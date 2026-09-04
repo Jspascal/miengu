@@ -1,0 +1,29 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`MienguEventSchema closure > (e) EVENT_TYPES is snapshotted so adding a type is a visible, deliberate diff 1`] = `
+[
+  "WorkItemCreated",
+  "WorkItemParked",
+  "WorkItemResumed",
+  "WorkItemCompleted",
+  "WorkItemFailed",
+  "RunStarted",
+  "RunFinished",
+  "StageEntered",
+  "StageCompleted",
+  "StageFailed",
+  "WorkspacePrepared",
+  "WorkspaceDiscarded",
+  "ExecutorInvoked",
+  "ExecutorReturned",
+  "DiffCaptured",
+  "BudgetConsumed",
+  "BudgetExhausted",
+  "CheckpointRaised",
+  "CheckpointDecided",
+  "AutoApproved",
+  "AssumptionRecorded",
+  "TestsTampered",
+  "DriftDetected",
+]
+`;

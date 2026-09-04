@@ -1,0 +1,45 @@
+export const CONFIG_TEMPLATE = `target:
+  repo: ../some-project
+  mode: worktree            # worktree | clone   (clone declared, not implemented in v1)
+  baseRef: HEAD
+oracles:                    # Phase 3 consumes; null = not declared
+  build:     null
+  test:      null
+  lint:      null
+  typecheck: null
+executor:
+  id: stub                  # claude-code | stub
+  claudeCode:
+    bin: claude
+    model: null
+    permissionMode: acceptEdits
+    outputFormat: stream-json
+    addDirs: []
+    maxBudgetUsd: null
+budget:
+  maxTurnsPerTask: 40
+  maxWallSecondsPerTask: 1800
+  maxUsdPerRun: null
+  maxWallSecondsPerRun: null
+limits:                     # binding decision 2 — no limit literals in code
+  kOracle: 3
+  kTest: 3
+  kReview: 2
+  maxAttemptsPerStage: 3
+wiki:
+  language: en              # binding decision 3 — claims stored in ONE canonical language
+locale: fr                  # binding decision 3 — human-view render locale
+store:
+  dir: .miengu
+  snapshotEvery: 200
+log:
+  level: info
+`;
+
+export interface RenderConfigTemplateOptions {
+  readonly targetRepo: string;
+}
+
+export function renderConfigTemplate(options: RenderConfigTemplateOptions): string {
+  return CONFIG_TEMPLATE.replace('../some-project', options.targetRepo);
+}
