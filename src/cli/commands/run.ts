@@ -1,28 +1,23 @@
-import { stat } from 'node:fs/promises';
-import { basename, extname, resolve } from 'node:path';
+import { mkdir, stat } from 'node:fs/promises';
+import { basename, extname, join, resolve } from 'node:path';
 import { assertNever } from '../../core/events.js';
 import { sha256File } from '../../core/hash.js';
 import { itemPaths } from '../../core/log.js';
 import { EventLog } from '../../core/log.js';
 import { systemClock } from '../../core/clock.js';
-import type { Clock } from '../../core/clock.js';
 import { createIdMinter, systemRng } from '../../core/idgen.js';
 import type { IdMinter } from '../../core/idgen.js';
 import { slugify } from '../../core/ids.js';
 import type { WorkItemId } from '../../core/ids.js';
 import { StoreError } from '../../errors.js';
 import { createLogger } from '../../logging.js';
-import type { Logger } from '../../logging.js';
 import { loadConfig } from '../../config/load.js';
-import type { MienguConfig } from '../../config/schema.js';
 import { createSnapshotStore } from '../../core/snapshot.js';
 import { PROJECTION_VERSION, WorkItemStateSchema } from '../../state/workitem.js';
 import type { WorkItemState } from '../../state/workitem.js';
 import { applyEvent } from '../../state/projector.js';
 import { stateHash } from '../../state/stateHash.js';
-import { DEFAULT_SIGTERM_GRACE_SECONDS, ClaudeCodeExecutor } from '../../executors/claudeCode.js';
-import { StubExecutor } from '../../executors/stub.js';
-import type { Executor, RawRunSource } from '../../executors/executor.js';
+import { buildExecutorRegistry } from '../../executors/registry.js';
 import { createWorkspaceProvider } from '../../executors/isolation.js';
 import { policyFromConfig } from '../../supervisor/nextStage.js';
 import { runItem } from '../../supervisor/loop.js';
@@ -58,33 +53,6 @@ async function mintItemId(storeDir: string, slug: ReturnType<typeof slugify>, id
   throw new StoreError('failed to mint a unique work item id after 5 attempts', { slug });
 }
 
-function createExecutorFromConfig(
-  config: MienguConfig,
-  paths: { transcriptsDir: string },
-  deps: { clock: Clock; ids: IdMinter; logger: Logger },
-): Executor & Partial<RawRunSource> {
-  switch (config.executor.id) {
-    case 'stub':
-      return new StubExecutor({ clock: deps.clock, ids: deps.ids });
-    case 'claude-code':
-      return new ClaudeCodeExecutor({
-        bin: config.executor.claudeCode.bin,
-        model: config.executor.claudeCode.model,
-        permissionMode: config.executor.claudeCode.permissionMode,
-        outputFormat: config.executor.claudeCode.outputFormat,
-        addDirs: config.executor.claudeCode.addDirs,
-        maxBudgetUsd: config.executor.claudeCode.maxBudgetUsd,
-        sigtermGraceSeconds: DEFAULT_SIGTERM_GRACE_SECONDS,
-        transcriptDir: paths.transcriptsDir,
-        clock: deps.clock,
-        ids: deps.ids,
-        logger: deps.logger,
-      });
-    default:
-      return assertNever(config.executor.id);
-  }
-}
-
 function exitCodeForOutcome(outcome: RunItemResult['outcome']): number {
   switch (outcome) {
     case 'completed':
@@ -100,9 +68,11 @@ function exitCodeForOutcome(outcome: RunItemResult['outcome']): number {
 }
 
 /**
- * Mints a work item and runs it, via `runItem`, to completion or park. Never runs more than
- * one item, never calls an LLM when `executor.id === 'stub'`, never commits anything, and
- * never leaves the write lock held on any exit path.
+ * Mints a work item and runs it, via `runItem`, to completion or park. Constructs the
+ * executor registry (eagerly, per role) after `RunStarted` and before `runItem` — a
+ * `ConfigError` from a misconfigured sandbox therefore propagates before any `StageEntered`
+ * is ever appended. Never runs more than one item, never commits anything, and never leaves
+ * the write lock held on any exit path.
  */
 export async function runCommand(options: RunCommandOptions): Promise<number> {
   const loaded = await loadConfig(options.configPath);
@@ -159,7 +129,24 @@ export async function runCommand(options: RunCommandOptions): Promise<number> {
       causationId: log.lastEventId,
     });
 
-    const executor = createExecutorFromConfig(loaded.config, paths, { clock, ids, logger });
+    const promptsDir = join(paths.itemDir, 'prompts');
+    const schemasDir = join(paths.itemDir, 'schemas');
+    const messagesDir = join(paths.itemDir, 'messages');
+    const frozenTestsDir = join(paths.itemDir, 'frozen-tests');
+    await Promise.all([
+      mkdir(promptsDir, { recursive: true }),
+      mkdir(schemasDir, { recursive: true }),
+      mkdir(messagesDir, { recursive: true }),
+      mkdir(frozenTestsDir, { recursive: true }),
+    ]);
+
+    const executors = buildExecutorRegistry({
+      config: loaded.config,
+      paths: { transcriptsDir: paths.transcriptsDir, messagesDir },
+      clock,
+      ids,
+      logger,
+    });
     const workspace = createWorkspaceProvider(loaded.config.target.mode);
     const snapshots = createSnapshotStore<WorkItemState>({
       dir: paths.snapshotsDir,
@@ -176,10 +163,14 @@ export async function runCommand(options: RunCommandOptions): Promise<number> {
       snapshots,
       config: loaded.config,
       policy,
-      executor,
+      executors,
       workspace,
       targetRepo: loaded.targetRepo,
       workspacesDir: paths.workspacesDir,
+      promptsDir,
+      schemasDir,
+      messagesDir,
+      frozenTestsDir,
       clock,
       ids,
       logger,
@@ -192,7 +183,13 @@ export async function runCommand(options: RunCommandOptions): Promise<number> {
     if (abortController.signal.aborted) {
       const abortEvent = await log.append({
         type: 'WorkItemParked',
-        data: { reason: 'operator-abort', detail: 'received SIGINT', resumable: true },
+        data: {
+          reason: 'operator-abort',
+          detail: 'received SIGINT',
+          resumable: true,
+          account: null,
+          resets_at: null,
+        },
         actor: { kind: 'human', id: null },
         causationId: log.lastEventId,
       });

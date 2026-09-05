@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
 import { CONFIG_TEMPLATE, renderConfigTemplate } from '../../src/config/scaffold.js';
 import { MienguConfigSchema } from '../../src/config/schema.js';
+import { validateConfig } from '../../src/config/validate.js';
 
 const EXAMPLE_PATH = fileURLToPath(
   new URL('../../miengu.config.example.yaml', import.meta.url),
@@ -13,6 +14,11 @@ describe('CONFIG_TEMPLATE', () => {
   it('parses successfully against MienguConfigSchema', () => {
     const parsed = parseYaml(CONFIG_TEMPLATE) as unknown;
     expect(() => MienguConfigSchema.parse(parsed)).not.toThrow();
+  });
+
+  it('passes validateConfig — the shipped template must not fail its own safety check', () => {
+    const parsed = MienguConfigSchema.parse(parseYaml(CONFIG_TEMPLATE));
+    expect(() => validateConfig(parsed)).not.toThrow();
   });
 
   it('is byte-identical to the committed example file', () => {

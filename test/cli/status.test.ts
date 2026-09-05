@@ -36,8 +36,29 @@ beforeEach(async () => {
     [
       'target:',
       `  repo: ${targetRepo}`,
-      'executor:',
-      '  id: stub',
+      'accounts:',
+      '  stub-account: {}',
+      'executors:',
+      '  stub-analyst: { type: stub, account: stub-account }',
+      '  stub-architect: { type: stub, account: stub-account }',
+      '  stub-planner: { type: stub, account: stub-account }',
+      '  stub-testauthor: { type: stub, account: stub-account }',
+      '  stub-coder: { type: stub, account: stub-account }',
+      '  stub-reviewer: { type: stub, account: stub-account }',
+      'tiers:',
+      '  stub-analyst: 1',
+      '  stub-architect: 1',
+      '  stub-planner: 1',
+      '  stub-testauthor: 1',
+      '  stub-coder: 1',
+      '  stub-reviewer: 1',
+      'roles:',
+      '  analyst: { executor: stub-analyst, maxTurns: 8, contextBudgetTokens: 40000 }',
+      '  architect: { executor: stub-architect, maxTurns: 8, contextBudgetTokens: 40000 }',
+      '  planner: { executor: stub-planner, maxTurns: 8, contextBudgetTokens: 40000 }',
+      '  testAuthor: { executor: stub-testauthor, maxTurns: 8, contextBudgetTokens: 40000 }',
+      '  coder: { executor: stub-coder, maxTurns: 8, contextBudgetTokens: 40000 }',
+      '  reviewer: { executor: stub-reviewer, maxTurns: 8, contextBudgetTokens: 40000 }',
       'store:',
       '  dir: .miengu',
       '  snapshotEvery: 3',
@@ -53,7 +74,7 @@ afterEach(async () => {
 });
 
 describe('statusCommand', () => {
-  it('reports a completed item, exit 0', async () => {
+  it('reports an item, exit 0', async () => {
     const prdFile = join(workDir, 'prd.md');
     await writeFile(prdFile, 'Build a thing.\n', 'utf8');
     await runCommand({ prdFile, configPath });

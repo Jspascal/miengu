@@ -1,9 +1,9 @@
 import { assertNever } from '../core/events.js';
 import type { MienguEvent } from '../core/events.js';
 import { ProjectionError } from '../errors.js';
-import { accumulate, EMPTY_LEDGER } from '../supervisor/budget.js';
-import { emptyAttempts, PROJECTION_VERSION } from './workitem.js';
-import type { CheckpointStateRecord, WorkItemState } from './workitem.js';
+import { EMPTY_BUDGET_STATE, foldConsumed, foldExhausted } from '../supervisor/budget.js';
+import { emptyAttempts, emptyQuotaAborts, nextStageInOrder, PROJECTION_VERSION } from './workitem.js';
+import type { CheckpointStateRecord, WorkItemState, WorktreeLockState } from './workitem.js';
 
 function buildInitialState(event: Extract<MienguEvent, { type: 'WorkItemCreated' }>): WorkItemState {
   return {
@@ -23,7 +23,12 @@ function buildInitialState(event: Extract<MienguEvent, { type: 'WorkItemCreated'
     attempts: emptyAttempts(),
     failures: [],
     park: null,
-    budget: { consumed: EMPTY_LEDGER, exhausted: null },
+    budget: EMPTY_BUDGET_STATE,
+    quotaAborts: emptyQuotaAborts(),
+    worktreeLock: null,
+    frozenTests: null,
+    validationFailures: [],
+    itemArtifacts: [],
     workspace: null,
     lastExecutor: null,
     lastDiff: null,
@@ -88,6 +93,8 @@ export function applyEvent(state: WorkItemState | null, event: MienguEvent): Wor
           detail: event.data.detail,
           since: event.ts,
           resumable: event.data.resumable,
+          account: event.data.account,
+          resetsAt: event.data.resets_at,
         },
       };
     }
@@ -96,6 +103,7 @@ export function applyEvent(state: WorkItemState | null, event: MienguEvent): Wor
         ...base,
         status: 'active',
         park: null,
+        budget: foldExhausted(base.budget, event.data.account, null),
       };
     }
     case 'WorkItemCompleted': {
@@ -140,11 +148,13 @@ export function applyEvent(state: WorkItemState | null, event: MienguEvent): Wor
     }
     case 'StageCompleted': {
       const artifact = event.data.artifact;
+      const stage = nextStageInOrder(event.data.stage);
       if (artifact === null) {
-        return base;
+        return { ...base, stage };
       }
       return {
         ...base,
+        stage,
         artifacts: {
           ...base.artifacts,
           [event.data.stage]: {
@@ -172,6 +182,23 @@ export function applyEvent(state: WorkItemState | null, event: MienguEvent): Wor
         ],
       };
     }
+    case 'ArtifactValidationFailed': {
+      return {
+        ...base,
+        validationFailures: [
+          ...base.validationFailures,
+          {
+            stage: event.data.stage,
+            role: event.data.role,
+            attempt: event.data.attempt,
+            validationAttempt: event.data.validation_attempt,
+            kind: event.data.kind,
+            errors: event.data.errors,
+            at: event.ts,
+          },
+        ],
+      };
+    }
     case 'WorkspacePrepared': {
       return {
         ...base,
@@ -191,6 +218,36 @@ export function applyEvent(state: WorkItemState | null, event: MienguEvent): Wor
         workspace: base.workspace === null ? null : { ...base.workspace, discarded: true },
       };
     }
+    case 'WorktreeLockAcquired': {
+      if (base.worktreeLock !== null) {
+        throw new ProjectionError(
+          `worktree lock at "${event.data.workdir}" already held by "${base.worktreeLock.holder}"; ` +
+            `cannot re-acquire for "${event.data.holder}"`,
+        );
+      }
+      const lock: WorktreeLockState = {
+        holder: event.data.holder,
+        workdir: event.data.workdir,
+        stage: event.data.stage,
+        intent: event.data.intent,
+        since: event.ts,
+      };
+      return { ...base, worktreeLock: lock };
+    }
+    case 'WorktreeLockReleased': {
+      if (base.worktreeLock === null) {
+        throw new ProjectionError(
+          `WorktreeLockReleased for "${event.data.workdir}" by "${event.data.holder}" but no lock is held`,
+        );
+      }
+      if (event.data.holder !== base.worktreeLock.holder && !event.data.reclaimed) {
+        throw new ProjectionError(
+          `WorktreeLockReleased by "${event.data.holder}" does not match the current holder ` +
+            `"${base.worktreeLock.holder}" and is not marked reclaimed`,
+        );
+      }
+      return { ...base, worktreeLock: null };
+    }
     case 'ExecutorInvoked': {
       return base;
     }
@@ -199,16 +256,27 @@ export function applyEvent(state: WorkItemState | null, event: MienguEvent): Wor
         ...base,
         lastExecutor: {
           executorId: event.data.executor_id,
+          executorType: event.data.executor_type,
+          account: event.data.account,
           stage: event.data.stage,
           status: event.data.status,
           telemetry: {
             turns: event.data.telemetry.turns,
             inputTokens: event.data.telemetry.input_tokens,
             outputTokens: event.data.telemetry.output_tokens,
+            cacheReadTokens: event.data.telemetry.cache_read_tokens,
+            cacheCreationTokens: event.data.telemetry.cache_creation_tokens,
             wallSeconds: event.data.telemetry.wall_seconds,
           },
           at: event.ts,
         },
+        quotaAborts:
+          event.data.status === 'quota_exhausted'
+            ? {
+                ...base.quotaAborts,
+                [event.data.stage]: base.quotaAborts[event.data.stage] + 1,
+              }
+            : base.quotaAborts,
       };
     }
     case 'DiffCaptured': {
@@ -225,24 +293,25 @@ export function applyEvent(state: WorkItemState | null, event: MienguEvent): Wor
       };
     }
     case 'BudgetConsumed': {
-      const consumed = accumulate(base.budget.consumed, {
-        wallSeconds: event.data.wall_seconds,
-        turns: event.data.turns,
-        usd: event.data.usd,
-      });
-      return { ...base, budget: { ...base.budget, consumed } };
+      return {
+        ...base,
+        budget: foldConsumed(base.budget, event.data.account, {
+          wallSeconds: event.data.wall_seconds,
+          turns: event.data.turns,
+          usd: event.data.usd,
+        }),
+      };
     }
     case 'BudgetExhausted': {
       return {
         ...base,
-        budget: {
-          ...base.budget,
-          exhausted: {
-            scope: event.data.scope,
-            limitKind: event.data.limit_kind,
-            at: event.ts,
-          },
-        },
+        budget: foldExhausted(base.budget, event.data.account, {
+          scope: event.data.scope,
+          limitKind: event.data.limit_kind,
+          at: event.ts,
+          resetsAt: event.data.resets_at,
+          detail: event.data.detail,
+        }),
       };
     }
     case 'CheckpointRaised': {
@@ -310,6 +379,24 @@ export function applyEvent(state: WorkItemState | null, event: MienguEvent): Wor
         ],
       };
     }
+    case 'TestsFrozen': {
+      if (base.frozenTests !== null && base.frozenTests.suiteId !== event.data.suite_id) {
+        throw new ProjectionError(
+          `tests already frozen for suite "${base.frozenTests.suiteId}"; ` +
+            `cannot freeze a different suite "${event.data.suite_id}" for the remainder of the item`,
+        );
+      }
+      return {
+        ...base,
+        frozenTests: {
+          suiteId: event.data.suite_id,
+          contentHash: event.data.content_hash,
+          files: event.data.files,
+          frozenCopyDir: event.data.frozen_copy_dir,
+          at: event.ts,
+        },
+      };
+    }
     case 'TestsTampered': {
       return {
         ...base,
@@ -321,6 +408,23 @@ export function applyEvent(state: WorkItemState | null, event: MienguEvent): Wor
             expectedHash: event.data.expected_hash,
             observedHash: event.data.observed_hash,
             paths: event.data.paths,
+            restored: event.data.restored,
+            at: event.ts,
+          },
+        ],
+      };
+    }
+    case 'ItemArtifactRecorded': {
+      return {
+        ...base,
+        itemArtifacts: [
+          ...base.itemArtifacts,
+          {
+            role: event.data.role,
+            stage: event.data.stage,
+            artifactKind: event.data.artifact_kind,
+            sha256: event.data.sha256,
+            summary: event.data.summary,
             at: event.ts,
           },
         ],

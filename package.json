@@ -11,7 +11,7 @@
   },
   "main": "./dist/cli/index.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node -e \"const fs=require('node:fs');fs.mkdirSync('dist/agents/prompts',{recursive:true});for(const f of fs.readdirSync('src/agents/prompts')){if(f.endsWith('.md')){fs.copyFileSync('src/agents/prompts/'+f,'dist/agents/prompts/'+f);}}\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",

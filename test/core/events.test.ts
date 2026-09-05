@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import type { z } from 'zod';
 import {
+  EVENT_SCHEMA_VERSION,
   EVENT_TYPES,
   DEFAULT_TIER,
   MienguEventSchema,
@@ -10,7 +11,7 @@ import type { EventType } from '../../src/core/events.js';
 type DiscriminatedMember = z.ZodObject<{ type: z.ZodLiteral<EventType> }>;
 
 const BASE_ENVELOPE = {
-  schema_version: 1,
+  schema_version: 2,
   event_id: 'evt-01234567-89ab-cdef-0123-456789abcdef',
   seq: 1,
   item_id: 'wi-example-abc123',
@@ -28,8 +29,14 @@ const VALID_DATA: Record<EventType, Record<string, unknown>> = {
     source: { kind: 'prd-file', path: 'prd.md', sha256: 'a'.repeat(64), bytes: 10 },
     config_hash: 'deadbeef',
   },
-  WorkItemParked: { reason: 'budget-exhausted', detail: 'x', resumable: true },
-  WorkItemResumed: { previous_reason: 'budget-exhausted', detail: 'x' },
+  WorkItemParked: {
+    reason: 'budget-exhausted',
+    detail: 'x',
+    resumable: true,
+    account: null,
+    resets_at: null,
+  },
+  WorkItemResumed: { previous_reason: 'budget-exhausted', detail: 'x', account: null },
   WorkItemCompleted: { stages_completed: ['intake'] },
   WorkItemFailed: { reason: 'loop-guard', detail: 'x' },
   RunStarted: {
@@ -42,6 +49,16 @@ const VALID_DATA: Record<EventType, Record<string, unknown>> = {
   StageEntered: { stage: 'intake', attempt: 1 },
   StageCompleted: { stage: 'intake', attempt: 1, artifact: null },
   StageFailed: { stage: 'intake', attempt: 1, reason: 'internal-error', detail: 'x' },
+  ArtifactValidationFailed: {
+    stage: 'test-authoring',
+    role: 'testAuthor',
+    executor_id: 'cx-high',
+    attempt: 1,
+    validation_attempt: 1,
+    kind: 'schema',
+    artifact_kind: 'test-suite-spec',
+    errors: ['cases must include at least one negative test'],
+  },
   WorkspacePrepared: {
     mode: 'worktree',
     target_repo: '/tmp/repo',
@@ -50,22 +67,56 @@ const VALID_DATA: Record<EventType, Record<string, unknown>> = {
     base_commit: 'a'.repeat(40),
   },
   WorkspaceDiscarded: { workdir: '/tmp/wd', retained: false },
+  WorktreeLockAcquired: {
+    workdir: '/tmp/wd',
+    holder: 'cc-sonnet',
+    stage: 'implementation',
+    intent: 'workspace-write',
+  },
+  WorktreeLockReleased: {
+    workdir: '/tmp/wd',
+    holder: 'cc-sonnet',
+    stage: 'implementation',
+    reclaimed: false,
+  },
   ExecutorInvoked: {
     executor_id: 'stub',
+    executor_type: 'stub',
+    account: 'claude-personal',
+    role: null,
     stage: 'intake',
     workdir: '/tmp/wd',
+    sandbox_intent: 'read-only',
+    native_structured_output: false,
+    output_schema_sha256: null,
     prompt_sha256: 'a'.repeat(64),
     prompt_bytes: 10,
+    prompt_path: null,
+    prompt_template_sha256: null,
+    validation_attempt: 1,
     context_pack_id: null,
+    context_pack_estimated_tokens: null,
     session_id: null,
+    resolved: { model: null, effort: null, max_turns: 10, context_budget_tokens: 1000 },
     budget: { max_turns: 10, max_wall_seconds: 60 },
     command_line: ['stub'],
+    session_id: 'sess-stub',
   },
   ExecutorReturned: {
     executor_id: 'stub',
+    executor_type: 'stub',
+    account: 'claude-personal',
     stage: 'intake',
     status: 'completed',
-    telemetry: { turns: 1, input_tokens: null, output_tokens: null, wall_seconds: 1 },
+    telemetry: {
+      turns: 1,
+      input_tokens: null,
+      output_tokens: null,
+      cache_read_tokens: null,
+      cache_creation_tokens: null,
+      wall_seconds: 1,
+    },
+    quota: null,
     raw: {
       exit_code: 0,
       signal: null,
@@ -74,6 +125,9 @@ const VALID_DATA: Record<EventType, Record<string, unknown>> = {
       failure_kind: null,
       stderr_tail: '',
       transcript_path: null,
+      final_message_bytes: null,
+      command_line: ['stub'],
+      session_id: 'sess-stub',
     },
   },
   DiffCaptured: {
@@ -86,13 +140,15 @@ const VALID_DATA: Record<EventType, Record<string, unknown>> = {
     deletions: 0,
     committed_during_run: false,
   },
-  BudgetConsumed: { scope: 'task', wall_seconds: 1, turns: 1, usd: null },
+  BudgetConsumed: { scope: 'task', account: 'claude-personal', wall_seconds: 1, turns: 1, usd: null },
   BudgetExhausted: {
     scope: 'task',
+    account: 'claude-personal',
     limit_kind: 'turns',
     declared_limit: 10,
     observed: 11,
     detail: 'x',
+    resets_at: null,
   },
   CheckpointRaised: {
     checkpoint: 'cp-example-1',
@@ -122,12 +178,26 @@ const VALID_DATA: Record<EventType, Record<string, unknown>> = {
     affects: [],
     depth: 0,
   },
+  TestsFrozen: {
+    suite_id: 'suite-example-1',
+    content_hash: 'a'.repeat(64),
+    files: [{ path: 'test/x.test.ts', sha256: 'b'.repeat(64), bytes: 10 }],
+    frozen_copy_dir: '/tmp/frozen',
+  },
   TestsTampered: {
     task_id: 'task-example-1',
     suite_id: 'suite-example-1',
     expected_hash: 'a'.repeat(64),
     observed_hash: 'b'.repeat(64),
     paths: [],
+    restored: true,
+  },
+  ItemArtifactRecorded: {
+    role: 'analyst',
+    stage: 'analysis',
+    artifact_kind: 'requirement-set',
+    sha256: 'a'.repeat(64),
+    summary: 'x',
   },
   DriftDetected: { claim: 'claim-example-1', expected: 'a', observed: 'b', area: null },
 };
@@ -135,6 +205,12 @@ const VALID_DATA: Record<EventType, Record<string, unknown>> = {
 function buildEvent(type: EventType): Record<string, unknown> {
   return { ...BASE_ENVELOPE, type, data: VALID_DATA[type] };
 }
+
+describe('EVENT_SCHEMA_VERSION', () => {
+  it('is 2 — the clean v2 break, binding decision 7', () => {
+    expect(EVENT_SCHEMA_VERSION).toBe(2);
+  });
+});
 
 describe('MienguEventSchema closure', () => {
   it('(a) has exactly one schema member per EVENT_TYPES entry, no more, no fewer', () => {
@@ -177,16 +253,18 @@ describe('(d) one valid + one invalid fixture per event type', () => {
 });
 
 describe('tier assignment', () => {
-  it('matches §3: WorkItemCreated=T0, CheckpointDecided=T0, AssumptionRecorded=T2, AutoApproved=T1, else T1', () => {
+  it('matches §3: WorkItemCreated=T0, CheckpointDecided=T0, AssumptionRecorded=T2, ItemArtifactRecorded=T2, AutoApproved=T1, else T1', () => {
     expect(DEFAULT_TIER.WorkItemCreated).toBe('T0');
     expect(DEFAULT_TIER.CheckpointDecided).toBe('T0');
     expect(DEFAULT_TIER.AssumptionRecorded).toBe('T2');
+    expect(DEFAULT_TIER.ItemArtifactRecorded).toBe('T2');
     expect(DEFAULT_TIER.AutoApproved).toBe('T1');
     for (const type of EVENT_TYPES) {
       if (
         type === 'WorkItemCreated' ||
         type === 'CheckpointDecided' ||
-        type === 'AssumptionRecorded'
+        type === 'AssumptionRecorded' ||
+        type === 'ItemArtifactRecorded'
       ) {
         continue;
       }

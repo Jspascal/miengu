@@ -40,7 +40,7 @@ const WORK_ITEM_CREATED: AppendInput = {
 function budgetConsumed(): AppendInput {
   return {
     type: 'BudgetConsumed',
-    data: { scope: 'task', wall_seconds: 1, turns: 1, usd: null },
+    data: { scope: 'task', account: 'claude-personal', wall_seconds: 1, turns: 1, usd: null },
     actor: { kind: 'system', id: null },
     causationId: null,
   };

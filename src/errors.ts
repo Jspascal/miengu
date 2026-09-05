@@ -89,6 +89,24 @@ export class ExecutorError extends MienguError {
   }
 }
 
+export class ContractError extends MienguError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super(message, 'CONTRACT_ERROR', 1, details);
+  }
+}
+
+export class ContextPackError extends MienguError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super(message, 'CONTEXT_PACK_ERROR', 1, details);
+  }
+}
+
+export class AgentError extends MienguError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super(message, 'AGENT_ERROR', 1, details);
+  }
+}
+
 export function isMienguError(e: unknown): e is MienguError {
   return e instanceof MienguError;
 }

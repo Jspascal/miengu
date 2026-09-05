@@ -2,25 +2,36 @@ import { spawn } from 'node:child_process';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { z } from 'zod';
-import type { Clock } from '../core/clock.js';
+import type { Clock, IsoTimestamp } from '../core/clock.js';
+import type { SandboxIntent } from '../core/events.js';
 import type { IdMinter } from '../core/idgen.js';
+import type { AccountId, ExecutorInstanceId } from '../core/ids.js';
 import type { Logger } from '../logging.js';
 import type {
   Executor,
-  ExecutorRunInput,
-  ExecutorRunResult,
+  ExecutorCapabilities,
+  ExecutorInput,
+  ExecutorResult,
   ExecutorStatus,
   ExecutorTelemetry,
+  QuotaObservation,
   RawRunRecord,
   RawRunSource,
 } from './executor.js';
 
 export const DEFAULT_SIGTERM_GRACE_SECONDS = 10;
 
+export type PermissionMode = 'acceptEdits' | 'auto' | 'bypassPermissions' | 'manual' | 'dontAsk' | 'plan';
+
 export interface ClaudeCodeOptions {
+  id: ExecutorInstanceId;
+  account: AccountId;
   bin: string;
   model: string | null;
-  permissionMode: 'acceptEdits' | 'auto' | 'bypassPermissions' | 'manual' | 'dontAsk' | 'plan';
+  effort: string | null;
+  sandboxIntent: SandboxIntent;
+  /** Config escape hatch; null = derive from sandboxIntent (ASSUMPTION A3). */
+  permissionModeOverride: PermissionMode | null;
   outputFormat: 'json' | 'stream-json';
   addDirs: readonly string[];
   maxBudgetUsd: number | null;
@@ -31,6 +42,14 @@ export interface ClaudeCodeOptions {
   logger: Logger;
 }
 
+export const CLAUDE_CAPABILITIES: ExecutorCapabilities = {
+  nativeStructuredOutput: false, // VERIFIED BY ABSENCE: `claude --help` has no --output-schema (2.1.260)
+  resumableSessions: true, // --session-id <uuid>
+  sandboxModes: ['read-only', 'workspace-write'],
+};
+
+export const RATE_LIMIT_ALLOWED_STATUSES = ['allowed', 'allowed_warning'] as const;
+
 // Every field the CLI's result object might carry, all optional, passthrough so we never
 // reject a shape we don't recognise — §9: unverifiable fields become `null`, never invented.
 export const CLAUDE_RESULT_SHAPE = z
@@ -39,10 +58,13 @@ export const CLAUDE_RESULT_SHAPE = z
     subtype: z.string().optional(),
     is_error: z.boolean().optional(),
     num_turns: z.unknown().optional(),
+    api_error_status: z.unknown().optional(),
     usage: z
       .object({
         input_tokens: z.unknown().optional(),
         output_tokens: z.unknown().optional(),
+        cache_creation_input_tokens: z.unknown().optional(),
+        cache_read_input_tokens: z.unknown().optional(),
       })
       .passthrough()
       .optional(),
@@ -52,8 +74,18 @@ export const CLAUDE_RESULT_SHAPE = z
   })
   .passthrough();
 
-// Heuristic: binding decision 4 — `claude` v2.1.247 has no machine-readable quota status,
-// so quota exhaustion can only be detected by matching error text the CLI happens to emit.
+const RATE_LIMIT_INFO_SHAPE = z
+  .object({
+    status: z.string().optional(),
+    utilization: z.number().optional(),
+    resetsAt: z.number().optional(),
+    rateLimitType: z.string().optional(),
+  })
+  .passthrough();
+
+// Heuristic: binding decision 4 — a machine-readable quota status now exists
+// (rate_limit_event.rate_limit_info), so these regexes are DEMOTED to fallback (precedence
+// tiers 3 and 4), consulted only when neither rate_limit_event nor api_error_status matched.
 const QUOTA_USAGE_LIMIT = /usage limit/i;
 // Heuristic: alternate wording observed for subscription/plan exhaustion errors.
 const QUOTA_EXCEEDED = /quota exceeded/i;
@@ -77,21 +109,153 @@ export function mapTelemetry(raw: unknown, wallSeconds: number): ExecutorTelemet
   const parsed = CLAUDE_RESULT_SHAPE.safeParse(raw);
   const data = parsed.success ? parsed.data : {};
   const usage = data.usage;
+
+  const cacheReadTokens =
+    usage !== undefined && isNonNegativeInt(usage.cache_read_input_tokens)
+      ? usage.cache_read_input_tokens
+      : null;
+  const cacheCreationTokens =
+    usage !== undefined && isNonNegativeInt(usage.cache_creation_input_tokens)
+      ? usage.cache_creation_input_tokens
+      : null;
+  const directInputTokens =
+    usage !== undefined && isNonNegativeInt(usage.input_tokens) ? usage.input_tokens : null;
+
+  // finding 3/row 5: `usage.input_tokens` alone under-reports by orders of magnitude — sum
+  // in the present, valid cache figures. `null` only when all three are absent or ill-typed.
+  const presentInputParts = [directInputTokens, cacheCreationTokens, cacheReadTokens].filter(
+    (v): v is number => v !== null,
+  );
+  const inputTokens = presentInputParts.length > 0
+    ? presentInputParts.reduce((sum, v) => sum + v, 0)
+    : null;
+
   return {
     turns: isNonNegativeInt(data.num_turns) ? data.num_turns : null,
-    inputTokens: usage !== undefined && isNonNegativeInt(usage.input_tokens)
-      ? usage.input_tokens
-      : null,
-    outputTokens: usage !== undefined && isNonNegativeInt(usage.output_tokens)
-      ? usage.output_tokens
-      : null,
+    inputTokens,
+    outputTokens:
+      usage !== undefined && isNonNegativeInt(usage.output_tokens) ? usage.output_tokens : null,
+    cacheReadTokens,
+    cacheCreationTokens,
     wallSeconds,
   };
 }
 
-function matchesQuotaSignature(raw: unknown, stderrTail: string): boolean {
-  const text = `${JSON.stringify(raw)} ${stderrTail}`;
+function isRecordWithType(v: unknown): v is { type?: unknown } {
+  return v !== null && typeof v === 'object';
+}
+
+/** finding row 4: the result line is selected by `type === 'result'`, last wins — never by
+ *  "last line that parsed", which is not guaranteed to be the result now that
+ *  `rate_limit_event` exists with no ordering promise. */
+export function selectResultLine(lines: readonly unknown[]): unknown {
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    if (isRecordWithType(line) && line.type === 'result') {
+      return line;
+    }
+  }
+  return null;
+}
+
+/** finding row 2: the last `rate_limit_event.rate_limit_info` — the primary quota signal. */
+export function selectRateLimitInfo(lines: readonly unknown[]): unknown {
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    if (isRecordWithType(line) && line.type === 'rate_limit_event') {
+      const info = (line as { rate_limit_info?: unknown }).rate_limit_info;
+      return info ?? null;
+    }
+  }
+  return null;
+}
+
+function isoFromUnixSeconds(seconds: number): IsoTimestamp {
+  return new Date(seconds * 1000).toISOString() as IsoTimestamp;
+}
+
+function buildRateLimitObservation(
+  rateLimitInfoRaw: unknown,
+  account: AccountId,
+): QuotaObservation | null {
+  if (rateLimitInfoRaw === null || rateLimitInfoRaw === undefined) {
+    return null;
+  }
+  const parsed = RATE_LIMIT_INFO_SHAPE.safeParse(rateLimitInfoRaw);
+  if (!parsed.success) {
+    return null;
+  }
+  const data = parsed.data;
+  return {
+    account,
+    source: 'rate-limit-event',
+    status: data.status ?? null,
+    utilization: data.utilization ?? null,
+    windowKind: data.rateLimitType ?? null,
+    resetsAt: data.resetsAt !== undefined ? isoFromUnixSeconds(data.resetsAt) : null,
+  };
+}
+
+function textMatchesQuotaSignature(text: string): boolean {
   return QUOTA_SIGNATURES.some((re) => re.test(text));
+}
+
+/**
+ * Quota detection precedence, first match wins (finding row 5). Gated on the run having
+ * FAILED (binding decision "Quota detection is gated on the run having failed"): a clean
+ * exit 0 + result/success + is_error !== true run is never quota_exhausted, whatever
+ * `rate_limit_event` said.
+ */
+function computeDetectedQuota(o: {
+  cleanSuccess: boolean;
+  rateLimitObservation: QuotaObservation | null;
+  resultLine: unknown;
+  stderrTail: string;
+  account: AccountId;
+}): QuotaObservation | null {
+  if (o.cleanSuccess) {
+    return null;
+  }
+  if (
+    o.rateLimitObservation !== null &&
+    o.rateLimitObservation.status !== null &&
+    !(RATE_LIMIT_ALLOWED_STATUSES as readonly string[]).includes(o.rateLimitObservation.status)
+  ) {
+    return o.rateLimitObservation;
+  }
+  const resultParsed = CLAUDE_RESULT_SHAPE.safeParse(o.resultLine);
+  const apiErrorStatus = resultParsed.success ? resultParsed.data.api_error_status : undefined;
+  if (apiErrorStatus === 429) {
+    return {
+      account: o.account,
+      source: 'api-error-status',
+      status: null,
+      utilization: null,
+      windowKind: null,
+      resetsAt: null,
+    };
+  }
+  if (textMatchesQuotaSignature(JSON.stringify(o.resultLine))) {
+    return {
+      account: o.account,
+      source: 'stream-regex',
+      status: null,
+      utilization: null,
+      windowKind: null,
+      resetsAt: null,
+    };
+  }
+  if (textMatchesQuotaSignature(o.stderrTail)) {
+    return {
+      account: o.account,
+      source: 'stderr-regex',
+      status: null,
+      utilization: null,
+      windowKind: null,
+      resetsAt: null,
+    };
+  }
+  return null;
 }
 
 function isGaveUp(raw: unknown): boolean {
@@ -102,6 +266,24 @@ function isGaveUp(raw: unknown): boolean {
   return parsed.data.is_error === true || parsed.data.subtype !== 'success';
 }
 
+function isCleanSuccess(resultLine: unknown, exitCode: number | null): boolean {
+  if (exitCode !== 0) {
+    return false;
+  }
+  const parsed = CLAUDE_RESULT_SHAPE.safeParse(resultLine);
+  return parsed.success && parsed.data.subtype === 'success' && parsed.data.is_error !== true;
+}
+
+function permissionModeFor(
+  intent: SandboxIntent,
+  override: PermissionMode | null,
+): PermissionMode {
+  if (override !== null) {
+    return override;
+  }
+  return intent === 'workspace-write' ? 'acceptEdits' : 'plan'; // ASSUMPTION A3
+}
+
 function buildArgv(o: ClaudeCodeOptions, sessionId: string): string[] {
   return [
     o.bin,
@@ -110,10 +292,11 @@ function buildArgv(o: ClaudeCodeOptions, sessionId: string): string[] {
     o.outputFormat,
     ...(o.outputFormat === 'stream-json' ? ['--verbose'] : []),
     '--permission-mode',
-    o.permissionMode,
+    permissionModeFor(o.sandboxIntent, o.permissionModeOverride),
     '--session-id',
     sessionId,
     ...(o.model !== null ? ['--model', o.model] : []),
+    ...(o.effort !== null ? ['--effort', o.effort] : []),
     ...o.addDirs.flatMap((d) => ['--add-dir', d]),
     ...(o.maxBudgetUsd !== null ? ['--max-budget-usd', String(o.maxBudgetUsd)] : []),
   ];
@@ -134,20 +317,26 @@ async function writeTranscript(
 }
 
 export class ClaudeCodeExecutor implements Executor, RawRunSource {
-  readonly id = 'claude-code';
+  readonly id: ExecutorInstanceId;
+  readonly type = 'claude-code';
+  readonly account: AccountId;
+  readonly capabilities: ExecutorCapabilities = CLAUDE_CAPABILITIES;
   lastRun: RawRunRecord | null = null;
 
   private readonly options: ClaudeCodeOptions;
 
   constructor(o: ClaudeCodeOptions) {
+    this.id = o.id;
+    this.account = o.account;
     this.options = o;
   }
 
-  async run(i: ExecutorRunInput): Promise<ExecutorRunResult> {
+  async run(i: ExecutorInput): Promise<ExecutorResult> {
     const sessionId = this.options.ids.sessionUuid();
     const argv = buildArgv(this.options, sessionId);
     const startedAt = this.options.clock.now();
     const startMonotonic = this.options.clock.monotonicMs();
+    const account = this.options.account;
 
     const result = await new Promise<{
       status: ExecutorStatus;
@@ -163,7 +352,7 @@ export class ClaudeCodeExecutor implements Executor, RawRunSource {
       let observedTurns = 0;
       let stdoutLineBuffer = '';
       let fullStdout = '';
-      let lastParsedLine: unknown = null;
+      const parsedLines: unknown[] = [];
       let stderrTail = '';
       let graceTimer: NodeJS.Timeout | null = null;
 
@@ -221,12 +410,8 @@ export class ClaudeCodeExecutor implements Executor, RawRunSource {
         }
         try {
           const parsed: unknown = JSON.parse(trimmed);
-          lastParsedLine = parsed;
-          if (
-            parsed !== null &&
-            typeof parsed === 'object' &&
-            (parsed as { type?: unknown }).type === 'assistant'
-          ) {
+          parsedLines.push(parsed);
+          if (isRecordWithType(parsed) && parsed.type === 'assistant') {
             observedTurns += 1;
             if (observedTurns > i.budget.maxTurns) {
               turnCapTriggered = true;
@@ -277,15 +462,35 @@ export class ClaudeCodeExecutor implements Executor, RawRunSource {
           stdoutLineBuffer = '';
         }
 
-        let finalResultRaw: unknown = null;
-        const wholeTrimmed = fullStdout.trim();
-        if (wholeTrimmed.length > 0) {
-          try {
-            finalResultRaw = JSON.parse(wholeTrimmed);
-          } catch {
-            finalResultRaw = lastParsedLine;
+        // finding row 4: select by `type === 'result'`, last wins. `lastParsedLine` is
+        // deleted — it is not guaranteed to be the result now that `rate_limit_event`
+        // exists with no ordering promise. Fall back to the whole-stdout parse only when
+        // no line carries `type: 'result'` (the `--output-format json` path).
+        let finalResultRaw = selectResultLine(parsedLines);
+        if (finalResultRaw === null) {
+          const wholeTrimmed = fullStdout.trim();
+          if (wholeTrimmed.length > 0) {
+            try {
+              finalResultRaw = JSON.parse(wholeTrimmed);
+            } catch {
+              finalResultRaw = null;
+            }
           }
         }
+
+        const rateLimitInfoRaw = selectRateLimitInfo(parsedLines);
+        const rateLimitObservation = buildRateLimitObservation(rateLimitInfoRaw, account);
+        const cleanSuccess = isCleanSuccess(finalResultRaw, code);
+        const detectedQuota = computeDetectedQuota({
+          cleanSuccess,
+          rateLimitObservation,
+          resultLine: finalResultRaw,
+          stderrTail,
+          account,
+        });
+        // finding row 2, point 4: recorded on every run, success or not — utilization is
+        // useful before it is fatal.
+        const quotaForRecord = detectedQuota ?? rateLimitObservation;
 
         let status: ExecutorStatus;
         let failureKind: RawRunRecord['failureKind'] = null;
@@ -297,15 +502,15 @@ export class ClaudeCodeExecutor implements Executor, RawRunSource {
           failureKind = 'timeout';
         } else if (abortTriggered) {
           status = 'crashed';
+        } else if (detectedQuota !== null) {
+          status = 'quota_exhausted';
+          failureKind = 'quota';
         } else if (spawnErrorOccurred || code !== 0) {
           status = 'crashed';
           failureKind = 'nonzero-exit';
         } else if (finalResultRaw === null) {
           status = 'crashed';
           failureKind = 'unparseable';
-        } else if (matchesQuotaSignature(finalResultRaw, stderrTail)) {
-          status = 'crashed';
-          failureKind = 'quota';
         } else if (isGaveUp(finalResultRaw)) {
           status = 'gave_up';
         } else {
@@ -315,6 +520,12 @@ export class ClaudeCodeExecutor implements Executor, RawRunSource {
         const finishedAt = this.options.clock.now();
         const wallSeconds = (this.options.clock.monotonicMs() - startMonotonic) / 1000;
         const telemetry = mapTelemetry(finalResultRaw, wallSeconds);
+
+        const resultParsed = CLAUDE_RESULT_SHAPE.safeParse(finalResultRaw);
+        const finalMessage =
+          resultParsed.success && resultParsed.data.result !== undefined
+            ? resultParsed.data.result
+            : null;
 
         void writeTranscript(this.options.transcriptDir, sessionId, fullStdout).then(
           (transcriptPath) => {
@@ -334,6 +545,8 @@ export class ClaudeCodeExecutor implements Executor, RawRunSource {
                 sessionId,
                 transcriptPath,
                 rawResult: finalResultRaw,
+                finalMessage,
+                quota: quotaForRecord,
               },
             });
           },

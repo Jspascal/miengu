@@ -50,6 +50,13 @@ export const CheckpointIdSchema = z
   .string()
   .regex(RE_CHECKPOINT_ID)
   .brand<'CheckpointId'>();
+// Operator-chosen names, lowercase-hyphen, <= 48 chars. Reuse RE_SLUG: neither family is minted.
+export const AccountIdSchema = z.string().regex(RE_SLUG).max(48).brand<'AccountId'>();
+export const ExecutorInstanceIdSchema = z
+  .string()
+  .regex(RE_SLUG)
+  .max(48)
+  .brand<'ExecutorInstanceId'>();
 
 export type Slug = z.infer<typeof SlugSchema>;
 export type ReqId = z.infer<typeof ReqIdSchema>;
@@ -65,6 +72,8 @@ export type WorkItemId = z.infer<typeof WorkItemIdSchema>;
 export type EventId = z.infer<typeof EventIdSchema>;
 export type RunId = z.infer<typeof RunIdSchema>;
 export type CheckpointId = z.infer<typeof CheckpointIdSchema>;
+export type AccountId = z.infer<typeof AccountIdSchema>;
+export type ExecutorInstanceId = z.infer<typeof ExecutorInstanceIdSchema>;
 
 function formatSerial(prefix: string, re: RegExp, slug: Slug, n: number): string {
   if (!Number.isInteger(n) || n < 1) {
@@ -214,4 +223,10 @@ export function isRunId(v: unknown): v is RunId {
 }
 export function isCheckpointId(v: unknown): v is CheckpointId {
   return typeof v === 'string' && RE_CHECKPOINT_ID.test(v);
+}
+export function isAccountId(v: unknown): v is AccountId {
+  return typeof v === 'string' && RE_SLUG.test(v) && v.length <= 48;
+}
+export function isExecutorInstanceId(v: unknown): v is ExecutorInstanceId {
+  return typeof v === 'string' && RE_SLUG.test(v) && v.length <= 48;
 }

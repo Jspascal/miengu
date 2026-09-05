@@ -1,12 +1,19 @@
 import { loadConfig } from '../../config/load.js';
 import { listItemIds } from '../../core/log.js';
-import type { WorkItemId } from '../../core/ids.js';
+import type { AccountId, WorkItemId } from '../../core/ids.js';
 import { EXIT } from '../exit.js';
 import { projectAccelerated } from './replay.js';
 
 export interface StatusCommandOptions {
   readonly configPath?: string | undefined;
   readonly json?: boolean | undefined;
+}
+
+interface StatusPark {
+  readonly reason: string;
+  readonly detail: string;
+  readonly account: AccountId | null;
+  readonly resetsAt: string | null;
 }
 
 interface StatusRow {
@@ -16,7 +23,7 @@ interface StatusRow {
   readonly stage: string | null;
   readonly status: string | null;
   readonly attemptsOnStage: number | null;
-  readonly parkReason: string | null;
+  readonly park: StatusPark | null;
   readonly updatedAt: string | null;
 }
 
@@ -30,7 +37,15 @@ async function buildRow(storeDir: string, itemId: WorkItemId): Promise<StatusRow
       stage: state.stage,
       status: state.status,
       attemptsOnStage: state.attempts[state.stage],
-      parkReason: state.park?.reason ?? null,
+      park:
+        state.park === null
+          ? null
+          : {
+              reason: state.park.reason,
+              detail: state.park.detail,
+              account: state.park.account,
+              resetsAt: state.park.resetsAt,
+            },
       updatedAt: state.updatedAt,
     };
   } catch (err) {
@@ -41,10 +56,23 @@ async function buildRow(storeDir: string, itemId: WorkItemId): Promise<StatusRow
       stage: null,
       status: null,
       attemptsOnStage: null,
-      parkReason: null,
+      park: null,
       updatedAt: null,
     };
   }
+}
+
+/** §17.2: a quota park names the account, e.g. "waiting on claude-personal window", instead
+ *  of a bare reason. Every other park reason renders as in Phase 1. */
+function renderPark(park: StatusPark | null): string {
+  if (park === null) {
+    return '';
+  }
+  if (park.reason === 'provider-quota' && park.account !== null) {
+    const resets = park.resetsAt !== null ? ` (resets ${park.resetsAt})` : '';
+    return `waiting on ${park.account} window${resets}`;
+  }
+  return park.reason;
 }
 
 function pad(value: string, width: number): string {
@@ -80,7 +108,7 @@ export async function statusCommand(options: StatusCommandOptions): Promise<numb
       continue;
     }
     lines.push(
-      `${pad(row.itemId, 24)}${pad(row.stage ?? '', 16)}${pad(row.status ?? '', 12)}${pad(String(row.attemptsOnStage ?? ''), 10)}${pad(row.parkReason ?? '', 20)}${row.updatedAt ?? ''}`,
+      `${pad(row.itemId, 24)}${pad(row.stage ?? '', 16)}${pad(row.status ?? '', 12)}${pad(String(row.attemptsOnStage ?? ''), 10)}${pad(renderPark(row.park), 20)}${row.updatedAt ?? ''}`,
     );
   }
   process.stdout.write(`${lines.join('\n')}\n`);

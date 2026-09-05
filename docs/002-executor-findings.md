@@ -4,7 +4,7 @@ Machine-verified answers to the `Phase 2 delta` §0 spike. Everything recorded h
 **`T1`** — observed by running the real binaries on this machine — except rows explicitly
 marked `PENDING`, which are `T3` until someone runs them.
 
-- Date of observation: **2026-09-04**
+- Date of observation: **2026-09-04** (S1, S2, S5)
 - Host: darwin 25.2.0 (arm64), Node 20+
 - `claude` — **2.1.260 (Claude Code)**, `/Users/josephnomo/.local/bin/claude`
 - `codex` — **codex-cli 0.149.1**, `/opt/homebrew/bin/codex`
@@ -191,6 +191,79 @@ Also present on `codex exec` and useful for hermetic tests: `--ephemeral`,
 
 ---
 
+## S5 — codex `--json` event vocabulary: **verified**
+
+Added because `Phase 2 delta` §17.3 asserts *"Codex surfaces `turn.failed` / `error` events
+in its JSONL stream; map from there"* without a spike row backing it. That claim would
+otherwise have been encoded into the adapter as if it were fact. **It is now `T1`.**
+
+Two runs against `codex exec --json --ephemeral --skip-git-repo-check`: one trivial
+success, one deliberate failure (`-m no-such-model-xyz`, which fails without spending a
+model call).
+
+### Success path — exact sequence
+
+```json
+{"type":"thread.started","thread_id":"01a06e8b-…"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"ok"}}
+{"type":"turn.completed","usage":{"input_tokens":18383,"cached_input_tokens":6144,
+  "cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}
+```
+
+Exit 0, **stderr empty**.
+
+| Need | Field |
+|---|---|
+| Session id for `codex exec resume <id>` | `thread.started.thread_id` |
+| Turn counting (the turn cap) | count `turn.started` |
+| Final artifact text (where `--output-schema` output lands) | `item.completed.item.text` where `item.type === "agent_message"` |
+| Telemetry | `turn.completed.usage` |
+
+**The codex turn cap is buildable and is not decorative.** `observedTurns` has a real
+source; it does not need to degrade to `null`.
+
+### Failure path — exact sequence
+
+```json
+{"type":"thread.started","thread_id":"01a06e8c-…"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Model metadata … not found. Defaulting to fallback metadata; …"}}
+{"type":"turn.started"}
+{"type":"error","message":"{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"…\"}}"}
+{"type":"turn.failed","error":{"message":"{\"type\":\"error\",\"status\":400,…}"}}
+```
+
+Exit **1**.
+
+Four findings that change the adapter:
+
+1. **`turn.failed` and `error` both exist** — the delta's §17.3 instruction is correct.
+2. **Everything goes to stdout; stderr is empty even on failure.** A codex adapter that
+   scans stderr for failure signatures would find nothing. This is the opposite of the
+   Claude Code assumption baked into `RawRunRecord.stderrTail`.
+3. **`item.completed` with `item.type === "error"` is NOT fatal** — it appeared before a
+   `turn.started` that then proceeded. Only `error` and `turn.failed` are terminal.
+   Treating any error item as fatal would abort recoverable runs.
+4. **The `message` field is a JSON-encoded string**, carrying `status` (HTTP, `400` here)
+   and `error.type` (`invalid_request_error`). Quota mapping therefore has a structured
+   path: parse `message`, read `.status` and `.error.type`. The delta's `rate_limit_error`
+   fallback is what `.error.type` would carry at 429.
+
+### Telemetry convention differs from Claude Code — do not share the fix
+
+Codex `input_tokens: 18383` with `cached_input_tokens: 6144` — the cached figure is a
+**subset** of the total. Claude Code's `input_tokens: 2` with
+`cache_read_input_tokens: 8144` **excludes** cache. The S2 fix (summing cache into input)
+is correct for Claude Code and would **double-count** on codex. Two adapters, two mappings.
+
+### Still unverified
+
+The `status` / `error.type` values at genuine **quota** exhaustion, as opposed to a 400.
+Same gap as S3, on the other vendor. Same mitigation: match on `.error.type` containing
+`rate_limit`, never on exit code alone.
+
+---
+
 ## Summary — what changes in the code because of this
 
 1. **No pty spawn strategy.** S1 clears it.
@@ -204,3 +277,11 @@ Also present on `codex exec` and useful for hermetic tests: `--ephemeral`,
    for Codex** — verified, so the §9.1b split must be built.
 7. **Codex effort ships as `-c model_reasoning_effort=`.**
 8. Park/resume can carry a real `resetsAt`; consider recording it on `BudgetExhausted`.
+9. **Codex turn counting is real** — count `turn.started`. Do not ship a degraded
+   `observedTurns: null` path.
+10. **Codex reports failures on stdout, not stderr.** `turn.failed` and `error` are
+    terminal; an `item.completed` of `item.type === "error"` is not.
+11. **Codex telemetry must NOT reuse the Claude Code cache-token fix** — codex's
+    `input_tokens` already includes cached tokens; summing would double-count.
+12. Codex session id for resume is `thread.started.thread_id`; the artifact text is
+    `item.completed.item.text`.

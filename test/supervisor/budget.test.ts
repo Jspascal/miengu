@@ -1,12 +1,24 @@
 import { describe, it, expect } from 'vitest';
 import {
+  EMPTY_ACCOUNT_LEDGER,
+  EMPTY_BUDGET_STATE,
   EMPTY_LEDGER,
+  accountLedger,
   accumulate,
   checkLimits,
+  foldConsumed,
+  foldExhausted,
   fromTelemetry,
+  isAccountExhausted,
 } from '../../src/supervisor/budget.js';
 import type { BudgetDelta, BudgetLimits } from '../../src/supervisor/budget.js';
-import type { BudgetLedger } from '../../src/state/workitem.js';
+import { IsoTimestampSchema } from '../../src/core/clock.js';
+import { AccountIdSchema } from '../../src/core/ids.js';
+import type { BudgetExhaustion, BudgetLedger } from '../../src/state/workitem.js';
+
+const ACCOUNT_A = AccountIdSchema.parse('claude-personal');
+const ACCOUNT_B = AccountIdSchema.parse('codex-personal');
+const AT = IsoTimestampSchema.parse('2024-01-01T00:00:00.000Z');
 
 describe('accumulate', () => {
   it('always adds wallSeconds', () => {
@@ -197,5 +209,88 @@ describe('fromTelemetry', () => {
       null,
     );
     expect(delta).toEqual({ wallSeconds: 3, turns: null, usd: null });
+  });
+});
+
+describe('foldConsumed', () => {
+  it('updates both accounts[a] and item from one delta', () => {
+    const delta: BudgetDelta = { wallSeconds: 5, turns: 2, usd: 1 };
+    const next = foldConsumed(EMPTY_BUDGET_STATE, ACCOUNT_A, delta);
+    expect(next.accounts[ACCOUNT_A]?.consumed).toEqual(accumulate(EMPTY_LEDGER, delta));
+    expect(next.item).toEqual(accumulate(EMPTY_LEDGER, delta));
+  });
+
+  it('two accounts accumulate independently', () => {
+    const deltaA: BudgetDelta = { wallSeconds: 5, turns: 2, usd: 1 };
+    const deltaB: BudgetDelta = { wallSeconds: 3, turns: 1, usd: 0.5 };
+    let state = foldConsumed(EMPTY_BUDGET_STATE, ACCOUNT_A, deltaA);
+    state = foldConsumed(state, ACCOUNT_B, deltaB);
+    expect(state.accounts[ACCOUNT_A]?.consumed).toEqual(accumulate(EMPTY_LEDGER, deltaA));
+    expect(state.accounts[ACCOUNT_B]?.consumed).toEqual(accumulate(EMPTY_LEDGER, deltaB));
+    expect(state.item).toEqual(accumulate(accumulate(EMPTY_LEDGER, deltaA), deltaB));
+  });
+
+  it('does not derive item by summing accounts — it is its own fold', () => {
+    const delta: BudgetDelta = { wallSeconds: 1, turns: null, usd: null };
+    const state = foldConsumed(EMPTY_BUDGET_STATE, ACCOUNT_A, delta);
+    expect(state.itemExhausted).toBeNull();
+    expect(state.item.partial).toEqual({ turns: true, usd: true });
+  });
+});
+
+describe('foldExhausted', () => {
+  const exhaustion: BudgetExhaustion = {
+    scope: 'item',
+    limitKind: 'provider-quota',
+    at: AT,
+    resetsAt: null,
+    detail: 'waiting on claude-personal window',
+  };
+
+  it('account === null sets itemExhausted and leaves accounts untouched', () => {
+    const withAccount = foldConsumed(EMPTY_BUDGET_STATE, ACCOUNT_A, {
+      wallSeconds: 1,
+      turns: 1,
+      usd: null,
+    });
+    const next = foldExhausted(withAccount, null, exhaustion);
+    expect(next.itemExhausted).toEqual(exhaustion);
+    expect(next.accounts).toEqual(withAccount.accounts);
+  });
+
+  it('a non-null account sets accounts[account].exhausted, not itemExhausted', () => {
+    const next = foldExhausted(EMPTY_BUDGET_STATE, ACCOUNT_A, exhaustion);
+    expect(next.accounts[ACCOUNT_A]?.exhausted).toEqual(exhaustion);
+    expect(next.itemExhausted).toBeNull();
+  });
+});
+
+describe('accountLedger', () => {
+  it('returns EMPTY_ACCOUNT_LEDGER for an unknown account and does not mint a key', () => {
+    const ledger = accountLedger(EMPTY_BUDGET_STATE, ACCOUNT_A);
+    expect(ledger).toEqual(EMPTY_ACCOUNT_LEDGER);
+    expect(Object.keys(EMPTY_BUDGET_STATE.accounts)).toEqual([]);
+  });
+});
+
+describe('isAccountExhausted', () => {
+  it('is false for account === null', () => {
+    expect(isAccountExhausted(EMPTY_BUDGET_STATE, null)).toBe(false);
+  });
+
+  it('is false for an account with no recorded exhaustion', () => {
+    expect(isAccountExhausted(EMPTY_BUDGET_STATE, ACCOUNT_A)).toBe(false);
+  });
+
+  it('is true once foldExhausted has set that account', () => {
+    const exhaustion: BudgetExhaustion = {
+      scope: 'task',
+      limitKind: 'turns',
+      at: AT,
+      resetsAt: null,
+      detail: 'x',
+    };
+    const next = foldExhausted(EMPTY_BUDGET_STATE, ACCOUNT_A, exhaustion);
+    expect(isAccountExhausted(next, ACCOUNT_A)).toBe(true);
   });
 });

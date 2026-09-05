@@ -4,6 +4,7 @@ import { parse as parseYaml } from 'yaml';
 import { ConfigError } from '../../errors.js';
 import { renderConfigTemplate } from '../../config/scaffold.js';
 import { CONFIG_FILENAME, MienguConfigSchema } from '../../config/schema.js';
+import { validateConfig } from '../../config/validate.js';
 import { EXIT } from '../exit.js';
 
 export interface InitCommandOptions {
@@ -41,14 +42,14 @@ export async function initCommand(options: InitCommandOptions): Promise<number> 
   const rendered = renderConfigTemplate({ targetRepo });
 
   // Validate what we are about to write before touching the filesystem.
-  MienguConfigSchema.parse(parseYaml(rendered));
+  validateConfig(MienguConfigSchema.parse(parseYaml(rendered)));
 
   await mkdir(targetDir, { recursive: true });
   await writeFile(configPath, rendered, 'utf8');
 
   // Validate what was actually written, by re-parsing it from disk.
   const written = await readFile(configPath, 'utf8');
-  MienguConfigSchema.parse(parseYaml(written));
+  validateConfig(MienguConfigSchema.parse(parseYaml(written)));
 
   return EXIT.OK;
 }

@@ -1,11 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { canonicalJson } from '../../src/core/canonical.js';
 import { IsoTimestampSchema } from '../../src/core/clock.js';
 import { STAGES } from '../../src/core/events.js';
-import type { Stage } from '../../src/core/events.js';
+import type { AccountId, Stage } from '../../src/core/events.js';
 import {
+  AccountIdSchema,
   CheckpointIdSchema,
   EventIdSchema,
   SlugSchema,
@@ -14,10 +15,16 @@ import {
 import { limitForStage, nextStage } from '../../src/supervisor/nextStage.js';
 import type { StageDecision, StagePolicy } from '../../src/supervisor/nextStage.js';
 import { EMPTY_LEDGER } from '../../src/supervisor/budget.js';
-import { PROJECTION_VERSION, emptyAttempts } from '../../src/state/workitem.js';
+import { PROJECTION_VERSION, emptyAttempts, emptyQuotaAborts } from '../../src/state/workitem.js';
 import type { WorkItemState } from '../../src/state/workitem.js';
 
 const GOLDEN_PATH = fileURLToPath(new URL('../golden/nextStage.table.json', import.meta.url));
+const PHASE1_NONPARK_PATH = fileURLToPath(
+  new URL('../golden/nextStage.table.phase1-nonpark.json', import.meta.url),
+);
+const PHASE2_GOLDEN_PATH = fileURLToPath(
+  new URL('../golden/nextStage.phase2.table.json', import.meta.url),
+);
 
 const TIMESTAMP = IsoTimestampSchema.parse('2024-01-01T00:00:00.000Z');
 const ITEM_ID = WorkItemIdSchema.parse('wi-example-abc123');
@@ -25,8 +32,17 @@ const SLUG = SlugSchema.parse('example');
 const EVENT_ID = EventIdSchema.parse('evt-00000000-0000-4000-8000-000000000000');
 const CHECKPOINT_ID = CheckpointIdSchema.parse('cp-example-1');
 
+function nullStageAccounts(): Readonly<Record<Stage, AccountId | null>> {
+  const out = {} as Record<Stage, AccountId | null>;
+  for (const stage of STAGES) {
+    out[stage] = null;
+  }
+  return out;
+}
+
 const POLICY: StagePolicy = {
   limits: { kOracle: 3, kTest: 3, kReview: 2, maxAttemptsPerStage: 3 },
+  stageAccounts: nullStageAccounts(),
 };
 
 const STATUSES = ['active', 'parked', 'completed', 'failed'] as const;
@@ -112,19 +128,34 @@ function buildState(row: {
     failures: [],
     park:
       row.status === 'parked'
-        ? { reason: 'awaiting-human', detail: 'test-park', since: TIMESTAMP, resumable: true }
+        ? {
+            reason: 'awaiting-human',
+            detail: 'test-park',
+            since: TIMESTAMP,
+            resumable: true,
+            account: null,
+            resetsAt: null,
+          }
         : null,
     budget: {
-      consumed: EMPTY_LEDGER,
-      exhausted:
+      accounts: {},
+      item: EMPTY_LEDGER,
+      itemExhausted:
         row.budgetExhausted === 'none'
           ? null
           : {
               scope: 'task',
               limitKind: row.budgetExhausted === 'provider-quota-caused' ? 'provider-quota' : 'turns',
               at: TIMESTAMP,
+              resetsAt: null,
+              detail: 'test-budget-exhausted',
             },
     },
+    quotaAborts: emptyQuotaAborts(),
+    worktreeLock: null,
+    frozenTests: null,
+    validationFailures: [],
+    itemArtifacts: [],
     workspace: null,
     lastExecutor: null,
     lastDiff: null,
@@ -161,6 +192,9 @@ function serializeRow(row: Row): string {
 
 describe('nextStage: 648-row guard-precedence table', () => {
   const rows = generateRows();
+  const generated = rows.map(serializeRow);
+  const golden = JSON.parse(readFileSync(GOLDEN_PATH, 'utf8')) as string[];
+  const phase1Nonpark = JSON.parse(readFileSync(PHASE1_NONPARK_PATH, 'utf8')) as string[];
 
   it('generates exactly the 648-row cross product', () => {
     expect(rows).toHaveLength(648);
@@ -178,12 +212,22 @@ describe('nextStage: 648-row guard-precedence table', () => {
   });
 
   it('matches the committed golden table (canonicalJson per row)', () => {
-    const serialized = rows.map(serializeRow);
-    if (process.env['UPDATE_GOLDEN'] === '1') {
-      writeFileSync(GOLDEN_PATH, `${JSON.stringify(serialized, null, 2)}\n`, 'utf8');
+    expect(generated).toEqual(golden);
+  });
+
+  it('"account" in decision iff decision.kind === "park"', () => {
+    for (const row of rows) {
+      const decision = decisionFor(row);
+      expect('account' in decision).toBe(decision.kind === 'park');
     }
-    const golden = JSON.parse(readFileSync(GOLDEN_PATH, 'utf8')) as string[];
-    expect(serialized).toEqual(golden);
+  });
+
+  it('every non-park entry is byte-identical to its frozen Phase 1 counterpart', () => {
+    const nonParkGenerated = rows
+      .map((row, index) => ({ row, serialized: generated[index] }))
+      .filter(({ row }) => decisionFor(row).kind !== 'park')
+      .map(({ serialized }) => serialized);
+    expect(nonParkGenerated).toEqual(phase1Nonpark);
   });
 
   it('precedence: parked + budget-exhausted => park carrying the park reason, not the budget reason', () => {
@@ -195,7 +239,12 @@ describe('nextStage: 648-row guard-precedence table', () => {
       attempts: 0,
       openBlockingCheckpoint: false,
     });
-    expect(decision).toEqual({ kind: 'park', reason: 'awaiting-human', detail: 'test-park' });
+    expect(decision).toEqual({
+      kind: 'park',
+      reason: 'awaiting-human',
+      detail: 'test-park',
+      account: null,
+    });
   });
 
   it('precedence: budget-exhausted + attempts-over => budget-exhausted', () => {
@@ -238,5 +287,225 @@ describe('nextStage: 648-row guard-precedence table', () => {
     if (decision.kind === 'park') {
       expect(decision.reason).toBe('provider-quota');
     }
+  });
+});
+
+// --- Phase 2 dimensions: account-aware guards (§0.7 binding decision 27) ---
+// A separate golden file and a separate generator. Appending to the Phase 1 array is
+// forbidden; this table lives in its own file with its own cross product.
+
+const ACCT_A = AccountIdSchema.parse('acct-a');
+const ACCT_B = AccountIdSchema.parse('acct-b');
+
+const PHASE2_STAGE_ACCOUNTS: Readonly<Record<Stage, AccountId | null>> = {
+  intake: null,
+  analysis: ACCT_A,
+  architecture: ACCT_A,
+  planning: ACCT_A,
+  'test-authoring': ACCT_A,
+  implementation: ACCT_B,
+  review: ACCT_B,
+  integration: null,
+  done: null,
+};
+
+const PHASE2_POLICY: StagePolicy = {
+  limits: POLICY.limits,
+  stageAccounts: PHASE2_STAGE_ACCOUNTS,
+};
+
+const ACCOUNT_EXHAUSTED_CASES = ['none', 'this-stage', 'different-stage'] as const;
+type AccountExhaustedCase = (typeof ACCOUNT_EXHAUSTED_CASES)[number];
+
+interface Phase2Row {
+  readonly stage: Stage;
+  readonly accountExhausted: AccountExhaustedCase;
+  readonly quotaAborts: number;
+  readonly attemptsCategory: AttemptCategory;
+  readonly attempts: number;
+  readonly openBlockingCheckpoint: boolean;
+}
+
+/**
+ * Programmatically generates the 486-row cross product
+ * `Stage(9) x accountExhausted(3: none | this stage's account | a different account) x
+ *  quotaAborts(3: 0, 1, 2) x attempts(3: 0, limit-1, limit) x openBlockingCheckpoint(2)`.
+ * `status` is fixed to `'active'`. Never hand-written, never randomised.
+ */
+function generatePhase2Rows(): Phase2Row[] {
+  const rows: Phase2Row[] = [];
+  for (const stage of STAGES) {
+    const limit = limitForStage(stage, PHASE2_POLICY);
+    for (const accountExhausted of ACCOUNT_EXHAUSTED_CASES) {
+      for (const quotaAborts of [0, 1, 2]) {
+        for (const attemptsCategory of ATTEMPT_CATEGORIES) {
+          const attempts = attemptsValueFor(limit, attemptsCategory);
+          for (const openBlockingCheckpoint of [false, true]) {
+            rows.push({
+              stage,
+              accountExhausted,
+              quotaAborts,
+              attemptsCategory,
+              attempts,
+              openBlockingCheckpoint,
+            });
+          }
+        }
+      }
+    }
+  }
+  return rows;
+}
+
+function otherAccount(a: AccountId | null): AccountId {
+  return a === ACCT_A ? ACCT_B : ACCT_A;
+}
+
+function buildPhase2State(row: Phase2Row): WorkItemState {
+  const thisAccount = PHASE2_STAGE_ACCOUNTS[row.stage];
+  const exhaustedAccount: AccountId | null =
+    row.accountExhausted === 'none'
+      ? null
+      : row.accountExhausted === 'this-stage'
+        ? (thisAccount ?? otherAccount(null))
+        : otherAccount(thisAccount);
+
+  return {
+    projectionVersion: PROJECTION_VERSION,
+    itemId: ITEM_ID,
+    slug: SLUG,
+    seq: 1,
+    lastEventId: EVENT_ID,
+    createdAt: TIMESTAMP,
+    updatedAt: TIMESTAMP,
+    title: 'Example item',
+    source: { kind: 'prd-file', path: 'prd.md', sha256: 'a'.repeat(64), bytes: 10 },
+    configHash: 'deadbeef',
+    status: 'active',
+    stage: row.stage,
+    stageEnteredAt: TIMESTAMP,
+    attempts: { ...emptyAttempts(), [row.stage]: row.attempts },
+    failures: [],
+    park: null,
+    budget: {
+      accounts:
+        exhaustedAccount === null
+          ? {}
+          : {
+              [exhaustedAccount]: {
+                consumed: EMPTY_LEDGER,
+                exhausted: {
+                  scope: 'item',
+                  limitKind: 'provider-quota',
+                  at: TIMESTAMP,
+                  resetsAt: TIMESTAMP,
+                  detail: 'test-account-exhausted',
+                },
+              },
+            },
+      item: EMPTY_LEDGER,
+      itemExhausted: null,
+    },
+    quotaAborts: { ...emptyQuotaAborts(), [row.stage]: row.quotaAborts },
+    worktreeLock: null,
+    frozenTests: null,
+    validationFailures: [],
+    itemArtifacts: [],
+    workspace: null,
+    lastExecutor: null,
+    lastDiff: null,
+    artifacts: {},
+    checkpoints: row.openBlockingCheckpoint
+      ? {
+          [CHECKPOINT_ID]: {
+            id: CHECKPOINT_ID,
+            kind: 'irreversible',
+            stage: row.stage,
+            blocking: true,
+            status: 'open',
+            raisedAt: TIMESTAMP,
+            resolvedAt: null,
+            resolvedBy: null,
+          },
+        }
+      : {},
+    assumptions: [],
+    drift: [],
+    tampering: [],
+    runs: [],
+  };
+}
+
+function phase2DecisionFor(row: Phase2Row): StageDecision {
+  return nextStage(buildPhase2State(row), PHASE2_POLICY);
+}
+
+function serializePhase2Row(row: Phase2Row): string {
+  return canonicalJson({ row, decision: phase2DecisionFor(row) });
+}
+
+describe('nextStage: 486-row Phase 2 account-aware guard table', () => {
+  const rows = generatePhase2Rows();
+  const generated = rows.map(serializePhase2Row);
+  const golden = JSON.parse(readFileSync(PHASE2_GOLDEN_PATH, 'utf8')) as string[];
+
+  it('generates exactly the 486-row cross product', () => {
+    expect(rows).toHaveLength(486);
+  });
+
+  it('never throws, and every decision is one of the four StageDecision kinds', () => {
+    for (const row of rows) {
+      const state = buildPhase2State(row);
+      let decision: StageDecision | undefined;
+      expect(() => {
+        decision = nextStage(state, PHASE2_POLICY);
+      }).not.toThrow();
+      expect(['run', 'checkpoint', 'park', 'done']).toContain(decision?.kind);
+    }
+  });
+
+  it('matches the committed Phase 2 golden table (canonicalJson per row)', () => {
+    expect(generated).toEqual(golden);
+  });
+
+  it("criterion 10: a different account exhausted does NOT park", () => {
+    const decision = phase2DecisionFor({
+      stage: 'analysis',
+      accountExhausted: 'different-stage',
+      quotaAborts: 0,
+      attemptsCategory: 'zero',
+      attempts: 0,
+      openBlockingCheckpoint: false,
+    });
+    expect(decision.kind).toBe('run');
+  });
+
+  it("this stage's account exhausted parks with reason 'provider-quota' and account naming it, even at attempts: 0", () => {
+    const decision = phase2DecisionFor({
+      stage: 'analysis',
+      accountExhausted: 'this-stage',
+      quotaAborts: 0,
+      attemptsCategory: 'zero',
+      attempts: 0,
+      openBlockingCheckpoint: false,
+    });
+    expect(decision.kind).toBe('park');
+    if (decision.kind === 'park') {
+      expect(decision.reason).toBe('provider-quota');
+      expect(decision.account).toBe(ACCT_A);
+    }
+  });
+
+  it("criterion 10: quotaAborts === attempts yields run with attempt: 1 at the limit (no attempt burn)", () => {
+    const limit = limitForStage('analysis', PHASE2_POLICY);
+    const decision = phase2DecisionFor({
+      stage: 'analysis',
+      accountExhausted: 'none',
+      quotaAborts: limit,
+      attemptsCategory: 'at-limit',
+      attempts: limit,
+      openBlockingCheckpoint: false,
+    });
+    expect(decision).toEqual({ kind: 'run', stage: 'analysis', attempt: 1, needsHuman: false });
   });
 });

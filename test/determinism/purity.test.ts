@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { canonicalJson } from '../../src/core/canonical.js';
 import { DEFAULT_TIER, MienguEventSchema } from '../../src/core/events.js';
 import type { EventType, MienguEvent, Stage } from '../../src/core/events.js';
 import { project } from '../../src/state/projector.js';
@@ -20,7 +21,7 @@ function tsAt(n: number): string {
 
 function mkEvent(seq: number, type: EventType, data: unknown): MienguEvent {
   return MienguEventSchema.parse({
-    schema_version: 1,
+    schema_version: 2,
     event_id: hexId('evt', seq),
     seq,
     item_id: ITEM_ID,
@@ -46,8 +47,84 @@ const STAGE_CYCLE: readonly Stage[] = [
   'done',
 ];
 
+const ACCOUNTS = ['claude-personal', 'codex-personal'] as const;
+
+function executorInvoked(seq: number, stage: Stage, account: (typeof ACCOUNTS)[number]): MienguEvent {
+  return mkEvent(seq, 'ExecutorInvoked', {
+    executor_id: 'stub',
+    executor_type: 'stub',
+    account,
+    role: null,
+    stage,
+    workdir: '/tmp/wd',
+    sandbox_intent: 'workspace-write',
+    native_structured_output: false,
+    output_schema_sha256: null,
+    prompt_sha256: 'a'.repeat(64),
+    prompt_bytes: 10,
+    prompt_path: null,
+    prompt_template_sha256: null,
+    validation_attempt: 1,
+    context_pack_id: null,
+    context_pack_estimated_tokens: null,
+    session_id: null,
+    resolved: { model: null, effort: null, max_turns: 10, context_budget_tokens: 1000 },
+    budget: { max_turns: 10, max_wall_seconds: 60 },
+    command_line: ['stub'],
+    session_id: 'sess-stub',
+  });
+}
+
+function executorReturned(
+  seq: number,
+  stage: Stage,
+  account: (typeof ACCOUNTS)[number],
+  status: 'completed' | 'quota_exhausted',
+): MienguEvent {
+  return mkEvent(seq, 'ExecutorReturned', {
+    executor_id: 'stub',
+    executor_type: 'stub',
+    account,
+    stage,
+    status,
+    telemetry: {
+      turns: 1,
+      input_tokens: null,
+      output_tokens: null,
+      cache_read_tokens: null,
+      cache_creation_tokens: null,
+      wall_seconds: 1,
+    },
+    quota:
+      status === 'quota_exhausted'
+        ? {
+            account,
+            source: 'rate-limit-event',
+            status: 'blocked',
+            utilization: 1,
+            window_kind: 'five_hour',
+            resets_at: null,
+          }
+        : null,
+    raw: {
+      exit_code: 0,
+      signal: null,
+      killed: 'none',
+      observed_turns: 1,
+      failure_kind: null,
+      stderr_tail: '',
+      transcript_path: null,
+      final_message_bytes: null,
+      command_line: ['stub'],
+      session_id: 'sess-stub',
+    },
+  });
+}
+
 /** A deterministic, self-contained N-event golden fixture built without idgen.ts or
- * clock.ts, so this file never has to import a module that touches `node:crypto`. */
+ * clock.ts, so this file never has to import a module that touches `node:crypto`. Includes
+ * at least one `BudgetConsumed` per account, one `ExecutorReturned{quota_exhausted}`, one
+ * `TestsFrozen`, and a matched `WorktreeLockAcquired`/`Released` pair. */
 function buildFixture(n: number): MienguEvent[] {
   const events: MienguEvent[] = [
     mkEvent(1, 'WorkItemCreated', {
@@ -57,52 +134,61 @@ function buildFixture(n: number): MienguEvent[] {
       config_hash: 'deadbeef',
     }),
   ];
+  let seq = 2;
+  function push(event: MienguEvent): void {
+    events.push(event);
+    seq += 1;
+  }
+
+  // Fixed prefix: exercises every Phase 2 delta at least once, deterministically.
+  push(mkEvent(seq, 'StageEntered', { stage: 'implementation', attempt: 1 }));
+  push(
+    mkEvent(seq, 'WorktreeLockAcquired', {
+      workdir: '/tmp/wd',
+      holder: 'cc-sonnet',
+      stage: 'implementation',
+      intent: 'workspace-write',
+    }),
+  );
+  push(executorInvoked(seq, 'implementation', 'claude-personal'));
+  push(executorReturned(seq, 'implementation', 'claude-personal', 'quota_exhausted'));
+  push(
+    mkEvent(seq, 'WorktreeLockReleased', {
+      workdir: '/tmp/wd',
+      holder: 'cc-sonnet',
+      stage: 'implementation',
+      reclaimed: false,
+    }),
+  );
+  push(mkEvent(seq, 'BudgetConsumed', { scope: 'task', account: 'claude-personal', wall_seconds: 1, turns: 1, usd: null }));
+  push(mkEvent(seq, 'BudgetConsumed', { scope: 'task', account: 'codex-personal', wall_seconds: 1, turns: 1, usd: null }));
+  push(
+    mkEvent(seq, 'TestsFrozen', {
+      suite_id: 'suite-example-1',
+      content_hash: 'c'.repeat(64),
+      files: [{ path: 'test/x.test.ts', sha256: 'd'.repeat(64), bytes: 10 }],
+      frozen_copy_dir: '/tmp/frozen',
+    }),
+  );
+  push(mkEvent(seq, 'StageCompleted', { stage: 'implementation', attempt: 1, artifact: null }));
 
   let cycleIndex = 0;
-  let seq = 2;
   while (events.length < n) {
     const stage = STAGE_CYCLE[Math.floor(cycleIndex / 6) % STAGE_CYCLE.length] as Stage;
     const phase = cycleIndex % 6;
+    const account = ACCOUNTS[cycleIndex % ACCOUNTS.length] as (typeof ACCOUNTS)[number];
     switch (phase) {
       case 0:
-        events.push(mkEvent(seq, 'StageEntered', { stage, attempt: 1 }));
+        push(mkEvent(seq, 'StageEntered', { stage, attempt: 1 }));
         break;
       case 1:
-        events.push(
-          mkEvent(seq, 'ExecutorInvoked', {
-            executor_id: 'stub',
-            stage,
-            workdir: '/tmp/wd',
-            prompt_sha256: 'a'.repeat(64),
-            prompt_bytes: 10,
-            context_pack_id: null,
-            session_id: null,
-            budget: { max_turns: 10, max_wall_seconds: 60 },
-            command_line: ['stub'],
-          }),
-        );
+        push(executorInvoked(seq, stage, account));
         break;
       case 2:
-        events.push(
-          mkEvent(seq, 'ExecutorReturned', {
-            executor_id: 'stub',
-            stage,
-            status: 'completed',
-            telemetry: { turns: 1, input_tokens: null, output_tokens: null, wall_seconds: 1 },
-            raw: {
-              exit_code: 0,
-              signal: null,
-              killed: 'none',
-              observed_turns: 1,
-              failure_kind: null,
-              stderr_tail: '',
-              transcript_path: null,
-            },
-          }),
-        );
+        push(executorReturned(seq, stage, account, 'completed'));
         break;
       case 3:
-        events.push(
+        push(
           mkEvent(seq, 'DiffCaptured', {
             workdir: '/tmp/wd',
             diff_sha256: 'b'.repeat(64),
@@ -116,14 +202,21 @@ function buildFixture(n: number): MienguEvent[] {
         );
         break;
       case 4:
-        events.push(mkEvent(seq, 'BudgetConsumed', { scope: 'task', wall_seconds: 1, turns: 1, usd: null }));
+        push(
+          mkEvent(seq, 'BudgetConsumed', {
+            scope: 'task',
+            account,
+            wall_seconds: 1,
+            turns: 1,
+            usd: null,
+          }),
+        );
         break;
       case 5:
       default:
-        events.push(mkEvent(seq, 'StageCompleted', { stage, attempt: 1, artifact: null }));
+        push(mkEvent(seq, 'StageCompleted', { stage, attempt: 1, artifact: null }));
         break;
     }
-    seq += 1;
     cycleIndex += 1;
   }
 
@@ -235,4 +328,14 @@ describe('(d) static import audit', () => {
       }
     });
   }
+});
+
+describe('(e) per-account ledger key order is deterministic', () => {
+  it('projecting the fixture twice yields the same budget.accounts key order under canonicalJson', () => {
+    const events = buildFixture(40);
+    const first = project(events);
+    const second = project(events);
+    expect(Object.keys(first.budget.accounts)).toEqual(Object.keys(second.budget.accounts));
+    expect(canonicalJson(first.budget.accounts)).toBe(canonicalJson(second.budget.accounts));
+  });
 });

@@ -30,6 +30,10 @@ import {
   isReqId,
   isTaskId,
   isSlug,
+  AccountIdSchema,
+  ExecutorInstanceIdSchema,
+  isAccountId,
+  isExecutorInstanceId,
 } from '../../src/core/ids.js';
 import type { Slug } from '../../src/core/ids.js';
 import { IdError } from '../../src/errors.js';
@@ -167,5 +171,35 @@ describe('slugify', () => {
 describe('parseSerial', () => {
   it('throws IdError for an unrecognised id', () => {
     expect(() => parseSerial('not-a-known-id-format')).toThrow(IdError);
+  });
+});
+
+describe('AccountIdSchema / ExecutorInstanceIdSchema', () => {
+  const SCHEMAS = [
+    { name: 'AccountId', schema: AccountIdSchema, example: 'claude-personal' },
+    { name: 'ExecutorInstanceId', schema: ExecutorInstanceIdSchema, example: 'cc-sonnet' },
+  ] as const;
+
+  for (const { name, schema, example } of SCHEMAS) {
+    it(`${name}: accepts ${example}`, () => {
+      expect(schema.safeParse(example).success).toBe(true);
+    });
+
+    it(`${name}: rejects uppercase, underscores, spaces, leading/trailing hyphens, empty, 49+ chars`, () => {
+      expect(schema.safeParse('Claude-Personal').success).toBe(false);
+      expect(schema.safeParse('claude_personal').success).toBe(false);
+      expect(schema.safeParse('claude personal').success).toBe(false);
+      expect(schema.safeParse('-claude-personal').success).toBe(false);
+      expect(schema.safeParse('claude-personal-').success).toBe(false);
+      expect(schema.safeParse('').success).toBe(false);
+      expect(schema.safeParse('a'.repeat(49)).success).toBe(false);
+    });
+  }
+
+  it('isAccountId / isExecutorInstanceId narrow correctly', () => {
+    expect(isAccountId('claude-personal')).toBe(true);
+    expect(isAccountId('Claude_Personal')).toBe(false);
+    expect(isExecutorInstanceId('cc-sonnet')).toBe(true);
+    expect(isExecutorInstanceId('cc sonnet')).toBe(false);
   });
 });

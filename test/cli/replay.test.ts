@@ -37,8 +37,29 @@ beforeEach(async () => {
     [
       'target:',
       `  repo: ${targetRepo}`,
-      'executor:',
-      '  id: stub',
+      'accounts:',
+      '  stub-account: {}',
+      'executors:',
+      '  stub-analyst: { type: stub, account: stub-account }',
+      '  stub-architect: { type: stub, account: stub-account }',
+      '  stub-planner: { type: stub, account: stub-account }',
+      '  stub-testauthor: { type: stub, account: stub-account }',
+      '  stub-coder: { type: stub, account: stub-account }',
+      '  stub-reviewer: { type: stub, account: stub-account }',
+      'tiers:',
+      '  stub-analyst: 1',
+      '  stub-architect: 1',
+      '  stub-planner: 1',
+      '  stub-testauthor: 1',
+      '  stub-coder: 1',
+      '  stub-reviewer: 1',
+      'roles:',
+      '  analyst: { executor: stub-analyst, maxTurns: 8, contextBudgetTokens: 40000 }',
+      '  architect: { executor: stub-architect, maxTurns: 8, contextBudgetTokens: 40000 }',
+      '  planner: { executor: stub-planner, maxTurns: 8, contextBudgetTokens: 40000 }',
+      '  testAuthor: { executor: stub-testauthor, maxTurns: 8, contextBudgetTokens: 40000 }',
+      '  coder: { executor: stub-coder, maxTurns: 8, contextBudgetTokens: 40000 }',
+      '  reviewer: { executor: stub-reviewer, maxTurns: 8, contextBudgetTokens: 40000 }',
       'store:',
       '  dir: .miengu',
       '  snapshotEvery: 3',
@@ -122,6 +143,25 @@ describe('replayCommand', () => {
     expect(lines.length).toBeGreaterThan(2);
     const middleIndex = Math.floor(lines.length / 2);
     lines[middleIndex] = 'not valid json for this line';
+    await writeFile(paths.eventsFile, `${lines.join('\n')}\n`, 'utf8');
+
+    await expect(replayCommand({ itemId, configPath, json: true })).rejects.toMatchObject({
+      exitCode: 4,
+    });
+  });
+
+  it('exits 4 against a log carrying a v1 schema_version line (the clean break, observable)', async () => {
+    const itemId = await runOneItem();
+    const storeDir = join(workDir, '.miengu');
+    const paths = itemPaths(storeDir, itemId);
+
+    const raw = await readFile(paths.eventsFile, 'utf8');
+    const lines = raw.trim().split('\n');
+    expect(lines.length).toBeGreaterThan(2);
+    const firstLine = JSON.parse(lines[0] ?? '{}') as { schema_version: number };
+    expect(firstLine.schema_version).toBe(2);
+    firstLine.schema_version = 1;
+    lines[0] = JSON.stringify(firstLine);
     await writeFile(paths.eventsFile, `${lines.join('\n')}\n`, 'utf8');
 
     await expect(replayCommand({ itemId, configPath, json: true })).rejects.toMatchObject({

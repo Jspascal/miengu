@@ -31,8 +31,16 @@ async function readdirSafe(dir: string): Promise<string[]> {
 }
 
 /**
- * §11 Phase 1 acceptance criterion: a work item advances through stub stages, produces a
- * complete event log, and `miengu replay` reconstructs identical state from events alone.
+ * §11 Phase 1 acceptance criterion, carried into Phase 2: a work item advances through the
+ * event-sourced pipeline, produces a complete event log, and `miengu replay` reconstructs
+ * identical state from events alone. The scaffold's shipped default (item 18) now points every
+ * role at a real vendor executor (`claude-code`/`codex`), which this hermetic test must not
+ * invoke; the config is overwritten, after `init`, with a stub-only one, matching the pattern
+ * `test/cli/run.test.ts` uses. A config-declared `stub` instance runs `StubExecutor`'s default
+ * script, whose per-stage artifacts satisfy both the §4 contracts and the mechanical checks, so
+ * the item still advances through all six role stages to `done` — the Phase 1 criterion is
+ * unchanged by Phase 2, as `Phase2 delta.md` requires ("nothing here invalidates what was
+ * built").
  */
 describe('Phase 1 acceptance: end-to-end against a throwaway target repo', () => {
   it('runs a work item to completion, replays identically, and survives torn/corrupt logs correctly', async () => {
@@ -53,12 +61,45 @@ describe('Phase 1 acceptance: end-to-end against a throwaway target repo', () =>
       // 1. `miengu init --target <targetRepo>`
       await initCommand({ dir: workDir, target: targetRepo });
       const configPath = join(workDir, 'miengu.config.yaml');
-
-      // 2. patch executor.id: 'stub' (already the scaffold default) and store.snapshotEvery: 3
       const rendered = await readFile(configPath, 'utf8');
-      const patched = rendered.replace('snapshotEvery: 200', 'snapshotEvery: 3');
-      expect(patched).not.toBe(rendered);
-      await writeFile(configPath, patched, 'utf8');
+      expect(rendered.length).toBeGreaterThan(0);
+
+      // 2. overwrite the scaffolded (real-vendor) config with a stub-only one, snapshotEvery: 3
+      await writeFile(
+        configPath,
+        [
+          'target:',
+          `  repo: ${targetRepo}`,
+          'accounts:',
+          '  stub-account: {}',
+          'executors:',
+          '  stub-analyst: { type: stub, account: stub-account }',
+          '  stub-architect: { type: stub, account: stub-account }',
+          '  stub-planner: { type: stub, account: stub-account }',
+          '  stub-testauthor: { type: stub, account: stub-account }',
+          '  stub-coder: { type: stub, account: stub-account }',
+          '  stub-reviewer: { type: stub, account: stub-account }',
+          'tiers:',
+          '  stub-analyst: 1',
+          '  stub-architect: 1',
+          '  stub-planner: 1',
+          '  stub-testauthor: 1',
+          '  stub-coder: 1',
+          '  stub-reviewer: 1',
+          'roles:',
+          '  analyst: { executor: stub-analyst, maxTurns: 8, contextBudgetTokens: 40000 }',
+          '  architect: { executor: stub-architect, maxTurns: 8, contextBudgetTokens: 40000 }',
+          '  planner: { executor: stub-planner, maxTurns: 8, contextBudgetTokens: 40000 }',
+          '  testAuthor: { executor: stub-testauthor, maxTurns: 8, contextBudgetTokens: 40000 }',
+          '  coder: { executor: stub-coder, maxTurns: 8, contextBudgetTokens: 40000 }',
+          '  reviewer: { executor: stub-reviewer, maxTurns: 8, contextBudgetTokens: 40000 }',
+          'store:',
+          '  dir: .miengu',
+          '  snapshotEvery: 3',
+          '',
+        ].join('\n'),
+        'utf8',
+      );
 
       // 3. write a small PRD and run it
       const prdFile = join(workDir, 'prd.md');
@@ -77,7 +118,9 @@ describe('Phase 1 acceptance: end-to-end against a throwaway target repo', () =>
       }
       const paths = itemPaths(storeDir, itemId);
 
-      // item reaches stage:'done', status:'completed'
+      // item reaches stage:'done', status:'completed' — BUILD_PROMPT §11's Phase 1 criterion,
+      // unchanged by Phase 2. The stub's default script returns a contract-valid artifact per
+      // role stage precisely so this property survives the introduction of §4 contracts.
       const finalState = await projectFromSeq1(storeDir, itemId);
       expect(finalState.stage).toBe('done');
       expect(finalState.status).toBe('completed');

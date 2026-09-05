@@ -1,10 +1,22 @@
-import type { BudgetLedger } from '../state/workitem.js';
+import type { AccountId } from '../core/ids.js';
+import type { AccountLedger, BudgetExhaustion, BudgetLedger, BudgetState } from '../state/workitem.js';
 
 export const EMPTY_LEDGER: BudgetLedger = {
   wallSeconds: 0,
   turns: 0,
   usd: 0,
   partial: { turns: false, usd: false },
+};
+
+export const EMPTY_ACCOUNT_LEDGER: AccountLedger = {
+  consumed: EMPTY_LEDGER,
+  exhausted: null,
+};
+
+export const EMPTY_BUDGET_STATE: BudgetState = {
+  accounts: {},
+  item: EMPTY_LEDGER,
+  itemExhausted: null,
 };
 
 export interface BudgetDelta {
@@ -77,4 +89,49 @@ export function fromTelemetry(t: ExecutorTelemetry, usd: number | null): BudgetD
     turns: t.turns,
     usd,
   };
+}
+
+/**
+ * Applies one delta to BOTH `accounts[account]` and `item` — the two-accumulator rule
+ * (binding decision 21). Never derives `item` by summing `accounts`.
+ */
+export function foldConsumed(s: BudgetState, account: AccountId, d: BudgetDelta): BudgetState {
+  const existing = s.accounts[account] ?? EMPTY_ACCOUNT_LEDGER;
+  return {
+    accounts: {
+      ...s.accounts,
+      [account]: { ...existing, consumed: accumulate(existing.consumed, d) },
+    },
+    item: accumulate(s.item, d),
+    itemExhausted: s.itemExhausted,
+  };
+}
+
+/** `account === null` targets `itemExhausted`; otherwise `accounts[account].exhausted`. */
+export function foldExhausted(
+  s: BudgetState,
+  account: AccountId | null,
+  e: BudgetExhaustion | null,
+): BudgetState {
+  if (account === null) {
+    return { ...s, itemExhausted: e };
+  }
+  const existing = s.accounts[account] ?? EMPTY_ACCOUNT_LEDGER;
+  return {
+    accounts: { ...s.accounts, [account]: { ...existing, exhausted: e } },
+    item: s.item,
+    itemExhausted: s.itemExhausted,
+  };
+}
+
+/** An account with no recorded spend is not exhausted. Never throws, never mints a key. */
+export function accountLedger(s: BudgetState, account: AccountId): AccountLedger {
+  return s.accounts[account] ?? EMPTY_ACCOUNT_LEDGER;
+}
+
+export function isAccountExhausted(s: BudgetState, account: AccountId | null): boolean {
+  if (account === null) {
+    return false;
+  }
+  return accountLedger(s, account).exhausted !== null;
 }

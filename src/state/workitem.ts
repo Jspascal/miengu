@@ -5,11 +5,15 @@ import {
   BUDGET_SCOPES,
   CHECKPOINT_KINDS,
   EXECUTOR_STATUSES,
+  EXECUTOR_TYPES,
   PARK_REASONS,
+  ROLES,
   RUN_OUTCOMES,
+  SANDBOX_INTENTS,
   STAGE_FAILURE_REASONS,
   STAGES,
   TARGET_MODES,
+  VALIDATION_FAILURE_KINDS,
 } from '../core/events.js';
 import type {
   ArtifactKind,
@@ -17,17 +21,23 @@ import type {
   BudgetScope,
   CheckpointKind,
   ExecutorStatus,
+  ExecutorType,
   ParkReason,
+  Role,
   RunOutcome,
+  SandboxIntent,
   Stage,
   StageFailureReason,
   TargetMode,
+  ValidationFailureKind,
 } from '../core/events.js';
 import {
+  AccountIdSchema,
   AssumptionIdSchema,
   CheckpointIdSchema,
   ClaimIdSchema,
   EventIdSchema,
+  ExecutorInstanceIdSchema,
   RunIdSchema,
   SlugSchema,
   SuiteIdSchema,
@@ -35,10 +45,12 @@ import {
   WorkItemIdSchema,
 } from '../core/ids.js';
 import type {
+  AccountId,
   AssumptionId,
   CheckpointId,
   ClaimId,
   EventId,
+  ExecutorInstanceId,
   RunId,
   Slug,
   SuiteId,
@@ -46,7 +58,7 @@ import type {
   WorkItemId,
 } from '../core/ids.js';
 
-export const PROJECTION_VERSION = 1;
+export const PROJECTION_VERSION = 2;
 
 export const STAGE_ORDER: readonly Stage[] = STAGES;
 
@@ -68,6 +80,52 @@ export function emptyAttempts(): Record<Stage, number> {
     integration: 0,
     done: 0,
   } satisfies Record<Stage, number>;
+}
+
+/** All nine `Stage` keys, zeroed. Binding decision 19's parallel counter. */
+export function emptyQuotaAborts(): Record<Stage, number> {
+  return {
+    intake: 0,
+    analysis: 0,
+    architecture: 0,
+    planning: 0,
+    'test-authoring': 0,
+    implementation: 0,
+    review: 0,
+    integration: 0,
+    done: 0,
+  } satisfies Record<Stage, number>;
+}
+
+const STAGE_ROLE: Readonly<Record<Stage, Role | null>> = {
+  intake: null,
+  analysis: 'analyst',
+  architecture: 'architect',
+  planning: 'planner',
+  'test-authoring': 'testAuthor',
+  implementation: 'coder',
+  review: 'reviewer',
+  integration: null,
+  done: null,
+};
+
+const ROLE_STAGE: Readonly<Record<Role, Stage>> = {
+  analyst: 'analysis',
+  architect: 'architecture',
+  planner: 'planning',
+  testAuthor: 'test-authoring',
+  coder: 'implementation',
+  reviewer: 'review',
+};
+
+/** `intake`, `integration`, `done` are supervisor-only (binding decision 5): `null`. */
+export function roleForStage(s: Stage): Role | null {
+  return STAGE_ROLE[s];
+}
+
+/** Total, the inverse of `roleForStage` over the six agent-run stages. */
+export function stageForRole(r: Role): Stage {
+  return ROLE_STAGE[r];
 }
 
 // Mirrors src/core/clock.ts's IsoTimestampSchema exactly (same validation, same brand
@@ -119,12 +177,68 @@ export interface BudgetLedger {
   partial: { turns: boolean; usd: boolean };
 }
 
+export interface BudgetExhaustion {
+  readonly scope: BudgetScope;
+  readonly limitKind: BudgetLimitKind;
+  readonly at: IsoTimestamp;
+  readonly resetsAt: IsoTimestamp | null;
+  readonly detail: string;
+}
+
+export interface AccountLedger {
+  readonly consumed: BudgetLedger;
+  readonly exhausted: BudgetExhaustion | null;
+}
+
+export interface BudgetState {
+  readonly accounts: Readonly<Record<AccountId, AccountLedger>>;
+  readonly item: BudgetLedger;
+  readonly itemExhausted: BudgetExhaustion | null;
+}
+
+export interface FrozenTestsState {
+  readonly suiteId: SuiteId;
+  readonly contentHash: string;
+  readonly files: readonly { path: string; sha256: string; bytes: number }[];
+  readonly frozenCopyDir: string;
+  readonly at: IsoTimestamp;
+}
+
+export interface WorktreeLockState {
+  readonly holder: ExecutorInstanceId;
+  readonly workdir: string;
+  readonly stage: Stage;
+  readonly intent: SandboxIntent;
+  readonly since: IsoTimestamp;
+}
+
+export interface ValidationFailureRecord {
+  readonly stage: Stage;
+  readonly role: Role;
+  readonly attempt: number;
+  readonly validationAttempt: 1 | 2;
+  readonly kind: ValidationFailureKind;
+  readonly errors: readonly string[];
+  readonly at: IsoTimestamp;
+}
+
+export interface ItemArtifactRecord {
+  readonly role: Role;
+  readonly stage: Stage;
+  readonly artifactKind: ArtifactKind;
+  readonly sha256: string;
+  readonly summary: string;
+  readonly at: IsoTimestamp;
+}
+
 // Mirrors src/executors/executor.ts's ExecutorTelemetry contract (that module is built
 // in a later item). Kept private and structural so this file does not need to import it.
 interface ExecutorTelemetry {
   turns: number | null;
   inputTokens: number | null;
   outputTokens: number | null;
+  cacheReadTokens: number | null;
+  cacheCreationTokens: number | null;
   wallSeconds: number;
 }
 
@@ -149,11 +263,15 @@ export interface WorkItemState {
     detail: string;
     since: IsoTimestamp;
     resumable: boolean;
+    account: AccountId | null;
+    resetsAt: IsoTimestamp | null;
   } | null;
-  readonly budget: {
-    readonly consumed: BudgetLedger;
-    readonly exhausted: { scope: BudgetScope; limitKind: BudgetLimitKind; at: IsoTimestamp } | null;
-  };
+  readonly budget: BudgetState;
+  readonly quotaAborts: Readonly<Record<Stage, number>>;
+  readonly worktreeLock: WorktreeLockState | null;
+  readonly frozenTests: FrozenTestsState | null;
+  readonly validationFailures: readonly ValidationFailureRecord[];
+  readonly itemArtifacts: readonly ItemArtifactRecord[];
   readonly workspace: {
     mode: TargetMode;
     targetRepo: string;
@@ -163,7 +281,9 @@ export interface WorkItemState {
     discarded: boolean;
   } | null;
   readonly lastExecutor: {
-    executorId: string;
+    executorId: ExecutorInstanceId;
+    executorType: ExecutorType;
+    account: AccountId;
     stage: Stage;
     status: ExecutorStatus;
     telemetry: ExecutorTelemetry;
@@ -193,6 +313,7 @@ export interface WorkItemState {
     expectedHash: string;
     observedHash: string;
     paths: readonly string[];
+    restored: boolean;
     at: IsoTimestamp;
   }[];
   readonly runs: readonly {
@@ -220,6 +341,8 @@ const ParkSchema = z
     detail: z.string(),
     since: IsoTimestampSchema,
     resumable: z.boolean(),
+    account: AccountIdSchema.nullable(),
+    resetsAt: IsoTimestampSchema.nullable(),
   })
   .strict()
   .nullable();
@@ -237,6 +360,8 @@ const AttemptsSchema = z
     done: z.number().int().nonnegative(),
   })
   .strict();
+
+const QuotaAbortsSchema = AttemptsSchema;
 
 const StageFailureRecordSchema = z
   .object({
@@ -263,17 +388,81 @@ const BudgetLedgerSchema = z
   })
   .strict();
 
-const BudgetStateSchema = z
+const BudgetExhaustionSchema = z
+  .object({
+    scope: z.enum(BUDGET_SCOPES),
+    limitKind: z.enum(BUDGET_LIMIT_KINDS),
+    at: IsoTimestampSchema,
+    resetsAt: IsoTimestampSchema.nullable(),
+    detail: z.string(),
+  })
+  .strict();
+
+const AccountLedgerSchema = z
   .object({
     consumed: BudgetLedgerSchema,
-    exhausted: z
-      .object({
-        scope: z.enum(BUDGET_SCOPES),
-        limitKind: z.enum(BUDGET_LIMIT_KINDS),
-        at: IsoTimestampSchema,
-      })
-      .strict()
-      .nullable(),
+    exhausted: BudgetExhaustionSchema.nullable(),
+  })
+  .strict();
+
+const BudgetStateSchema = z
+  .object({
+    accounts: z.record(AccountIdSchema, AccountLedgerSchema),
+    item: BudgetLedgerSchema,
+    itemExhausted: BudgetExhaustionSchema.nullable(),
+  })
+  .strict();
+
+const FrozenTestsStateSchema = z
+  .object({
+    suiteId: SuiteIdSchema,
+    contentHash: z.string(),
+    files: z.array(
+      z
+        .object({
+          path: z.string(),
+          sha256: z.string(),
+          bytes: z.number().int().nonnegative(),
+        })
+        .strict(),
+    ),
+    frozenCopyDir: z.string(),
+    at: IsoTimestampSchema,
+  })
+  .strict()
+  .nullable();
+
+const WorktreeLockStateSchema = z
+  .object({
+    holder: ExecutorInstanceIdSchema,
+    workdir: z.string(),
+    stage: z.enum(STAGES),
+    intent: z.enum(SANDBOX_INTENTS),
+    since: IsoTimestampSchema,
+  })
+  .strict()
+  .nullable();
+
+const ValidationFailureRecordSchema = z
+  .object({
+    stage: z.enum(STAGES),
+    role: z.enum(ROLES),
+    attempt: z.number().int().min(1),
+    validationAttempt: z.union([z.literal(1), z.literal(2)]),
+    kind: z.enum(VALIDATION_FAILURE_KINDS),
+    errors: z.array(z.string()),
+    at: IsoTimestampSchema,
+  })
+  .strict();
+
+const ItemArtifactRecordSchema = z
+  .object({
+    role: z.enum(ROLES),
+    stage: z.enum(STAGES),
+    artifactKind: z.enum(ARTIFACT_KINDS),
+    sha256: z.string(),
+    summary: z.string(),
+    at: IsoTimestampSchema,
   })
   .strict();
 
@@ -294,13 +483,17 @@ const ExecutorTelemetrySchema = z
     turns: z.number().int().nonnegative().nullable(),
     inputTokens: z.number().int().nonnegative().nullable(),
     outputTokens: z.number().int().nonnegative().nullable(),
+    cacheReadTokens: z.number().int().nonnegative().nullable(),
+    cacheCreationTokens: z.number().int().nonnegative().nullable(),
     wallSeconds: z.number().nonnegative(),
   })
   .strict();
 
 const LastExecutorStateSchema = z
   .object({
-    executorId: z.string(),
+    executorId: ExecutorInstanceIdSchema,
+    executorType: z.enum(EXECUTOR_TYPES),
+    account: AccountIdSchema,
     stage: z.enum(STAGES),
     status: z.enum(EXECUTOR_STATUSES),
     telemetry: ExecutorTelemetrySchema,
@@ -386,6 +579,7 @@ const TamperingRecordSchema = z
     expectedHash: z.string(),
     observedHash: z.string(),
     paths: z.array(z.string()),
+    restored: z.boolean(),
     at: IsoTimestampSchema,
   })
   .strict();
@@ -423,6 +617,11 @@ export const WorkItemStateSchema = z
     failures: z.array(StageFailureRecordSchema),
     park: ParkSchema,
     budget: BudgetStateSchema,
+    quotaAborts: QuotaAbortsSchema,
+    worktreeLock: WorktreeLockStateSchema,
+    frozenTests: FrozenTestsStateSchema,
+    validationFailures: z.array(ValidationFailureRecordSchema),
+    itemArtifacts: z.array(ItemArtifactRecordSchema),
     workspace: WorkspaceStateSchema,
     lastExecutor: LastExecutorStateSchema,
     lastDiff: LastDiffStateSchema,

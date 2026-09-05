@@ -5,6 +5,7 @@ import { ConfigError } from '../errors.js';
 import { sha256Canonical } from '../core/hash.js';
 import { CONFIG_FILENAME, MienguConfigSchema } from './schema.js';
 import type { MienguConfig } from './schema.js';
+import { validateConfig } from './validate.js';
 
 export interface LoadedConfig {
   readonly config: MienguConfig;
@@ -81,6 +82,7 @@ export async function loadConfig(
   }
 
   const config = result.data;
+  validateConfig(config);
   const configHash = sha256Canonical(config);
   const configDir = dirname(configPath);
   const storeDir = resolve(configDir, config.store.dir);

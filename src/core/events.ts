@@ -11,9 +11,15 @@ import {
   TaskIdSchema,
   SuiteIdSchema,
   ClaimIdSchema,
+  AccountIdSchema,
+  ExecutorInstanceIdSchema,
 } from './ids.js';
 
-export const EVENT_SCHEMA_VERSION = 1;
+// EVENT_SCHEMA_VERSION 2: clean break, no v1 reader exists (binding decision 7). The repo
+// has zero commits and no production runs; EventLog.open already hard-refuses any line whose
+// schema_version !== EVENT_SCHEMA_VERSION with LogCorruptError, and that refusal is the
+// migration story.
+export const EVENT_SCHEMA_VERSION = 2;
 
 export const ACTOR_KINDS = ['supervisor', 'executor', 'human', 'oracle', 'system'] as const;
 export type ActorKind = (typeof ACTOR_KINDS)[number];
@@ -42,6 +48,27 @@ export const EnvelopeSchema = z.object({
   causation_id: EventIdSchema.nullable(),
 });
 
+export const ROLES = ['analyst', 'architect', 'planner', 'testAuthor', 'coder', 'reviewer'] as const;
+export type Role = (typeof ROLES)[number];
+
+export const EXECUTOR_TYPES = ['claude-code', 'codex', 'stub'] as const; // NOT 'api-sdk' (Phase 3)
+export type ExecutorType = (typeof EXECUTOR_TYPES)[number];
+
+export const SANDBOX_INTENTS = ['read-only', 'workspace-write'] as const;
+export type SandboxIntent = (typeof SANDBOX_INTENTS)[number];
+
+export const VALIDATION_FAILURE_KINDS = ['parse', 'schema', 'mechanical'] as const;
+export type ValidationFailureKind = (typeof VALIDATION_FAILURE_KINDS)[number];
+
+export const QUOTA_SOURCES = [
+  'rate-limit-event',
+  'api-error-status',
+  'stream-regex',
+  'stderr-regex',
+  'provider-event',
+] as const;
+export type QuotaSource = (typeof QUOTA_SOURCES)[number];
+
 export const EVENT_TYPES = [
   // A — item lifecycle
   'WorkItemCreated',
@@ -56,9 +83,12 @@ export const EVENT_TYPES = [
   'StageEntered',
   'StageCompleted',
   'StageFailed',
+  'ArtifactValidationFailed',
   // D — workspace & executor
   'WorkspacePrepared',
   'WorkspaceDiscarded',
+  'WorktreeLockAcquired',
+  'WorktreeLockReleased',
   'ExecutorInvoked',
   'ExecutorReturned',
   'DiffCaptured',
@@ -71,7 +101,9 @@ export const EVENT_TYPES = [
   'AutoApproved',
   // G — named by contract elsewhere in the brief
   'AssumptionRecorded',
+  'TestsFrozen',
   'TestsTampered',
+  'ItemArtifactRecorded',
   'DriftDetected',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
@@ -119,6 +151,8 @@ export const STAGE_FAILURE_REASONS = [
   'validation-failed',
   'workspace-error',
   'internal-error',
+  'sandbox-violation',
+  'tests-tampered',
 ] as const;
 export type StageFailureReason = (typeof STAGE_FAILURE_REASONS)[number];
 
@@ -133,6 +167,7 @@ export const EXECUTOR_STATUSES = [
   'gave_up',
   'budget_turns',
   'budget_wall',
+  'quota_exhausted',
   'crashed',
 ] as const;
 export type ExecutorStatus = (typeof EXECUTOR_STATUSES)[number];
@@ -185,6 +220,8 @@ export const WorkItemParkedData = z
     reason: z.enum(PARK_REASONS),
     detail: z.string(),
     resumable: z.boolean(),
+    account: AccountIdSchema.nullable(),
+    resets_at: EnvelopeTimestampSchema.nullable(),
   })
   .strict();
 
@@ -192,6 +229,7 @@ export const WorkItemResumedData = z
   .object({
     previous_reason: z.enum(PARK_REASONS),
     detail: z.string(),
+    account: AccountIdSchema.nullable(),
   })
   .strict();
 
@@ -255,6 +293,19 @@ export const StageFailedData = z
   })
   .strict();
 
+export const ArtifactValidationFailedData = z
+  .object({
+    stage: z.enum(STAGES),
+    role: z.enum(ROLES),
+    executor_id: ExecutorInstanceIdSchema,
+    attempt: z.number().int().min(1),
+    validation_attempt: z.union([z.literal(1), z.literal(2)]),
+    kind: z.enum(VALIDATION_FAILURE_KINDS),
+    artifact_kind: z.enum(ARTIFACT_KINDS),
+    errors: z.array(z.string()),
+  })
+  .strict();
+
 export const WorkspacePreparedData = z
   .object({
     mode: z.enum(TARGET_MODES),
@@ -272,15 +323,51 @@ export const WorkspaceDiscardedData = z
   })
   .strict();
 
+export const WorktreeLockAcquiredData = z
+  .object({
+    workdir: z.string(),
+    holder: ExecutorInstanceIdSchema,
+    stage: z.enum(STAGES),
+    intent: z.enum(SANDBOX_INTENTS),
+  })
+  .strict();
+
+export const WorktreeLockReleasedData = z
+  .object({
+    workdir: z.string(),
+    holder: ExecutorInstanceIdSchema,
+    stage: z.enum(STAGES),
+    reclaimed: z.boolean(),
+  })
+  .strict();
+
 export const ExecutorInvokedData = z
   .object({
-    executor_id: z.string(),
+    executor_id: ExecutorInstanceIdSchema,
+    executor_type: z.enum(EXECUTOR_TYPES),
+    account: AccountIdSchema,
+    role: z.enum(ROLES).nullable(),
     stage: z.enum(STAGES),
     workdir: z.string(),
+    sandbox_intent: z.enum(SANDBOX_INTENTS),
+    native_structured_output: z.boolean(),
+    output_schema_sha256: z.string().nullable(),
     prompt_sha256: z.string(),
     prompt_bytes: z.number().int().nonnegative(),
+    prompt_path: z.string().nullable(),
+    prompt_template_sha256: z.string().nullable(),
+    validation_attempt: z.union([z.literal(1), z.literal(2)]),
     context_pack_id: z.string().nullable(),
+    context_pack_estimated_tokens: z.number().int().nonnegative().nullable(),
     session_id: z.string().nullable(),
+    resolved: z
+      .object({
+        model: z.string().nullable(),
+        effort: z.string().nullable(),
+        max_turns: z.number().int().positive(),
+        context_budget_tokens: z.number().int().positive(),
+      })
+      .strict(),
     budget: z
       .object({
         max_turns: z.number().int().positive(),
@@ -293,7 +380,9 @@ export const ExecutorInvokedData = z
 
 export const ExecutorReturnedData = z
   .object({
-    executor_id: z.string(),
+    executor_id: ExecutorInstanceIdSchema,
+    executor_type: z.enum(EXECUTOR_TYPES),
+    account: AccountIdSchema,
     stage: z.enum(STAGES),
     status: z.enum(EXECUTOR_STATUSES),
     telemetry: z
@@ -301,9 +390,22 @@ export const ExecutorReturnedData = z
         turns: z.number().int().nonnegative().nullable(),
         input_tokens: z.number().int().nonnegative().nullable(),
         output_tokens: z.number().int().nonnegative().nullable(),
+        cache_read_tokens: z.number().int().nonnegative().nullable(),
+        cache_creation_tokens: z.number().int().nonnegative().nullable(),
         wall_seconds: z.number().nonnegative(),
       })
       .strict(),
+    quota: z
+      .object({
+        account: AccountIdSchema,
+        source: z.enum(QUOTA_SOURCES),
+        status: z.string().nullable(),
+        utilization: z.number().nullable(),
+        window_kind: z.string().nullable(),
+        resets_at: EnvelopeTimestampSchema.nullable(),
+      })
+      .strict()
+      .nullable(),
     raw: z
       .object({
         exit_code: z.number().int().nullable(),
@@ -313,6 +415,14 @@ export const ExecutorReturnedData = z
         failure_kind: FAILURE_KIND_SCHEMA,
         stderr_tail: z.string(),
         transcript_path: z.string().nullable(),
+        final_message_bytes: z.number().int().nonnegative().nullable(),
+        command_line: z.array(z.string()),
+        // The provider's own session handle: `--session-id` for claude-code, and
+        // `thread.started.thread_id` for codex — precisely the id `codex exec resume <id>`
+        // takes. Both adapters advertise `resumableSessions: true`, so without this the id
+        // §17.2's park/resume needs exists nowhere in the log. Recorded here rather than on
+        // ExecutorInvoked because codex only reveals it once the run has started.
+        session_id: z.string().nullable(),
       })
       .strict(),
   })
@@ -334,6 +444,7 @@ export const DiffCapturedData = z
 export const BudgetConsumedData = z
   .object({
     scope: z.enum(BUDGET_SCOPES),
+    account: AccountIdSchema,
     wall_seconds: z.number().nonnegative(),
     turns: z.number().int().nonnegative().nullable(),
     usd: z.number().nonnegative().nullable(),
@@ -343,10 +454,12 @@ export const BudgetConsumedData = z
 export const BudgetExhaustedData = z
   .object({
     scope: z.enum(BUDGET_SCOPES),
+    account: AccountIdSchema.nullable(),
     limit_kind: z.enum(BUDGET_LIMIT_KINDS),
     declared_limit: z.number().nullable(),
     observed: z.number().nullable(),
     detail: z.string(),
+    resets_at: EnvelopeTimestampSchema.nullable(),
   })
   .strict();
 
@@ -390,6 +503,23 @@ export const AssumptionRecordedData = z
   })
   .strict();
 
+export const TestsFrozenData = z
+  .object({
+    suite_id: SuiteIdSchema,
+    content_hash: z.string().regex(/^[0-9a-f]{64}$/),
+    files: z.array(
+      z
+        .object({
+          path: z.string(),
+          sha256: z.string(),
+          bytes: z.number().int().nonnegative(),
+        })
+        .strict(),
+    ),
+    frozen_copy_dir: z.string(),
+  })
+  .strict();
+
 export const TestsTamperedData = z
   .object({
     task_id: TaskIdSchema,
@@ -397,6 +527,17 @@ export const TestsTamperedData = z
     expected_hash: z.string(),
     observed_hash: z.string(),
     paths: z.array(z.string()),
+    restored: z.boolean(),
+  })
+  .strict();
+
+export const ItemArtifactRecordedData = z
+  .object({
+    role: z.enum(ROLES),
+    stage: z.enum(STAGES),
+    artifact_kind: z.enum(ARTIFACT_KINDS),
+    sha256: z.string(),
+    summary: z.string(),
   })
   .strict();
 
@@ -450,6 +591,10 @@ const MEMBERS = {
     type: z.literal('StageFailed'),
     data: StageFailedData,
   }),
+  ArtifactValidationFailed: EnvelopeSchema.extend({
+    type: z.literal('ArtifactValidationFailed'),
+    data: ArtifactValidationFailedData,
+  }),
   WorkspacePrepared: EnvelopeSchema.extend({
     type: z.literal('WorkspacePrepared'),
     data: WorkspacePreparedData,
@@ -457,6 +602,14 @@ const MEMBERS = {
   WorkspaceDiscarded: EnvelopeSchema.extend({
     type: z.literal('WorkspaceDiscarded'),
     data: WorkspaceDiscardedData,
+  }),
+  WorktreeLockAcquired: EnvelopeSchema.extend({
+    type: z.literal('WorktreeLockAcquired'),
+    data: WorktreeLockAcquiredData,
+  }),
+  WorktreeLockReleased: EnvelopeSchema.extend({
+    type: z.literal('WorktreeLockReleased'),
+    data: WorktreeLockReleasedData,
   }),
   ExecutorInvoked: EnvelopeSchema.extend({
     type: z.literal('ExecutorInvoked'),
@@ -494,9 +647,17 @@ const MEMBERS = {
     type: z.literal('AssumptionRecorded'),
     data: AssumptionRecordedData,
   }),
+  TestsFrozen: EnvelopeSchema.extend({
+    type: z.literal('TestsFrozen'),
+    data: TestsFrozenData,
+  }),
   TestsTampered: EnvelopeSchema.extend({
     type: z.literal('TestsTampered'),
     data: TestsTamperedData,
+  }),
+  ItemArtifactRecorded: EnvelopeSchema.extend({
+    type: z.literal('ItemArtifactRecorded'),
+    data: ItemArtifactRecordedData,
   }),
   DriftDetected: EnvelopeSchema.extend({
     type: z.literal('DriftDetected'),
@@ -523,8 +684,11 @@ export const DEFAULT_TIER = {
   StageEntered: 'T1',
   StageCompleted: 'T1',
   StageFailed: 'T1',
+  ArtifactValidationFailed: 'T1',
   WorkspacePrepared: 'T1',
   WorkspaceDiscarded: 'T1',
+  WorktreeLockAcquired: 'T1',
+  WorktreeLockReleased: 'T1',
   ExecutorInvoked: 'T1',
   ExecutorReturned: 'T1',
   DiffCaptured: 'T1',
@@ -534,7 +698,9 @@ export const DEFAULT_TIER = {
   CheckpointDecided: 'T0',
   AutoApproved: 'T1',
   AssumptionRecorded: 'T2',
+  TestsFrozen: 'T1',
   TestsTampered: 'T1',
+  ItemArtifactRecorded: 'T2',
   DriftDetected: 'T1',
 } satisfies Record<EventType, ProvenanceTier>;
 
