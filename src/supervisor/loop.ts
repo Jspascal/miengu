@@ -27,6 +27,8 @@ import type { AppendFn, PackBuildInput, RawPackMaterials } from '../agents/agent
 import type { ArchitecturePlan, RequirementSet, TaskGraph, TestSuiteSpec } from '../contracts/index.js';
 import type { AccountId, ExecutorInstanceId } from '../core/ids.js';
 import type { CauseId, EventId, TaskId } from '../core/ids.js';
+import { artifactSectionTier, deriveClaims } from '../wiki/records.js';
+import { fileMapBodies, stackFactsBodies, systemSkeletonBodies, wikiIndexBodies } from '../wiki/packmaterials.js';
 import { runOracleSweep } from '../oracles/runner.js';
 import { checkpointAcceptedTask, checkpointFrozenTests, captureFinalPatch, rebuildWorkspace } from '../integrator/merge.js';
 import { bucketLimit, classifyFailure, deterministicTaskOrder, escalationRank, invalidationClosure, nextEscalationLevel } from './escalation.js';
@@ -201,15 +203,19 @@ async function readTextFileOrNull(path: string): Promise<string | null> {
 }
 
 /** Assembles the raw pack materials this phase can actually fetch (§5's pack-source-kind
- *  fetchers are supervisor plumbing, per `agent.ts`'s own note). Everything it cannot yet
- *  source (wiki index, stack facts, file map, source files, diffs, oracle results, reviewer
- *  findings) is `null`/empty, which simply yields no section of that kind — never a
- *  fabricated one. The diff is the exception: it is captured before the stage runs and
- *  passed in, because the Reviewer cannot do its job without it. */
+ *  fetchers are supervisor plumbing, per `agent.ts`'s own note). Wiki index, stack facts,
+ *  system skeleton and file map are sourced from this item's own claim set (binding decision
+ *  10: item-scoped, never `listItemIds` — a pack material must never read another item's
+ *  log). Source files, PRD-external material, diffs and oracle results remain supervisor/CLI
+ *  plumbing outside Phase 4's scope; a `null`/empty value simply yields no section of that
+ *  kind, never a fabricated one. The diff is the exception: it is captured before the stage
+ *  runs and passed in, because the Reviewer cannot do its job without it. */
 async function buildRawPackMaterials(o: {
   readonly workdir: string;
   readonly prdPath: string;
   readonly testDirs: readonly string[];
+  readonly events: readonly MienguEvent[];
+  readonly state: WorkItemState;
   readonly requirementSet: RequirementSet | null;
   readonly testSuiteSpec: TestSuiteSpec | null;
   readonly frozenTests: FrozenTestsState | null;
@@ -224,6 +230,9 @@ async function buildRawPackMaterials(o: {
   readonly diff: string | null;
 }): Promise<RawPackMaterials> {
   const prd = await readTextFileOrNull(o.prdPath);
+
+  const claimSet = deriveClaims(o.events);
+  const artifacts = o.state.artifacts;
 
   const frozenTestList =
     o.testSuiteSpec !== null
@@ -251,13 +260,15 @@ async function buildRawPackMaterials(o: {
 
   return {
     prd,
-    wikiIndex: null,
+    wikiIndex: wikiIndexBodies(claimSet),
     existingReqIds: o.requirementSet?.requirements.map((r) => r.req_id) ?? [],
     priorOutOfScope: o.requirementSet?.out_of_scope ?? [],
-    stackFacts: null,
-    systemSkeleton: null,
-    fileMap: null,
+    stackFacts: stackFactsBodies(claimSet),
+    systemSkeleton: systemSkeletonBodies(claimSet),
+    fileMap: fileMapBodies(claimSet),
     testConventions: `Tests live under: ${o.testDirs.join(', ')}`,
+    // The Coder runs inside the prepared worktree and can read files itself; shipping bodies
+    // it can already read buys no review minutes and is not a Phase 4 contract (§9).
     sourceFiles: [],
     frozenTestList,
     frozenTestBodies,
@@ -270,6 +281,12 @@ async function buildRawPackMaterials(o: {
       chosen: a.chosen,
       affects: a.affects,
     })),
+    artifactTiers: {
+      requirementSet: artifactSectionTier(claimSet, artifacts.requirementSet?.eventId ?? null, 'T2'),
+      architecturePlan: artifactSectionTier(claimSet, artifacts.architecturePlan?.eventId ?? null, 'T2'),
+      taskGraph: artifactSectionTier(claimSet, artifacts.taskGraph?.eventId ?? null, 'T2'),
+      testSuiteSpec: artifactSectionTier(claimSet, artifacts.testSuiteSpec?.eventId ?? null, 'T2'),
+    },
   };
 }
 
@@ -437,6 +454,8 @@ async function performRunAttempt(
     workdir: workspaceInfo.workdir,
     prdPath: state.source.path,
     testDirs,
+    events,
+    state,
     requirementSet: checkContext.requirementSet,
     testSuiteSpec,
     frozenTests: state.frozenTests,

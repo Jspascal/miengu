@@ -20,6 +20,8 @@ import { toJsonSchema, jsonSchemaSha256 } from '../contracts/toJsonSchema.js';
 import type { TaskGraph } from '../contracts/index.js';
 import { assemblePack, renderPack } from '../wiki/contextpack.js';
 import type { ContextPackSection } from '../wiki/contextpack.js';
+import type { TieredBody } from '../wiki/packmaterials.js';
+import type { ProvenanceTier } from '../core/provenance.js';
 import type { ReqId } from '../core/ids.js';
 import { loadTemplate, renderPrompt } from './prompts/render.js';
 import type { PromptVars } from './prompts/render.js';
@@ -50,12 +52,12 @@ export type AppendFn = (
  */
 export interface RawPackMaterials {
   readonly prd: string | null;
-  readonly wikiIndex: string | null;
+  readonly wikiIndex: readonly TieredBody[];
   readonly existingReqIds: readonly ReqId[];
   readonly priorOutOfScope: readonly string[];
-  readonly stackFacts: string | null;
-  readonly systemSkeleton: string | null;
-  readonly fileMap: string | null;
+  readonly stackFacts: readonly TieredBody[];
+  readonly systemSkeleton: readonly TieredBody[];
+  readonly fileMap: readonly TieredBody[];
   readonly testConventions: string | null;
   readonly sourceFiles: readonly { readonly path: string; readonly body: string }[];
   /** Names and intents only (§15.5/§15.6) — never bodies, for the Reviewer. */
@@ -73,6 +75,13 @@ export interface RawPackMaterials {
     readonly chosen: string;
     readonly affects: readonly string[];
   }[];
+  /** Derived tiers for the artifact-backed sections (binding decision 13). */
+  readonly artifactTiers: {
+    readonly requirementSet: ProvenanceTier;
+    readonly architecturePlan: ProvenanceTier;
+    readonly taskGraph: ProvenanceTier;
+    readonly testSuiteSpec: ProvenanceTier;
+  };
 }
 
 export interface EscalationContext {

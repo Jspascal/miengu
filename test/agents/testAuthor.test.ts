@@ -18,12 +18,12 @@ const START = '2024-01-01T00:00:00.000Z' as IsoTimestamp;
 function emptyRaw(): PackBuildInput['raw'] {
   return {
     prd: null,
-    wikiIndex: null,
+    wikiIndex: [],
     existingReqIds: [],
     priorOutOfScope: [],
-    stackFacts: null,
-    systemSkeleton: null,
-    fileMap: null,
+    stackFacts: [],
+    systemSkeleton: [],
+    fileMap: [],
     testConventions: null,
     sourceFiles: [],
     frozenTestList: [],
@@ -33,6 +33,12 @@ function emptyRaw(): PackBuildInput['raw'] {
     currentTaskReviewerFindings: null,
     escalationContext: null,
     assumptions: [],
+    artifactTiers: {
+      requirementSet: 'T2',
+      architecturePlan: 'T2',
+      taskGraph: 'T2',
+      testSuiteSpec: 'T2',
+    },
   };
 }
 
@@ -51,9 +57,14 @@ function pack(overrides: Partial<PackBuildInput['raw']> = {}): PackBuildInput {
   };
 }
 
-describe("testAuthor.buildCandidates excludes implementation, components, file-map, task-graph", () => {
-  it('never emits architecture-components, file-map, task, or task-graph even when offered', () => {
-    const full = pack({ fileMap: 'files', sourceFiles: [{ path: 'src/a.ts', body: 'x' }] });
+describe("testAuthor.buildCandidates excludes implementation, components, file-map, task-graph, wiki-index, system-skeleton", () => {
+  it('never emits architecture-components, file-map, task, task-graph, wiki-index or system-skeleton even when offered', () => {
+    const full = pack({
+      fileMap: [{ body: 'files', tier: 'T2', sourceEventId: null }],
+      wikiIndex: [{ body: 'wiki', tier: 'T2', sourceEventId: null }],
+      systemSkeleton: [{ body: 'skeleton', tier: 'T2', sourceEventId: null }],
+      sourceFiles: [{ path: 'src/a.ts', body: 'x' }],
+    });
     const sections = buildCandidates(full);
     const kinds = sections.map((s) => s.kind);
     expect(kinds).not.toContain('architecture-components');
@@ -61,6 +72,9 @@ describe("testAuthor.buildCandidates excludes implementation, components, file-m
     expect(kinds).not.toContain('task');
     expect(kinds).not.toContain('task-graph');
     expect(kinds).not.toContain('source-files');
+    // Decision 12: the third Test Author side channel, closed before packmaterials.ts fills it.
+    expect(kinds).not.toContain('wiki-index');
+    expect(kinds).not.toContain('system-skeleton');
     const omits = ROLE_PACK_POLICY.testAuthor.omits;
     for (const kind of kinds) {
       expect(omits).not.toContain(kind);

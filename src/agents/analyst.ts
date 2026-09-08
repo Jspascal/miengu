@@ -2,19 +2,12 @@ import { formatAssumptionId } from '../core/ids.js';
 import { sha256Canonical } from '../core/hash.js';
 import type { RequirementSet } from '../contracts/index.js';
 import type { ContextPackSection } from '../wiki/contextpack.js';
+import { packSection } from '../wiki/contextpack.js';
 import { checkRequirementSet } from './checks.js';
 import type { CheckContext } from './checks.js';
 import { renderEscalationContext } from './agent.js';
 import type { PackBuildInput, PostStepInput, PostStepResult, RoleModule } from './agent.js';
 import type { AppendInput } from '../core/log.js';
-
-function section(
-  kind: ContextPackSection['kind'],
-  heading: string,
-  body: string,
-): ContextPackSection {
-  return { kind, heading, body, tier: 'T1', sourceEventId: null };
-}
 
 /**
  * §15.1 pack: the request/PRD text · the wiki index (component names and one-line
@@ -25,26 +18,32 @@ function section(
 export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[] {
   const sections: ContextPackSection[] = [];
   if (i.raw.prd !== null) {
-    sections.push(section('prd', 'Request', i.raw.prd));
+    sections.push(packSection('prd', 'Request', i.raw.prd, 'T0'));
   }
-  if (i.raw.wikiIndex !== null) {
-    sections.push(section('wiki-index', 'Wiki index', i.raw.wikiIndex));
+  for (const wikiIndex of i.raw.wikiIndex) {
+    sections.push(packSection('wiki-index', 'Wiki index', wikiIndex.body, wikiIndex.tier, wikiIndex.sourceEventId));
   }
   if (i.raw.existingReqIds.length > 0) {
     sections.push(
-      section('existing-req-ids', 'Existing requirement ids', i.raw.existingReqIds.join('\n')),
+      packSection(
+        'existing-req-ids', 'Existing requirement ids', i.raw.existingReqIds.join('\n'),
+        i.raw.artifactTiers.requirementSet,
+      ),
     );
   }
   if (i.raw.priorOutOfScope.length > 0) {
     sections.push(
-      section('prior-out-of-scope', 'Previously recorded out of scope', i.raw.priorOutOfScope.join('\n')),
+      packSection(
+        'prior-out-of-scope', 'Previously recorded out of scope', i.raw.priorOutOfScope.join('\n'),
+        i.raw.artifactTiers.requirementSet,
+      ),
     );
   }
-  if (i.raw.stackFacts !== null) {
-    sections.push(section('stack-facts', 'Stack facts', i.raw.stackFacts));
+  for (const stackFacts of i.raw.stackFacts) {
+    sections.push(packSection('stack-facts', 'Stack facts', stackFacts.body, stackFacts.tier, stackFacts.sourceEventId));
   }
   if (i.raw.escalationContext !== null) {
-    sections.push(section('escalation-context', 'Escalation context', renderEscalationContext('analyst', i.raw.escalationContext)));
+    sections.push(packSection('escalation-context', 'Escalation context', renderEscalationContext('analyst', i.raw.escalationContext), 'T1'));
   }
   return sections;
 }

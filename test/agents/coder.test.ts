@@ -19,12 +19,12 @@ const slug = SlugSchema.parse('example');
 function emptyRaw(): PackBuildInput['raw'] {
   return {
     prd: null,
-    wikiIndex: null,
+    wikiIndex: [],
     existingReqIds: [],
     priorOutOfScope: [],
-    stackFacts: null,
-    systemSkeleton: null,
-    fileMap: null,
+    stackFacts: [],
+    systemSkeleton: [],
+    fileMap: [],
     testConventions: null,
     sourceFiles: [],
     frozenTestList: [],
@@ -34,6 +34,12 @@ function emptyRaw(): PackBuildInput['raw'] {
     currentTaskReviewerFindings: null,
     escalationContext: null,
     assumptions: [],
+    artifactTiers: {
+      requirementSet: 'T2',
+      architecturePlan: 'T2',
+      taskGraph: 'T2',
+      testSuiteSpec: 'T2',
+    },
   };
 }
 

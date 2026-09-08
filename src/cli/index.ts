@@ -5,6 +5,8 @@ import { initCommand } from './commands/init.js';
 import { runCommand } from './commands/run.js';
 import { statusCommand } from './commands/status.js';
 import { replayCommand } from './commands/replay.js';
+import { reportCommand } from './commands/report.js';
+import { wikiRenderCommand } from './commands/wikiRender.js';
 import { notImplemented } from './commands/notImplemented.js';
 import { EXIT, exitCodeFor } from './exit.js';
 
@@ -77,9 +79,16 @@ program
 
 program
   .command('report')
-  .option('--since <date>', 'report only items changed since this date')
-  .action(() => {
-    notImplemented('miengu report', 5);
+  .description('the batch review report')
+  .option('--since <date>', 'report only items updated since this ISO-8601 or YYYY-MM-DD date')
+  .option('--config <path>', 'path to miengu.config.yaml')
+  .option('--json', 'print machine-readable output')
+  .action(async (opts: { since?: string; config?: string; json?: boolean }) => {
+    process.exitCode = await reportCommand({
+      since: opts.since,
+      configPath: opts.config,
+      json: opts.json,
+    });
   });
 
 program
@@ -91,12 +100,23 @@ program
     notImplemented('miengu decide', 5);
   });
 
-program
-  .command('wiki')
+const wikiCommand = program.command('wiki').description('operate on the human-readable wiki view');
+
+wikiCommand
   .command('render')
-  .action(() => {
-    notImplemented('miengu wiki render', 4);
+  .description('regenerate the human view from the log')
+  .option('--config <path>', 'path to miengu.config.yaml')
+  .option('--json', 'print machine-readable output')
+  .action(async (opts: { config?: string; json?: boolean }) => {
+    process.exitCode = await wikiRenderCommand({ configPath: opts.config, json: opts.json });
   });
+
+// A bare `miengu wiki` names no subcommand to run, so nothing happened: print help and exit
+// `EXIT.USAGE` (2) rather than silently doing nothing or exiting 0.
+wikiCommand.action(() => {
+  wikiCommand.outputHelp();
+  process.exitCode = EXIT.USAGE;
+});
 
 async function main(): Promise<void> {
   try {

@@ -1,73 +1,74 @@
 import type { TestSuiteSpec, TestSuiteSpecDraft } from '../contracts/index.js';
 import type { ContextPackSection } from '../wiki/contextpack.js';
+import { packSection } from '../wiki/contextpack.js';
 import { freezeTests } from '../supervisor/freeze.js';
 import { AgentError } from '../errors.js';
 import { checkTestSuiteSpec } from './checks.js';
 import type { CheckContext } from './checks.js';
 import type { PackBuildInput, PostStepInput, PostStepResult, RoleModule } from './agent.js';
 
-function section(
-  kind: ContextPackSection['kind'],
-  heading: string,
-  body: string,
-): ContextPackSection {
-  return { kind, heading, body, tier: 'T1', sourceEventId: null };
-}
-
 /**
  * §15.4 pack: `RequirementSet` · `ArchitecturePlan.interfaces` only · test conventions
  * detected mechanically. Never emits implementation, `architecture-components`,
- * `file-map`, `task-graph`, `task`, or anything the Coder produced.
+ * `file-map`, `task-graph`, `task`, or anything the Coder produced. Decision 12 closes the
+ * Test Author's third side channel: `wiki-index` and `system-skeleton` are the component map
+ * under another name, so this module never builds either — offering one would make
+ * `assemblePack` throw, since both are now in `testAuthor.omits`.
  */
 export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[] {
   const sections: ContextPackSection[] = [];
-  if (i.raw.wikiIndex !== null) {
-    sections.push(section('wiki-index', 'Wiki index', i.raw.wikiIndex));
-  }
   if (i.raw.existingReqIds.length > 0) {
     sections.push(
-      section('existing-req-ids', 'Existing requirement ids', i.raw.existingReqIds.join('\n')),
+      packSection(
+        'existing-req-ids', 'Existing requirement ids', i.raw.existingReqIds.join('\n'),
+        i.raw.artifactTiers.requirementSet,
+      ),
     );
   }
   if (i.raw.priorOutOfScope.length > 0) {
     sections.push(
-      section('prior-out-of-scope', 'Previously recorded out of scope', i.raw.priorOutOfScope.join('\n')),
+      packSection(
+        'prior-out-of-scope', 'Previously recorded out of scope', i.raw.priorOutOfScope.join('\n'),
+        i.raw.artifactTiers.requirementSet,
+      ),
     );
   }
-  if (i.raw.stackFacts !== null) {
-    sections.push(section('stack-facts', 'Stack facts', i.raw.stackFacts));
-  }
-  if (i.raw.systemSkeleton !== null) {
-    sections.push(section('system-skeleton', 'System skeleton', i.raw.systemSkeleton));
+  for (const stackFacts of i.raw.stackFacts) {
+    sections.push(packSection('stack-facts', 'Stack facts', stackFacts.body, stackFacts.tier, stackFacts.sourceEventId));
   }
   if (i.checkContext.requirementSet !== null) {
     sections.push(
-      section('requirement-set', 'Requirement set', JSON.stringify(i.checkContext.requirementSet, null, 2)),
+      packSection(
+        'requirement-set', 'Requirement set', JSON.stringify(i.checkContext.requirementSet, null, 2),
+        i.raw.artifactTiers.requirementSet,
+      ),
     );
   }
   if (i.checkContext.architecturePlan !== null) {
     sections.push(
-      section(
+      packSection(
         'architecture-interfaces',
         'Interfaces',
         JSON.stringify(i.checkContext.architecturePlan.interfaces, null, 2),
+        i.raw.artifactTiers.architecturePlan,
       ),
     );
   }
   if (i.raw.testConventions !== null) {
-    sections.push(section('test-conventions', 'Test conventions', i.raw.testConventions));
+    sections.push(packSection('test-conventions', 'Test conventions', i.raw.testConventions, 'T1'));
   }
   if (i.raw.frozenTestList.length > 0) {
     sections.push(
-      section(
+      packSection(
         'frozen-test-list',
         'Previously frozen tests (names and intents only)',
         i.raw.frozenTestList.map((t) => `${t.testId}: ${t.intent}`).join('\n'),
+        'T1',
       ),
     );
   }
   if (i.raw.assumptions.length > 0) {
-    sections.push(section('assumptions', 'Recorded assumptions', JSON.stringify(i.raw.assumptions, null, 2)));
+    sections.push(packSection('assumptions', 'Recorded assumptions', JSON.stringify(i.raw.assumptions, null, 2), 'T2'));
   }
   return sections;
 }

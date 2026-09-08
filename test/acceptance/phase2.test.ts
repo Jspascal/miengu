@@ -52,6 +52,8 @@ import {
 import { toJsonSchema } from '../../src/contracts/toJsonSchema.js';
 import { assemblePack, renderPack, ROLE_PACK_POLICY } from '../../src/wiki/contextpack.js';
 import type { ContextPackSection } from '../../src/wiki/contextpack.js';
+import { deriveClaims } from '../../src/wiki/records.js';
+import { fileMapBodies, stackFactsBodies, systemSkeletonBodies, wikiIndexBodies } from '../../src/wiki/packmaterials.js';
 import { loadTemplate, renderPrompt } from '../../src/agents/prompts/render.js';
 import type { PromptVars } from '../../src/agents/prompts/render.js';
 import * as analystModule from '../../src/agents/analyst.js';
@@ -1048,18 +1050,24 @@ describe('Phase 2 acceptance: the ten delta criteria', () => {
         'prose before or after and no markdown fence.';
 
       const prdText = await readFile(PRD_PATH, 'utf8');
+      // The item's own log, sliced to exactly what `loop.ts`'s `buildRawPackMaterials` saw at
+      // this invocation: WorkItemCreated + RunStarted (the item's first pass through the
+      // Analyst has no StageCompleted yet, so wiki-index/system-skeleton/file-map are empty —
+      // binding decision 10 — but RunStarted already ran, so stack-facts is not).
+      const eventsAtAnalystInvocation = swapped.events.filter((e) => e.seq <= analystInvoked.seq);
+      const claimSet = deriveClaims(eventsAtAnalystInvocation);
       const candidates = analystModule.buildCandidates({
         itemId: swapped.itemId,
         checkContext: { requirementSet: null, architecturePlan: null, taskGraph: null, maxPathsPerTask: 8, testDirs: ['test/'] },
         task: null,
         raw: {
           prd: prdText,
-          wikiIndex: null,
+          wikiIndex: wikiIndexBodies(claimSet),
           existingReqIds: [],
           priorOutOfScope: [],
-          stackFacts: null,
-          systemSkeleton: null,
-          fileMap: null,
+          stackFacts: stackFactsBodies(claimSet),
+          systemSkeleton: systemSkeletonBodies(claimSet),
+          fileMap: fileMapBodies(claimSet),
           testConventions: 'Tests live under: test/',
           sourceFiles: [],
           frozenTestList: [],
@@ -1069,6 +1077,7 @@ describe('Phase 2 acceptance: the ten delta criteria', () => {
           currentTaskReviewerFindings: null,
           escalationContext: null,
           assumptions: [],
+          artifactTiers: { requirementSet: 'T2', architecturePlan: 'T2', taskGraph: 'T2', testSuiteSpec: 'T2' },
         },
       });
       const pack = assemblePack({

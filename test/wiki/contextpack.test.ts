@@ -92,6 +92,14 @@ describe('(c) the two load-bearing rows, asserted by name', () => {
     expect(omits).toContain('task-graph');
   });
 
+  it('testAuthor.omits contains wiki-index and system-skeleton (decision 12: both are the ' +
+    'component map under another name, and close the same side channel architecture-components ' +
+    'already blocks)', () => {
+    const omits = ROLE_PACK_POLICY.testAuthor.omits;
+    expect(omits).toContain('wiki-index');
+    expect(omits).toContain('system-skeleton');
+  });
+
   it('reviewer.omits contains coder-transcript', () => {
     expect(ROLE_PACK_POLICY.reviewer.omits).toContain('coder-transcript');
   });

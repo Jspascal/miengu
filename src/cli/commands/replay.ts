@@ -30,7 +30,7 @@ async function pathExists(path: string): Promise<boolean> {
  * Every complete line is fully validated; a malformed complete line is a hard refusal, matching
  * `core/log.ts`'s open/recovery discipline without touching the filesystem.
  */
-async function readEventsReadOnly(eventsFile: string, itemId: WorkItemId): Promise<MienguEvent[]> {
+export async function readEventsReadOnly(eventsFile: string, itemId: WorkItemId): Promise<MienguEvent[]> {
   let raw: Buffer;
   try {
     raw = await readFile(eventsFile);

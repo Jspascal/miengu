@@ -1,17 +1,10 @@
 import type { Implementation } from '../contracts/index.js';
 import type { ContextPackSection } from '../wiki/contextpack.js';
+import { packSection } from '../wiki/contextpack.js';
 import { restoreFrozenTests, verifyFrozenTests } from '../supervisor/freeze.js';
 import { checkImplementation } from './checks.js';
 import type { CheckContext } from './checks.js';
 import type { PackBuildInput, PostStepInput, PostStepResult, RoleModule } from './agent.js';
-
-function section(
-  kind: ContextPackSection['kind'],
-  heading: string,
-  body: string,
-): ContextPackSection {
-  return { kind, heading, body, tier: 'T1', sourceEventId: null };
-}
 
 /**
  * §15.5 pack: exactly one `Task` · files under its `expected_paths` plus their direct
@@ -26,54 +19,62 @@ export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[
 
   if (i.raw.existingReqIds.length > 0) {
     sections.push(
-      section('existing-req-ids', 'Existing requirement ids', i.raw.existingReqIds.join('\n')),
+      packSection(
+        'existing-req-ids', 'Existing requirement ids', i.raw.existingReqIds.join('\n'),
+        i.raw.artifactTiers.requirementSet,
+      ),
     );
   }
   if (i.raw.priorOutOfScope.length > 0) {
     sections.push(
-      section('prior-out-of-scope', 'Previously recorded out of scope', i.raw.priorOutOfScope.join('\n')),
+      packSection(
+        'prior-out-of-scope', 'Previously recorded out of scope', i.raw.priorOutOfScope.join('\n'),
+        i.raw.artifactTiers.requirementSet,
+      ),
     );
   }
-  if (i.raw.stackFacts !== null) {
-    sections.push(section('stack-facts', 'Stack facts', i.raw.stackFacts));
+  for (const stackFacts of i.raw.stackFacts) {
+    sections.push(packSection('stack-facts', 'Stack facts', stackFacts.body, stackFacts.tier, stackFacts.sourceEventId));
   }
-  if (i.raw.systemSkeleton !== null) {
-    sections.push(section('system-skeleton', 'System skeleton', i.raw.systemSkeleton));
+  for (const systemSkeleton of i.raw.systemSkeleton) {
+    sections.push(packSection('system-skeleton', 'System skeleton', systemSkeleton.body, systemSkeleton.tier, systemSkeleton.sourceEventId));
   }
 
   if (task !== null && i.checkContext.architecturePlan !== null) {
     const plan = i.checkContext.architecturePlan;
+    const architectureTier = i.raw.artifactTiers.architecturePlan;
     const intersectingDecisions = plan.decisions.filter((d) => d.req_ids.some((r) => task.req_ids.includes(r)));
     if (intersectingDecisions.length > 0) {
       sections.push(
-        section('architecture-decisions', 'Decisions intersecting this task', JSON.stringify(intersectingDecisions, null, 2)),
+        packSection('architecture-decisions', 'Decisions intersecting this task', JSON.stringify(intersectingDecisions, null, 2), architectureTier),
       );
     }
     const componentIds = new Set(task.component_ids);
     const components = plan.components.filter((c) => componentIds.has(c.component_id));
     if (components.length > 0) {
-      sections.push(section('architecture-components', 'Task components', JSON.stringify(components, null, 2)));
+      sections.push(packSection('architecture-components', 'Task components', JSON.stringify(components, null, 2), architectureTier));
     }
     const interfaces = plan.interfaces.filter((iface) => componentIds.has(iface.component_id));
     if (interfaces.length > 0) {
-      sections.push(section('architecture-interfaces', 'Interfaces this task implements', JSON.stringify(interfaces, null, 2)));
+      sections.push(packSection('architecture-interfaces', 'Interfaces this task implements', JSON.stringify(interfaces, null, 2), architectureTier));
     }
   }
 
   if (task !== null) {
-    sections.push(section('file-map', 'expected_paths', task.expected_paths.join('\n')));
-    sections.push(section('task', 'Task', JSON.stringify(task, null, 2)));
+    sections.push(packSection('file-map', 'expected_paths', task.expected_paths.join('\n'), i.raw.artifactTiers.taskGraph));
+    sections.push(packSection('task', 'Task', JSON.stringify(task, null, 2), i.raw.artifactTiers.taskGraph));
   }
 
   if (i.raw.testConventions !== null) {
-    sections.push(section('test-conventions', 'Test conventions', i.raw.testConventions));
+    sections.push(packSection('test-conventions', 'Test conventions', i.raw.testConventions, 'T1'));
   }
   if (i.raw.frozenTestList.length > 0) {
     sections.push(
-      section(
+      packSection(
         'frozen-test-list',
         'Frozen test list (names and intents only)',
         i.raw.frozenTestList.map((t) => `${t.testId}: ${t.intent}`).join('\n'),
+        'T1',
       ),
     );
   }
@@ -82,10 +83,11 @@ export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[
     // already filtered `raw.frozenTestBodies` to this task's paths; buildCandidates never
     // widens what it was given.
     sections.push(
-      section(
+      packSection(
         'frozen-test-bodies',
         'Frozen tests for this task',
         i.raw.frozenTestBodies.map((f) => `--- ${f.path} ---\n${f.body}`).join('\n\n'),
+        'T1',
       ),
     );
   }
@@ -94,20 +96,20 @@ export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[
     : i.raw.sourceFiles;
   if (relevantSourceFiles.length > 0) {
     sections.push(
-      section('source-files', 'Source files', relevantSourceFiles.map((f) => `--- ${f.path} ---\n${f.body}`).join('\n\n')),
+      packSection('source-files', 'Source files', relevantSourceFiles.map((f) => `--- ${f.path} ---\n${f.body}`).join('\n\n'), 'T1'),
     );
   }
   if (i.raw.diff !== null) {
-    sections.push(section('diff', 'Prior diff', i.raw.diff));
+    sections.push(packSection('diff', 'Prior diff', i.raw.diff, 'T1'));
   }
   if (i.raw.oracleResults !== null) {
-    sections.push(section('oracle-results', 'Oracle results', i.raw.oracleResults));
+    sections.push(packSection('oracle-results', 'Oracle results', i.raw.oracleResults, 'T1'));
   }
   if (i.raw.currentTaskReviewerFindings !== null) {
-    sections.push(section('current-task-reviewer-findings', 'Current task reviewer findings', i.raw.currentTaskReviewerFindings));
+    sections.push(packSection('current-task-reviewer-findings', 'Current task reviewer findings', i.raw.currentTaskReviewerFindings, 'T2'));
   }
   if (i.raw.assumptions.length > 0) {
-    sections.push(section('assumptions', 'Recorded assumptions', JSON.stringify(i.raw.assumptions, null, 2)));
+    sections.push(packSection('assumptions', 'Recorded assumptions', JSON.stringify(i.raw.assumptions, null, 2), 'T2'));
   }
   return sections;
 }

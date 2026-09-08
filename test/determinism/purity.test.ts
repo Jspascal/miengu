@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { canonicalJson } from '../../src/core/canonical.js';
 import { DEFAULT_TIER, MienguEventSchema } from '../../src/core/events.js';
 import type { EventType, MienguEvent, Stage } from '../../src/core/events.js';
@@ -315,16 +315,127 @@ describe('(d) static import audit', () => {
     'src/core/canonical.ts',
     'src/core/provenance.ts',
     'src/core/events.ts',
+    // Phase 4 additions (Group A item 3). records.ts exists as of Group A item 1;
+    // packmaterials.ts, humanview.ts and report/batch.ts are added by items 5, 12 and 15 and
+    // this item's verification is re-run at each subsequent group gate.
+    'src/wiki/records.ts',
+    'src/wiki/packmaterials.ts',
+    'src/wiki/humanview.ts',
+    'src/report/batch.ts',
   ];
-  const FORBIDDEN_SUBSTRINGS = ['Date.now', 'new Date', 'Math.random', 'process.env'];
+  const FORBIDDEN_SUBSTRINGS = [
+    'Date.now',
+    'new Date',
+    'Math.random',
+    'process.env',
+    'localeCompare',
+    'toLocaleString',
+    'toLocaleDateString',
+    'Intl.',
+  ];
 
   for (const relPath of DETERMINISM_ZONE_FILES) {
-    it(`${relPath} contains no node: import and no forbidden substring`, () => {
+    // packmaterials.ts, humanview.ts and report/batch.ts are declared here (item 3) before
+    // they exist (items 5, 12, 15); skipped, never silently passed, until each is created —
+    // at which point this same assertion applies to it with no further change to this file.
+    const exists = existsSync(join(process.cwd(), relPath));
+    const runner = exists ? it : it.skip;
+    runner(`${relPath} contains no node: import and no forbidden substring`, () => {
       const source = readFileSync(join(process.cwd(), relPath), 'utf8');
       expect(source).not.toMatch(/from ['"]node:/);
       for (const forbidden of FORBIDDEN_SUBSTRINGS) {
         expect(source).not.toContain(forbidden);
       }
+    });
+  }
+});
+
+describe('(f) transitive import audit', () => {
+  // (d) only inspects each zone file's own source text, so a forbidden import reachable
+  // through an intermediate module — e.g. records.ts -> contracts/testSuiteSpec.ts ->
+  // core/clock.js, one hop outside the zone — was invisible to it. Item 1's MUST-NOT list
+  // (records.ts, and by the same declaration every other zone file) forbids clock.js,
+  // idgen.js, hash.js, log.js, snapshot.js, node:*, pino and anything under src/config/,
+  // src/cli/, src/executors/ — not just as a direct import, but as anything reachable at
+  // all. This walks the real import graph from each zone file instead of trusting that no
+  // intermediate module ever re-exposes one of them.
+  const DETERMINISM_ZONE_FILES = [
+    'src/state/workitem.ts',
+    'src/state/projector.ts',
+    'src/supervisor/budget.ts',
+    'src/core/ids.ts',
+    'src/core/canonical.ts',
+    'src/core/provenance.ts',
+    'src/core/events.ts',
+    'src/wiki/records.ts',
+    'src/wiki/packmaterials.ts',
+    'src/wiki/humanview.ts',
+    'src/report/batch.ts',
+  ];
+  const FORBIDDEN_NODE_BUILTIN = /^node:/;
+  const FORBIDDEN_BARE_SPECIFIERS = ['pino'];
+  const FORBIDDEN_PATH_PATTERNS = [
+    /clock\.js$/, /idgen\.js$/, /hash\.js$/, /log\.js$/, /snapshot\.js$/,
+    /\/executors\//, /\/cli\//, /\/config\//,
+  ];
+  // Matches both `import ... from '<spec>'` and `export ... from '<spec>'` (re-exports),
+  // type-only or not — a forbidden module reached only via `export type` still widens what
+  // is reachable from the zone.
+  const IMPORT_SPECIFIER_RE = /\bfrom\s+['"]([^'"]+)['"]/g;
+
+  function importSpecifiers(source: string): string[] {
+    const specifiers: string[] = [];
+    let match: RegExpExecArray | null;
+    IMPORT_SPECIFIER_RE.lastIndex = 0;
+    while ((match = IMPORT_SPECIFIER_RE.exec(source)) !== null) {
+      specifiers.push(match[1] as string);
+    }
+    return specifiers;
+  }
+
+  function isForbidden(specifier: string): boolean {
+    return (
+      FORBIDDEN_NODE_BUILTIN.test(specifier) ||
+      FORBIDDEN_BARE_SPECIFIERS.includes(specifier) ||
+      FORBIDDEN_PATH_PATTERNS.some((pattern) => pattern.test(specifier))
+    );
+  }
+
+  /** Resolves a relative specifier (`./x.js`, `../y.js`) to an on-disk `.ts` source file.
+   *  Bare specifiers (npm packages) resolve to `null` and are not walked further. */
+  function resolveRelative(fromFile: string, specifier: string): string | null {
+    if (!specifier.startsWith('.')) return null;
+    const withoutExt = specifier.endsWith('.js') ? specifier.slice(0, -'.js'.length) : specifier;
+    const resolved = join(dirname(fromFile), `${withoutExt}.ts`);
+    return existsSync(resolved) ? resolved : null;
+  }
+
+  for (const relPath of DETERMINISM_ZONE_FILES) {
+    const entry = join(process.cwd(), relPath);
+    const exists = existsSync(entry);
+    const runner = exists ? it : it.skip;
+    runner(`${relPath}'s transitive import graph reaches no forbidden module`, () => {
+      const visited = new Set<string>([entry]);
+      const queue: string[] = [entry];
+      const violations: string[] = [];
+
+      while (queue.length > 0) {
+        const file = queue.shift() as string;
+        const source = readFileSync(file, 'utf8');
+        for (const specifier of importSpecifiers(source)) {
+          if (isForbidden(specifier)) {
+            violations.push(`${file} -> ${specifier}`);
+            continue;
+          }
+          const next = resolveRelative(file, specifier);
+          if (next !== null && !visited.has(next)) {
+            visited.add(next);
+            queue.push(next);
+          }
+        }
+      }
+
+      expect(violations).toEqual([]);
     });
   }
 });

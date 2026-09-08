@@ -1,19 +1,24 @@
 import { describe, it, expect } from 'vitest';
 import { buildCandidates, plannerModule } from '../../src/agents/planner.js';
 import type { PackBuildInput } from '../../src/agents/agent.js';
+import type { TieredBody } from '../../src/wiki/packmaterials.js';
 import { WorkItemIdSchema } from '../../src/core/ids.js';
 
 const itemId = WorkItemIdSchema.parse('wi-example-abc123');
 
+function tieredBody(body: string): TieredBody {
+  return { body, tier: 'T2', sourceEventId: null };
+}
+
 function emptyRaw(): PackBuildInput['raw'] {
   return {
     prd: null,
-    wikiIndex: null,
+    wikiIndex: [],
     existingReqIds: [],
     priorOutOfScope: [],
-    stackFacts: null,
-    systemSkeleton: null,
-    fileMap: null,
+    stackFacts: [],
+    systemSkeleton: [],
+    fileMap: [],
     testConventions: null,
     sourceFiles: [],
     frozenTestList: [],
@@ -23,6 +28,12 @@ function emptyRaw(): PackBuildInput['raw'] {
     currentTaskReviewerFindings: null,
     escalationContext: null,
     assumptions: [],
+    artifactTiers: {
+      requirementSet: 'T2',
+      architecturePlan: 'T2',
+      taskGraph: 'T2',
+      testSuiteSpec: 'T2',
+    },
   };
 }
 
@@ -47,7 +58,7 @@ describe("planner.buildCandidates excludes source-files and frozen-test-bodies",
       sourceFiles: [{ path: 'src/a.ts', body: 'x' }],
       frozenTestBodies: [{ path: 'test/a.test.ts', body: 'x' }],
       frozenTestList: [{ testId: 't', intent: 'i' }],
-      fileMap: 'files',
+      fileMap: [tieredBody('files')],
       diff: 'diff',
     });
     const sections = buildCandidates(full);
@@ -55,6 +66,27 @@ describe("planner.buildCandidates excludes source-files and frozen-test-bodies",
     expect(kinds).not.toContain('source-files');
     expect(kinds).not.toContain('frozen-test-bodies');
     expect(kinds).not.toContain('diff');
+  });
+});
+
+describe('planner.buildCandidates escalation-context tier honesty (binding decision 13)', () => {
+  it('never emits a T1 section whose body includes the reviewer findings it carries', () => {
+    const full = pack({
+      escalationContext: {
+        category: 'requirement-miss',
+        affectedRequirementIds: [],
+        summary: 'task looks right',
+        componentIds: [],
+        t1OracleSummaries: [],
+        taskIds: ['t-1'],
+        currentTaskReviewerFindings: 'the reviewer thinks the edge case is unhandled',
+      },
+    });
+    const sections = buildCandidates(full);
+    const findingsCarryingT1 = sections.find(
+      (s) => s.kind === 'escalation-context' && s.tier === 'T1' && s.body.includes('the reviewer thinks the edge case is unhandled'),
+    );
+    expect(findingsCarryingT1).toBeUndefined();
   });
 });
 

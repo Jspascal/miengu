@@ -3,6 +3,8 @@ import tseslint from 'typescript-eslint';
 
 const DETERMINISM_MESSAGE =
   'replay determinism: record the value in the event, never recompute it';
+const ICU_MESSAGE =
+  'ICU-version dependent: would break byte-identical output across machines (decision 3/16)';
 
 export default tseslint.config(
   // Build output, never source. `npm run build` did not produce `dist/` until Group 7 (the CLI
@@ -49,6 +51,13 @@ export default tseslint.config(
       'src/core/canonical.ts',
       'src/core/provenance.ts',
       'src/core/events.ts',
+      // Phase 4 (Group A item 3): declared here before they all exist (see records.ts,
+      // created in the same item; packmaterials.ts, humanview.ts and report/batch.ts follow
+      // in items 5, 12 and 15). A missing file is simply never linted; nothing is exempted.
+      'src/wiki/records.ts',
+      'src/wiki/packmaterials.ts',
+      'src/wiki/humanview.ts',
+      'src/report/batch.ts',
     ],
     rules: {
       'no-restricted-imports': [
@@ -100,6 +109,22 @@ export default tseslint.config(
         {
           selector: "MemberExpression[object.name='performance']",
           message: DETERMINISM_MESSAGE,
+        },
+        {
+          selector: "CallExpression[callee.property.name='localeCompare']",
+          message: ICU_MESSAGE,
+        },
+        {
+          selector: "CallExpression[callee.property.name='toLocaleString']",
+          message: ICU_MESSAGE,
+        },
+        {
+          selector: "CallExpression[callee.property.name='toLocaleDateString']",
+          message: ICU_MESSAGE,
+        },
+        {
+          selector: "MemberExpression[object.name='Intl']",
+          message: ICU_MESSAGE,
         },
       ],
       'no-restricted-globals': ['error', 'require', '__dirname', '__filename'],

@@ -1,16 +1,9 @@
 import type { ReviewVerdict } from '../contracts/index.js';
 import type { ContextPackSection } from '../wiki/contextpack.js';
+import { packSection } from '../wiki/contextpack.js';
 import { checkReviewVerdict } from './checks.js';
 import type { CheckContext } from './checks.js';
 import type { PackBuildInput, PostStepInput, PostStepResult, RoleModule } from './agent.js';
-
-function section(
-  kind: ContextPackSection['kind'],
-  heading: string,
-  body: string,
-): ContextPackSection {
-  return { kind, heading, body, tier: 'T1', sourceEventId: null };
-}
 
 /**
  * §15.6 pack: the diff · the task's requirements · decisions whose `req_ids` intersect ·
@@ -20,24 +13,30 @@ function section(
  */
 export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[] {
   const sections: ContextPackSection[] = [];
-  if (i.raw.wikiIndex !== null) {
-    sections.push(section('wiki-index', 'Wiki index', i.raw.wikiIndex));
+  for (const wikiIndex of i.raw.wikiIndex) {
+    sections.push(packSection('wiki-index', 'Wiki index', wikiIndex.body, wikiIndex.tier, wikiIndex.sourceEventId));
   }
   if (i.raw.existingReqIds.length > 0) {
     sections.push(
-      section('existing-req-ids', 'Existing requirement ids', i.raw.existingReqIds.join('\n')),
+      packSection(
+        'existing-req-ids', 'Existing requirement ids', i.raw.existingReqIds.join('\n'),
+        i.raw.artifactTiers.requirementSet,
+      ),
     );
   }
   if (i.raw.priorOutOfScope.length > 0) {
     sections.push(
-      section('prior-out-of-scope', 'Previously recorded out of scope', i.raw.priorOutOfScope.join('\n')),
+      packSection(
+        'prior-out-of-scope', 'Previously recorded out of scope', i.raw.priorOutOfScope.join('\n'),
+        i.raw.artifactTiers.requirementSet,
+      ),
     );
   }
-  if (i.raw.stackFacts !== null) {
-    sections.push(section('stack-facts', 'Stack facts', i.raw.stackFacts));
+  for (const stackFacts of i.raw.stackFacts) {
+    sections.push(packSection('stack-facts', 'Stack facts', stackFacts.body, stackFacts.tier, stackFacts.sourceEventId));
   }
-  if (i.raw.systemSkeleton !== null) {
-    sections.push(section('system-skeleton', 'System skeleton', i.raw.systemSkeleton));
+  for (const systemSkeleton of i.raw.systemSkeleton) {
+    sections.push(packSection('system-skeleton', 'System skeleton', systemSkeleton.body, systemSkeleton.tier, systemSkeleton.sourceEventId));
   }
   const task = i.task;
   if (i.checkContext.requirementSet !== null) {
@@ -55,7 +54,7 @@ export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[
             ),
           };
     sections.push(
-      section('requirement-set', "Task's requirements", JSON.stringify(scoped, null, 2)),
+      packSection('requirement-set', "Task's requirements", JSON.stringify(scoped, null, 2), i.raw.artifactTiers.requirementSet),
     );
   }
   if (task !== null && i.checkContext.architecturePlan !== null) {
@@ -63,35 +62,36 @@ export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[
       d.req_ids.some((r) => task.req_ids.includes(r)),
     );
     if (intersecting.length > 0) {
-      sections.push(section('architecture-decisions', 'Intersecting decisions', JSON.stringify(intersecting, null, 2)));
+      sections.push(packSection('architecture-decisions', 'Intersecting decisions', JSON.stringify(intersecting, null, 2), i.raw.artifactTiers.architecturePlan));
     }
   }
   if (i.raw.frozenTestList.length > 0) {
     sections.push(
-      section(
+      packSection(
         'frozen-test-list',
         'Frozen test list (names and intents only)',
         i.raw.frozenTestList.map((t) => `${t.testId}: ${t.intent}`).join('\n'),
+        'T1',
       ),
     );
   }
   if (task !== null) {
-    sections.push(section('task', 'Task', JSON.stringify(task, null, 2)));
+    sections.push(packSection('task', 'Task', JSON.stringify(task, null, 2), i.raw.artifactTiers.taskGraph));
   }
   if (i.raw.testConventions !== null) {
-    sections.push(section('test-conventions', 'Test conventions', i.raw.testConventions));
+    sections.push(packSection('test-conventions', 'Test conventions', i.raw.testConventions, 'T1'));
   }
   if (i.raw.diff !== null) {
-    sections.push(section('diff', 'Diff', i.raw.diff));
+    sections.push(packSection('diff', 'Diff', i.raw.diff, 'T1'));
   }
   if (i.raw.oracleResults !== null) {
-    sections.push(section('oracle-results', 'Oracle results', i.raw.oracleResults));
+    sections.push(packSection('oracle-results', 'Oracle results', i.raw.oracleResults, 'T1'));
   }
   if (i.raw.assumptions.length > 0) {
-    sections.push(section('assumptions', 'Recorded assumptions', JSON.stringify(i.raw.assumptions, null, 2)));
+    sections.push(packSection('assumptions', 'Recorded assumptions', JSON.stringify(i.raw.assumptions, null, 2), 'T2'));
   }
   if (i.raw.currentTaskReviewerFindings !== null) {
-    sections.push(section('current-task-reviewer-findings', 'Current task reviewer findings', i.raw.currentTaskReviewerFindings));
+    sections.push(packSection('current-task-reviewer-findings', 'Current task reviewer findings', i.raw.currentTaskReviewerFindings, 'T2'));
   }
   return sections;
 }

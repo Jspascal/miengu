@@ -4,20 +4,25 @@ import { ROLE_PACK_POLICY } from '../../src/wiki/contextpack.js';
 import { ArchitecturePlanSchema } from '../../src/contracts/architecturePlan.js';
 import type { ArchitecturePlan } from '../../src/contracts/index.js';
 import type { PackBuildInput } from '../../src/agents/agent.js';
+import type { TieredBody } from '../../src/wiki/packmaterials.js';
 import { SlugSchema, WorkItemIdSchema } from '../../src/core/ids.js';
 
 const itemId = WorkItemIdSchema.parse('wi-example-abc123');
 const slug = SlugSchema.parse('example');
 
+function tieredBody(body: string): TieredBody {
+  return { body, tier: 'T2', sourceEventId: null };
+}
+
 function emptyRaw(): PackBuildInput['raw'] {
   return {
     prd: null,
-    wikiIndex: null,
+    wikiIndex: [],
     existingReqIds: [],
     priorOutOfScope: [],
-    stackFacts: null,
-    systemSkeleton: null,
-    fileMap: null,
+    stackFacts: [],
+    systemSkeleton: [],
+    fileMap: [],
     testConventions: null,
     sourceFiles: [],
     frozenTestList: [],
@@ -27,6 +32,12 @@ function emptyRaw(): PackBuildInput['raw'] {
     currentTaskReviewerFindings: null,
     escalationContext: null,
     assumptions: [],
+    artifactTiers: {
+      requirementSet: 'T2',
+      architecturePlan: 'T2',
+      taskGraph: 'T2',
+      testSuiteSpec: 'T2',
+    },
   };
 }
 
@@ -49,12 +60,12 @@ describe('architect.buildCandidates', () => {
   it("never emits a kind in the Architect's omits list, even when every raw material is populated", () => {
     const full = pack({
       prd: 'the request',
-      wikiIndex: 'wiki',
+      wikiIndex: [tieredBody('wiki')],
       existingReqIds: [],
       priorOutOfScope: ['out'],
-      stackFacts: 'stack',
-      systemSkeleton: 'skeleton',
-      fileMap: 'files',
+      stackFacts: [tieredBody('stack')],
+      systemSkeleton: [tieredBody('skeleton')],
+      fileMap: [tieredBody('files')],
       testConventions: 'conventions',
       sourceFiles: [{ path: 'src/a.ts', body: 'x' }],
       frozenTestList: [{ testId: 't', intent: 'i' }],

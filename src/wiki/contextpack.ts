@@ -57,6 +57,13 @@ function rolePolicy(
  * list. Encodes §15.1–15.6's packs and §3.17's table; the two bolded rows there are
  * load-bearing: the Test Author never sees `architecture-components`, `file-map` or
  * `task-graph`, and the Reviewer never sees `coder-transcript`.
+ *
+ * Phase 4 binding decision 12 closes a third Test Author side channel: `wiki-index` and
+ * `system-skeleton` are the component graph under another name (component ids plus one-line
+ * responsibilities; the component graph plus interface signatures), and `architecture-components`
+ * is already omitted for exactly that reason. Both moved from `testAuthor.includes` to
+ * `testAuthor.omits` here, before `src/wiki/packmaterials.ts` fills them with real content —
+ * closing the leak before the fill, never after.
  */
 export const ROLE_PACK_POLICY = {
   analyst: rolePolicy(
@@ -143,11 +150,9 @@ export const ROLE_PACK_POLICY = {
   ),
   testAuthor: rolePolicy(
     [
-      'wiki-index',
       'existing-req-ids',
       'prior-out-of-scope',
       'stack-facts',
-      'system-skeleton',
       'requirement-set',
       'architecture-interfaces',
       'test-conventions',
@@ -157,6 +162,10 @@ export const ROLE_PACK_POLICY = {
     ['requirement-set', 'architecture-interfaces', 'test-conventions'],
     [
       'prd',
+      // Decision 12: both are the component map under another name and close the same side
+      // channel `architecture-components` already blocks below.
+      'wiki-index',
+      'system-skeleton',
       'architecture-decisions',
       'architecture-components',
       'file-map',
@@ -243,6 +252,22 @@ export interface ContextPack {
   readonly sections: readonly ContextPackSection[];
   readonly estimatedTokens: number;
   readonly dropped: readonly { kind: PackSourceKind; heading: string; reason: 'budget' }[];
+}
+
+/**
+ * §3 (binding decision 13): the single, exported section constructor that replaces the six
+ * role modules' private `section()` helpers. `tier` is a required argument — the compiler
+ * forces every call site to name a real, derived tier instead of inheriting a hardcoded `T1`
+ * that made `assemblePack`'s tier floor and weakest-tier-first budget drop dead code.
+ */
+export function packSection(
+  kind: PackSourceKind,
+  heading: string,
+  body: string,
+  tier: ProvenanceTier,
+  sourceEventId: EventId | null = null,
+): ContextPackSection {
+  return { kind, heading, body, tier, sourceEventId };
 }
 
 /** ceil(utf8Bytes / 4). AN ESTIMATE — never a claim about the provider's own token count. */
