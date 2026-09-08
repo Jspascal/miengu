@@ -1,6 +1,6 @@
 import type { ReviewVerdict } from '../contracts/index.js';
 import type { ContextPackSection } from '../wiki/contextpack.js';
-import { checkReviewVerdict, dispatchedTask } from './checks.js';
+import { checkReviewVerdict } from './checks.js';
 import type { CheckContext } from './checks.js';
 import type { PackBuildInput, PostStepInput, PostStepResult, RoleModule } from './agent.js';
 
@@ -39,7 +39,7 @@ export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[
   if (i.raw.systemSkeleton !== null) {
     sections.push(section('system-skeleton', 'System skeleton', i.raw.systemSkeleton));
   }
-  const task = i.checkContext.taskGraph !== null ? dispatchedTask(i.checkContext.taskGraph) : null;
+  const task = i.task;
   if (i.checkContext.requirementSet !== null) {
     // §15.6 scopes this to the task's own `req_ids`. It previously shipped the FULL
     // RequirementSet under the heading "Task's requirements", which both mislabels the
@@ -90,8 +90,8 @@ export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[
   if (i.raw.assumptions.length > 0) {
     sections.push(section('assumptions', 'Recorded assumptions', JSON.stringify(i.raw.assumptions, null, 2)));
   }
-  if (i.raw.reviewerFindings !== null) {
-    sections.push(section('reviewer-findings', 'Prior reviewer findings', i.raw.reviewerFindings));
+  if (i.raw.currentTaskReviewerFindings !== null) {
+    sections.push(section('current-task-reviewer-findings', 'Current task reviewer findings', i.raw.currentTaskReviewerFindings));
   }
   return sections;
 }
@@ -102,8 +102,8 @@ export function buildTaskSection(): string {
     'and failed to find one.';
 }
 
-export function validate(artifact: unknown, c: CheckContext): readonly string[] {
-  return checkReviewVerdict(artifact as ReviewVerdict, c);
+export function validate(artifact: unknown, c: CheckContext, pack: PackBuildInput): readonly string[] {
+  return checkReviewVerdict(artifact as ReviewVerdict, c, pack.task, pack.activeT1OracleFailure, pack.activeCauseLevel);
 }
 
 /** §15.6: no post-step — the verdict is recorded, never acted on (binding decision 2). */

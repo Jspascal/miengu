@@ -20,7 +20,8 @@ function emptyRaw(): PackBuildInput['raw'] {
     frozenTestBodies: [],
     diff: null,
     oracleResults: null,
-    reviewerFindings: null,
+    currentTaskReviewerFindings: null,
+    escalationContext: null,
     assumptions: [],
   };
 }

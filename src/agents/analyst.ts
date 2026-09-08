@@ -4,6 +4,7 @@ import type { RequirementSet } from '../contracts/index.js';
 import type { ContextPackSection } from '../wiki/contextpack.js';
 import { checkRequirementSet } from './checks.js';
 import type { CheckContext } from './checks.js';
+import { renderEscalationContext } from './agent.js';
 import type { PackBuildInput, PostStepInput, PostStepResult, RoleModule } from './agent.js';
 import type { AppendInput } from '../core/log.js';
 
@@ -41,6 +42,9 @@ export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[
   }
   if (i.raw.stackFacts !== null) {
     sections.push(section('stack-facts', 'Stack facts', i.raw.stackFacts));
+  }
+  if (i.raw.escalationContext !== null) {
+    sections.push(section('escalation-context', 'Escalation context', renderEscalationContext('analyst', i.raw.escalationContext)));
   }
   return sections;
 }

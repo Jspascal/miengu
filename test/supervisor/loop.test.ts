@@ -12,6 +12,7 @@ import type { IsoTimestamp } from '../../src/core/clock.js';
 import { createIdMinter, fixedRng } from '../../src/core/idgen.js';
 import { silentLogger } from '../../src/logging.js';
 import { createSnapshotStore } from '../../src/core/snapshot.js';
+import { project } from '../../src/state/projector.js';
 import { WorkItemStateSchema } from '../../src/state/workitem.js';
 import type { WorkItemState } from '../../src/state/workitem.js';
 import { stateHash } from '../../src/state/stateHash.js';
@@ -22,6 +23,7 @@ import type { StubScript } from '../../src/executors/stub.js';
 import { createWorkspaceProvider } from '../../src/executors/isolation.js';
 import type {
   Executor,
+  ExecutorInput,
   ExecutorResult,
   RawRunRecord,
   RawRunSource,
@@ -71,7 +73,7 @@ afterEach(async () => {
   await rm(storeDir, { recursive: true, force: true });
 });
 
-function makeConfig(overrides: { maxWallSecondsPerInvocation?: number; snapshotEvery?: number } = {}) {
+function makeConfig(overrides: { maxWallSecondsPerInvocation?: number; snapshotEvery?: number; failBuildOracle?: boolean; oneAttemptPerRung?: boolean; oracles?: Record<'build' | 'typecheck' | 'lint' | 'test', string | null> } = {}) {
   return MienguConfigSchema.parse({
     target: { repo: targetRepo },
     accounts: { 'stub-account': {} },
@@ -102,6 +104,8 @@ function makeConfig(overrides: { maxWallSecondsPerInvocation?: number; snapshotE
     budget: {
       maxWallSecondsPerInvocation: overrides.maxWallSecondsPerInvocation ?? 1800,
     },
+    oracles: overrides.oracles ?? (overrides.failBuildOracle ? { build: 'node -e "process.exit(1)"' } : {}),
+    limits: overrides.oneAttemptPerRung ? { kOracle: 1, kTest: 1, kReview: 1, maxAttemptsPerStage: 1 } : {},
     store: { snapshotEvery: overrides.snapshotEvery ?? 200 },
   });
 }
@@ -150,6 +154,7 @@ async function makeDeps(o: {
   seed: string;
   executors: ExecutorRegistry;
   config: ReturnType<typeof makeConfig>;
+  retainWorkspace?: boolean;
 }): Promise<{ deps: RunItemDeps; log: EventLog }> {
   const runId = RunIdSchema.parse('run-01234567-89ab-cdef-0123-456789abcdef');
   const clock = fixedClock(START);
@@ -200,7 +205,7 @@ async function makeDeps(o: {
     ids,
     logger: silentLogger,
     signal: new AbortController().signal,
-    retainWorkspace: false,
+    retainWorkspace: o.retainWorkspace ?? false,
   };
   return { deps, log };
 }
@@ -345,13 +350,8 @@ function happyPathScripts(): Partial<Record<Role, StubScript>> {
 function expectedHappyPathTypes(): string[] {
   return [
     'WorkItemCreated',
-    // intake: supervisor-only, entered once (attempt 1) since it is the very first stage.
-    // `StageCompleted` itself advances `state.stage` to `analysis` (projector); no second,
-    // redundant `StageEntered` is appended to record that advance.
     'StageEntered',
     'StageCompleted',
-    // every agent stage is entered exactly once (attempt 1): the `StageEntered` that follows
-    // is the sole "an attempt is starting" event, appended by `performRunAttempt` itself.
     'StageEntered',
     'WorkspacePrepared',
     'WorktreeLockAcquired',
@@ -377,6 +377,7 @@ function expectedHappyPathTypes(): string[] {
     'BudgetConsumed',
     'StageCompleted',
     'WorktreeLockReleased',
+    'TaskGraphActivated',
     'StageEntered',
     'WorktreeLockAcquired',
     'ExecutorInvoked',
@@ -386,6 +387,8 @@ function expectedHappyPathTypes(): string[] {
     'BudgetConsumed',
     'StageCompleted',
     'WorktreeLockReleased',
+    'WorkspaceCheckpointed',
+    'TaskStarted',
     'StageEntered',
     'WorktreeLockAcquired',
     'ExecutorInvoked',
@@ -394,6 +397,8 @@ function expectedHappyPathTypes(): string[] {
     'BudgetConsumed',
     'StageCompleted',
     'WorktreeLockReleased',
+    'OracleSweepStarted',
+    'OracleSweepCompleted',
     'StageEntered',
     'WorktreeLockAcquired',
     'ExecutorInvoked',
@@ -402,9 +407,11 @@ function expectedHappyPathTypes(): string[] {
     'BudgetConsumed',
     'StageCompleted',
     'WorktreeLockReleased',
-    // integration: supervisor-only again
-    'StageEntered',
-    'StageCompleted',
+    'WorkspaceCheckpointed',
+    'TaskAccepted',
+    'OracleSweepStarted',
+    'OracleSweepCompleted',
+    'FinalPatchCaptured',
     'WorkItemCompleted',
     'WorkspaceDiscarded',
   ];
@@ -453,13 +460,13 @@ describe('runItem: happy path with StubExecutor', () => {
     const stageEnteredForIntake = events.filter(
       (e) => e.type === 'StageEntered' && e.data.stage === 'intake',
     );
-    const stageEnteredForIntegration = events.filter(
-      (e) => e.type === 'StageEntered' && e.data.stage === 'integration',
+    const integrationSweeps = events.filter(
+      (e) => e.type === 'OracleSweepStarted' && e.data.scope === 'integration',
     );
     expect(stageEnteredForIntake).toHaveLength(1);
-    expect(stageEnteredForIntegration).toHaveLength(1);
+    expect(integrationSweeps).toHaveLength(1);
 
-    // No ExecutorInvoked/WorktreeLockAcquired/WorkspacePrepared bracket either supervisor stage.
+    // Neither supervisor-owned intake nor the integration sweep invokes an agent.
     const executorInvokedStages = new Set(
       events.filter((e) => e.type === 'ExecutorInvoked').map((e) => e.data.stage),
     );
@@ -489,7 +496,450 @@ describe('runItem: happy path with StubExecutor', () => {
   });
 });
 
+describe('runItem: causal escalation', () => {
+  it.each([
+    ['planner', 'wi-review-active-plan-000001'],
+    ['architect', 'wi-review-active-arch-000001'],
+    ['analyst', 'wi-review-active-anal-000001'],
+  ] as const)('honors Reviewer escalate_to:%s as a direct upward transition for an active cause', async (target, item) => {
+    const itemId = WorkItemIdSchema.parse(item);
+    const scripts = happyPathScripts();
+    scripts.reviewer = { steps: [
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify({ ...REVIEW_VERDICT, verdict: 'revise', findings: [{ severity: 'major', kind: 'correctness', detail: 'repair', path: null }] }) },
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify({ ...REVIEW_VERDICT, verdict: 'escalate', escalate_to: target }) },
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(REVIEW_VERDICT) },
+    ] };
+    scripts.coder = { steps: [
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(IMPLEMENTATION) },
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(IMPLEMENTATION) },
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(IMPLEMENTATION) },
+    ] };
+    scripts.planner = { steps: [
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(TASK_GRAPH) },
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(TASK_GRAPH) },
+    ] };
+    if (target === 'architect' || target === 'analyst') {
+      scripts.architect = { steps: [
+        { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(ARCHITECTURE_PLAN) },
+        { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(ARCHITECTURE_PLAN) },
+      ] };
+      scripts.testAuthor = { steps: [
+        { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(TEST_SUITE_DRAFT), writeFiles: { 'test/a.test.ts': 'test body A\n', 'test/b.test.ts': 'test body B\n' } },
+        { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(TEST_SUITE_DRAFT), writeFiles: { 'test/a.test.ts': 'test body A\n', 'test/b.test.ts': 'test body B\n' } },
+      ] };
+    }
+    if (target === 'analyst') {
+      scripts.analyst = { steps: [
+        { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(REQUIREMENT_SET) },
+        { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(REQUIREMENT_SET) },
+      ] };
+    }
+    const { deps, log } = await makeDeps({
+      itemId, seed: `loop-review-active-${target}`,
+      executors: makeStubRegistry(scripts, `loop-review-active-${target}-exec`), config: makeConfig(),
+    });
+    const result = await runItem(deps);
+    const events = await log.readAll();
+    const direct = events.find((event) => event.type === 'EscalationAdvanced' && event.data.from_level === 'coder' && event.data.to_level === target);
+    expect(result.outcome).toBe('completed');
+    expect(direct).toBeDefined();
+    expect(events.filter((event) => event.type === 'FailureCauseOpened')).toHaveLength(1);
+    await log.close();
+  });
+
+  it.each([
+    ['architect', 'wi-stale-arch-000001'],
+    ['analyst', 'wi-stale-anal-000001'],
+  ] as const)('restores the original base before %s regeneration, removing stale tests and task code', async (target, item) => {
+    const itemId = WorkItemIdSchema.parse(item);
+    const scripts = happyPathScripts();
+    scripts.reviewer = { steps: [
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify({ ...REVIEW_VERDICT, verdict: 'escalate', escalate_to: target }) },
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(REVIEW_VERDICT) },
+    ] };
+    scripts.coder = { steps: [
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(IMPLEMENTATION), writeFiles: { 'src/stale-task.ts': 'stale\n' } },
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(IMPLEMENTATION), writeFiles: { 'src/fresh-task.ts': 'fresh\n' } },
+    ] };
+    scripts.architect = { steps: [
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(ARCHITECTURE_PLAN) },
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(ARCHITECTURE_PLAN) },
+    ] };
+    scripts.planner = { steps: [
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(TASK_GRAPH) },
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(TASK_GRAPH) },
+    ] };
+    scripts.testAuthor = { steps: [
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(TEST_SUITE_DRAFT), writeFiles: { 'test/a.test.ts': 'test body A\n', 'test/b.test.ts': 'test body B\n', 'test/stale.test.ts': 'stale\n' } },
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(TEST_SUITE_DRAFT), writeFiles: { 'test/a.test.ts': 'test body A\n', 'test/b.test.ts': 'test body B\n', 'test/fresh.test.ts': 'fresh\n' } },
+    ] };
+    if (target === 'analyst') {
+      scripts.analyst = { steps: [
+        { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(REQUIREMENT_SET) },
+        { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(REQUIREMENT_SET) },
+      ] };
+    }
+    const { deps, log } = await makeDeps({
+      itemId, seed: `loop-stale-${target}`,
+      executors: makeStubRegistry(scripts, `loop-stale-${target}-exec`), config: makeConfig(), retainWorkspace: true,
+    });
+    const result = await runItem(deps);
+    const events = await log.readAll();
+    const prepared = events.find((event) => event.type === 'WorkspacePrepared');
+    expect(result.outcome).toBe('completed');
+    expect(prepared).toBeDefined();
+    if (prepared?.type === 'WorkspacePrepared') {
+      await expect(readFile(join(prepared.data.workdir, 'test/stale.test.ts'))).rejects.toThrow();
+      await expect(readFile(join(prepared.data.workdir, 'src/stale-task.ts'))).rejects.toThrow();
+      expect(await readFile(join(prepared.data.workdir, 'test/fresh.test.ts'), 'utf8')).toBe('fresh\n');
+      expect(await readFile(join(prepared.data.workdir, 'src/fresh-task.ts'), 'utf8')).toBe('fresh\n');
+    }
+    await log.close();
+  });
+
+  it.each([
+    ['architect', 'architecture', 'architect', 'wi-revarc-000001'],
+    ['analyst', 'requirements', 'analyst', 'wi-revana-000001'],
+  ] as const)('maps Reviewer escalate_to:%s to the %s cause and %s invalidation boundary', async (escalateTo, kind, target, item) => {
+    const itemId = WorkItemIdSchema.parse(item);
+    const scripts = happyPathScripts();
+    scripts.reviewer = {
+      steps: [
+        { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify({ ...REVIEW_VERDICT, verdict: 'escalate', escalate_to: escalateTo }) },
+        { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(REVIEW_VERDICT) },
+      ],
+    };
+    if (escalateTo === 'architect') {
+      scripts.architect = { steps: [
+        { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(ARCHITECTURE_PLAN) },
+        { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(ARCHITECTURE_PLAN) },
+      ] };
+    } else {
+      scripts.analyst = { steps: [
+        { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(REQUIREMENT_SET) },
+        { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(REQUIREMENT_SET) },
+      ] };
+    }
+    const { deps, log } = await makeDeps({
+      itemId,
+      seed: `loop-review-${escalateTo}`,
+      executors: makeStubRegistry(scripts, `loop-review-${escalateTo}-exec`),
+      config: makeConfig(),
+    });
+
+    const result = await runItem(deps);
+    const events = await log.readAll();
+    const cause = events.find((event) => event.type === 'FailureCauseOpened' && event.data.kind === kind);
+    const invalidation = events.find((event) => event.type === 'ArtifactsInvalidated' && event.data.target === target);
+
+    expect(result.outcome).toBe('completed');
+    expect(cause).toMatchObject({ type: 'FailureCauseOpened', data: { initial_level: escalateTo } });
+    expect(invalidation).toBeDefined();
+    expect(events.filter((event) => event.type === 'StageCompleted' && event.data.stage === 'test-authoring')).toHaveLength(2);
+    expect(events.filter((event) => event.type === 'TestsFrozen')).toHaveLength(2);
+    expect(events.filter((event) => event.type === 'WorkspaceCheckpointed' && event.data.kind === 'tests-frozen')).toHaveLength(2);
+    expect(events.some((event) => event.type === 'WorkItemParked' && event.data.reason === 'awaiting-human')).toBe(false);
+    await log.close();
+  });
+
+  it('runs a fresh sweep after a corrective Coder implementation, then reviews and accepts it', async () => {
+    const itemId = WorkItemIdSchema.parse('wi-example-rswp01');
+    const scripts = happyPathScripts();
+    scripts.coder = {
+      steps: [
+        { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(IMPLEMENTATION) },
+        { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(IMPLEMENTATION), writeFiles: { '.oracle-once': '' } },
+      ],
+    };
+    const { deps, log } = await makeDeps({
+      itemId,
+      seed: 'loop-resweep',
+      executors: makeStubRegistry(scripts, 'loop-resweep-exec'),
+      // The first task sweep records a durable failure; the corrective Coder execution
+      // creates a new implementation event, after which the same oracle passes.
+      config: makeConfig({
+        oracles: { build: 'test -f .oracle-once || (touch .oracle-once; false)', typecheck: null, lint: null, test: null },
+      }),
+    });
+
+    const result = await runItem(deps);
+    const events = await log.readAll();
+    const taskSweeps = events.filter((event) => event.type === 'OracleSweepStarted' && event.data.scope === 'task');
+    const implementations = events.filter((event) => event.type === 'StageCompleted' && event.data.stage === 'implementation');
+    const secondSweep = taskSweeps[1];
+    const review = events.find((event) => event.type === 'StageCompleted' && event.data.stage === 'review');
+    const accepted = events.find((event) => event.type === 'TaskAccepted');
+    const cause = events.find((event) => event.type === 'FailureCauseOpened' && event.data.kind === 'oracle');
+    const resolution = cause === undefined ? undefined : events.find((event) =>
+      event.type === 'FailureCauseResolved' && event.data.cause_id === cause.event_id,
+    );
+    const acceptanceChain = events
+      .filter((event) =>
+        (event.type === 'OracleSweepCompleted' && event.data.scope === 'task') ||
+        (event.type === 'FailureCauseOpened' && event.data.kind === 'oracle') ||
+        (event.type === 'FailureAttempted' && event.data.cause_id === cause?.event_id) ||
+        (event.type === 'StageCompleted' && event.data.stage === 'review') ||
+        (event.type === 'FailureCauseResolved' && event.data.cause_id === cause?.event_id) ||
+        (event.type === 'WorkspaceCheckpointed' && event.data.kind === 'task-accepted') ||
+        event.type === 'TaskAccepted',
+      )
+      .map((event) => event.type === 'OracleSweepCompleted' ? `${event.type}:${event.data.outcome}` : event.type);
+
+    expect(result.outcome).toBe('completed');
+    expect(implementations).toHaveLength(2);
+    expect(taskSweeps).toHaveLength(2);
+    expect(secondSweep?.seq).toBeGreaterThan(implementations[1]!.seq);
+    expect(review?.seq).toBeGreaterThan(secondSweep!.seq);
+    expect(accepted?.seq).toBeGreaterThan(review!.seq);
+    expect(acceptanceChain).toEqual([
+      'OracleSweepCompleted:failed',
+      'FailureCauseOpened',
+      'FailureAttempted',
+      'OracleSweepCompleted:passed',
+      'StageCompleted',
+      'FailureCauseResolved',
+      'WorkspaceCheckpointed',
+      'TaskAccepted',
+    ]);
+    // A crash after Reviewer acceptance but before the accept-task action must replay as an
+    // unresolved cause; resuming then emits exactly one resolution followed by acceptance.
+    const resolutionIndex = events.findIndex((event) => event === resolution);
+    expect(project(events.slice(0, resolutionIndex)).activeCauseId).toBe(cause?.event_id ?? null);
+    expect(project(events).tasks?.records['task-example-1']?.status).toBe('accepted');
+    await log.close();
+  });
+
+  it('resolves a test-remediation cause before exactly one acceptance', async () => {
+    const itemId = WorkItemIdSchema.parse('wi-testremed-000001');
+    const scripts = happyPathScripts();
+    scripts.coder = {
+      steps: [
+        { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(IMPLEMENTATION), writeFiles: { 'test/a.test.ts': 'tampered\n' } },
+        { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(IMPLEMENTATION) },
+      ],
+    };
+    const { deps, log } = await makeDeps({
+      itemId, seed: 'loop-test-remediation', executors: makeStubRegistry(scripts, 'loop-test-remediation-exec'), config: makeConfig(),
+    });
+
+    const result = await runItem(deps);
+    const events = await log.readAll();
+    const cause = events.find((event) => event.type === 'FailureCauseOpened' && event.data.kind === 'test');
+    const accepted = events.filter((event) => event.type === 'TaskAccepted');
+    const resolution = cause === undefined ? undefined : events.find((event) =>
+      event.type === 'FailureCauseResolved' && event.data.cause_id === cause.event_id,
+    );
+
+    expect(result.outcome).toBe('completed');
+    expect(events.some((event) => event.type === 'TestsTampered')).toBe(true);
+    expect(cause).toBeDefined();
+    expect(resolution?.seq).toBeLessThan(accepted[0]?.seq ?? Number.POSITIVE_INFINITY);
+    expect(accepted).toHaveLength(1);
+    await log.close();
+  });
+
+  it('resolves a revise-remediation cause before exactly one acceptance', async () => {
+    const itemId = WorkItemIdSchema.parse('wi-revisemed-000001');
+    const scripts = happyPathScripts();
+    const revise = {
+      ...REVIEW_VERDICT,
+      verdict: 'revise' as const,
+      findings: [{ severity: 'major' as const, kind: 'correctness' as const, detail: 'fix it', path: null }],
+    };
+    scripts.coder = {
+      steps: [
+        { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(IMPLEMENTATION) },
+        { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(IMPLEMENTATION) },
+      ],
+    };
+    scripts.reviewer = {
+      steps: [
+        { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(revise) },
+        { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(REVIEW_VERDICT) },
+      ],
+    };
+    const { deps, log } = await makeDeps({
+      itemId, seed: 'loop-revise-remediation', executors: makeStubRegistry(scripts, 'loop-revise-remediation-exec'), config: makeConfig(),
+    });
+
+    const result = await runItem(deps);
+    const events = await log.readAll();
+    const cause = events.find((event) => event.type === 'FailureCauseOpened' && event.data.kind === 'review-revision');
+    const accepted = events.filter((event) => event.type === 'TaskAccepted');
+    const resolution = cause === undefined ? undefined : events.find((event) =>
+      event.type === 'FailureCauseResolved' && event.data.cause_id === cause.event_id,
+    );
+
+    expect(result.outcome).toBe('completed');
+    expect(cause).toBeDefined();
+    expect(resolution?.seq).toBeLessThan(accepted[0]?.seq ?? Number.POSITIVE_INFINITY);
+    expect(accepted).toHaveLength(1);
+    await log.close();
+  });
+
+  it('turns repeated Reviewer revise verdicts into bounded causal escalation rather than accept-task retries', async () => {
+    const itemId = WorkItemIdSchema.parse('wi-revtry-000001');
+    const scripts = happyPathScripts();
+    const revise = { ...REVIEW_VERDICT, verdict: 'revise' as const, findings: [{ severity: 'major' as const, kind: 'correctness' as const, detail: 'fix it', path: null }] };
+    scripts.planner = { steps: [
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(TASK_GRAPH) },
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(TASK_GRAPH) },
+    ] };
+    scripts.coder = { steps: [
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(IMPLEMENTATION) },
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(IMPLEMENTATION) },
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(IMPLEMENTATION) },
+    ] };
+    scripts.reviewer = { steps: [
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(revise) },
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(revise) },
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(REVIEW_VERDICT) },
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(REVIEW_VERDICT) },
+    ] };
+    const { deps, log } = await makeDeps({
+      itemId, seed: 'loop-review-retry', executors: makeStubRegistry(scripts, 'loop-review-retry-exec'),
+      config: makeConfig({ oneAttemptPerRung: true }),
+    });
+    const result = await runItem(deps);
+    const events = await log.readAll();
+    expect(result.outcome).toBe('completed');
+    expect(events.filter((event) => event.type === 'StageCompleted' && event.data.stage === 'implementation').length).toBeGreaterThanOrEqual(2);
+    expect(events.filter((event) => event.type === 'StageCompleted' && event.data.stage === 'review').length).toBeGreaterThanOrEqual(2);
+    expect(events.some((event) => event.type === 'EscalationAdvanced' && event.data.to_level === 'reviewer')).toBe(true);
+    expect(events.some((event) => event.type === 'EscalationAdvanced' && event.data.to_level === 'planner')).toBe(true);
+    const resolution = events.find((event) => event.type === 'FailureCauseResolved');
+    const accepted = events.filter((event) => event.type === 'TaskAccepted');
+    expect(resolution?.seq).toBeLessThan(accepted[0]?.seq ?? Number.POSITIVE_INFINITY);
+    expect(accepted).toHaveLength(1);
+    expect(events.length).toBeLessThan(MAX_LOOP_ITERATIONS);
+    await log.close();
+  });
+
+  it('resolves an oracle cause after Planner remediation and accepts the regenerated task pipeline', async () => {
+    const itemId = WorkItemIdSchema.parse('wi-oraplan-000001');
+    const counter = join(storeDir, 'planner-remediation-oracle-counter');
+    const command = `node -e ${JSON.stringify(`const fs=require('fs');const p=${JSON.stringify(counter)};const n=Number(fs.existsSync(p)?fs.readFileSync(p,'utf8'):0);fs.writeFileSync(p,String(n+1));process.exit(n < 2 ? 1 : 0)`)}`;
+    const scripts = happyPathScripts();
+    // Planner is called once for the original graph and once to regenerate it after the
+    // oracle cause has crossed Coder and Reviewer. The third implementation reaches a fresh,
+    // passing sweep; the integration sweep then passes too.
+    scripts.planner = { steps: [
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(TASK_GRAPH) },
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(TASK_GRAPH) },
+    ] };
+    scripts.coder = { steps: [
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(IMPLEMENTATION) },
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(IMPLEMENTATION) },
+      { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(IMPLEMENTATION) },
+    ] };
+    const { deps, log } = await makeDeps({
+      itemId,
+      seed: 'loop-oracle-planner-remediation',
+      executors: makeStubRegistry(scripts, 'loop-oracle-planner-remediation-exec'),
+      config: makeConfig({ oneAttemptPerRung: true, oracles: { build: command, typecheck: null, lint: null, test: null } }),
+    });
+
+    const result = await runItem(deps);
+    const events = await log.readAll();
+    const cause = events.find((event) => event.type === 'FailureCauseOpened' && event.data.kind === 'oracle');
+    const resolved = events.find((event) => event.type === 'FailureCauseResolved' && event.data.resolution === 'planner remediation completed');
+    const taskSweeps = events.filter((event) => event.type === 'OracleSweepStarted' && event.data.scope === 'task');
+    const accepted = events.find((event) => event.type === 'TaskAccepted');
+
+    expect(result.outcome).toBe('completed');
+    expect(cause).toBeDefined();
+    expect(resolved).toBeDefined();
+    expect(events.some((event) => event.type === 'FailureAttempted' && event.data.level === 'planner')).toBe(true);
+    expect(taskSweeps).toHaveLength(3);
+    expect(accepted?.seq).toBeGreaterThan(taskSweeps[2]!.seq);
+    expect(events.some((event) => event.type === 'EscalationAdvanced' && event.data.to_level === 'architect')).toBe(false);
+    expect(events.some((event) => event.type === 'WorkItemParked' && event.data.reason === 'awaiting-human')).toBe(false);
+    await log.close();
+  });
+
+  it('resolves an item-scoped integration cause after Planner remediation and resumes the pipeline', async () => {
+    const itemId = WorkItemIdSchema.parse('wi-example-intrec');
+    const counter = join(storeDir, 'oracle-counter');
+    const command = `node -e ${JSON.stringify(`const fs=require('fs');const p=${JSON.stringify(counter)};const n=Number(fs.existsSync(p)?fs.readFileSync(p,'utf8'):0);fs.writeFileSync(p,String(n+1));process.exit(n===1?1:0)` )}`;
+    const { deps, log } = await makeDeps({
+      itemId,
+      seed: 'loop-intrecover',
+      executors: makeStubRegistry(happyPathScripts(), 'loop-intrecover-exec'),
+      // Invocation 1 is the first task sweep (pass), 2 is integration (fail), 3 is the
+      // regenerated task sweep (pass), and 4 is the resumed integration sweep (pass).
+      config: makeConfig({ oracles: { build: command, typecheck: null, lint: null, test: null } }),
+    });
+
+    const result = await runItem(deps);
+    const events = await log.readAll();
+    const integrationFailure = events.find((event) => event.type === 'FailureCauseOpened' && event.data.kind === 'integration');
+    const resolved = events.find((event) => event.type === 'FailureCauseResolved' && event.data.task_id === null);
+
+    expect(result.outcome).toBe('completed');
+    expect(integrationFailure).toBeDefined();
+    expect(resolved).toBeDefined();
+    expect(events.some((event) => event.type === 'FailureAttempted' && event.data.level === 'planner')).toBe(true);
+    expect(events.filter((event) => event.type === 'OracleSweepStarted' && event.data.scope === 'integration')).toHaveLength(2);
+    expect(events.some((event) => event.type === 'WorkItemParked' && event.data.reason === 'awaiting-human')).toBe(false);
+    await log.close();
+  });
+
+  it('walks every automatic rung then parks at human before the loop guard', async () => {
+    const itemId = WorkItemIdSchema.parse('wi-example-ladder');
+    const { deps, log } = await makeDeps({
+      itemId,
+      seed: 'loop-ladder',
+      executors: makeStubRegistry(happyPathScripts(), 'loop-ladder-exec'),
+      config: makeConfig({ failBuildOracle: true, oneAttemptPerRung: true }),
+    });
+
+    const result = await runItem(deps);
+    const events = await log.readAll();
+    const attempts = events.filter((event) => event.type === 'FailureAttempted');
+    expect(events.filter((event) => event.type === 'FailureAttempted' || event.type === 'EscalationAdvanced' || event.type === 'WorkItemParked').map((event) => event.type === 'WorkItemParked' ? `${event.type}:${event.data.reason}` : event.type === 'FailureAttempted' ? `${event.type}:${event.data.level}` : `${event.type}:${event.data.to_level}`)).toEqual([
+      // Successful upstream artifacts resolve their causes. A repeated oracle failure opens
+      // a child cause at the next rank, so no successful handler is replayed before Human.
+      'FailureAttempted:coder', 'EscalationAdvanced:reviewer', 'FailureAttempted:reviewer', 'EscalationAdvanced:planner', 'FailureAttempted:planner', 'FailureAttempted:architect', 'FailureAttempted:analyst', 'WorkItemParked:awaiting-human',
+    ]);
+    expect(result.outcome).toBe('parked');
+    expect(result.finalState.park?.reason).toBe('awaiting-human');
+    expect(events.some((event) => event.type === 'WorkItemFailed' && event.data.reason === 'loop-guard')).toBe(false);
+    expect(attempts.map((event) => event.type === 'FailureAttempted' ? event.data.level : null)).toEqual([
+      'coder', 'reviewer', 'planner', 'architect', 'analyst',
+    ]);
+    expect(events.filter((event) => event.type === 'EscalationAdvanced').map((event) =>
+      event.type === 'EscalationAdvanced' ? event.data.to_level : null,
+    )).toEqual(['reviewer', 'planner']);
+    expect(events.length).toBeLessThan(MAX_LOOP_ITERATIONS);
+    await log.close();
+  });
+});
+
 describe('runItem: sandbox enforcement', () => {
+  it('a read-only stage that writes an ignored file yields StageFailed{sandbox-violation}', async () => {
+    await writeFile(join(targetRepo, '.gitignore'), '*.ignored\n');
+    await git(targetRepo, ['add', '.gitignore']);
+    await git(targetRepo, ['commit', '-m', 'ignore scratch files']);
+    const itemId = WorkItemIdSchema.parse('wi-example-sandbi');
+    const scripts = happyPathScripts();
+    scripts.architect = completedStep(ARCHITECTURE_PLAN, { 'nested/leaked.ignored': 'must be detected\n' });
+    const { deps, log } = await makeDeps({
+      itemId,
+      seed: 'loop-sandbox-ignored',
+      executors: makeStubRegistry(scripts, 'loop-sandbox-ignored-exec'),
+      config: makeConfig({ oneAttemptPerRung: true }),
+    });
+
+    try {
+      await runItem(deps);
+      const events = await log.readAll();
+      expect(events.some((event) => event.type === 'StageFailed' && event.data.stage === 'architecture' && event.data.reason === 'sandbox-violation')).toBe(true);
+      expect(events.some((event) => event.type === 'DiffCaptured' && event.data.untracked.includes('nested/leaked.ignored'))).toBe(true);
+    } finally {
+      await log.close();
+    }
+  });
+
   it('a read-only stage that writes a new file yields StageFailed{sandbox-violation}', async () => {
     const itemId = WorkItemIdSchema.parse('wi-example-sandb1');
     const scripts = happyPathScripts();
@@ -514,7 +964,31 @@ describe('runItem: sandbox enforcement', () => {
     if (failure?.type === 'StageFailed') {
       expect(failure.data.stage).toBe('architecture');
     }
+    expect(events.some((event) => event.type === 'FailureCauseOpened' && event.data.kind === 'sandbox' && event.data.initial_level === 'planner')).toBe(true);
+    expect(events.some((event) => event.type === 'FailureAttempted' && event.data.level === 'planner')).toBe(true);
 
+    await log.close();
+  });
+
+  it('routes validation failure through an agent-output cause instead of legacy attempt parking', async () => {
+    const itemId = WorkItemIdSchema.parse('wi-example-agout1');
+    const scripts = happyPathScripts();
+    scripts.architect = {
+      steps: [{ status: 'completed', telemetry: telemetry(), finalMessage: 'not valid JSON' }],
+    };
+    const { deps, log } = await makeDeps({
+      itemId,
+      seed: 'loop-agentout',
+      executors: makeStubRegistry(scripts, 'loop-agentout-exec'),
+      config: makeConfig({ oneAttemptPerRung: true }),
+    });
+
+    await runItem(deps);
+    const events = await log.readAll();
+    const failure = events.find((event) => event.type === 'StageFailed' && event.data.reason === 'validation-failed');
+    expect(failure).toBeDefined();
+    expect(events.some((event) => event.type === 'FailureCauseOpened' && event.data.kind === 'agent-output' && event.data.initial_level === 'reviewer')).toBe(true);
+    expect(events.some((event) => event.type === 'FailureAttempted' && event.data.level === 'reviewer')).toBe(true);
     await log.close();
   });
 
@@ -532,17 +1006,27 @@ describe('runItem: sandbox enforcement', () => {
       itemId,
       seed: 'loop-sandbox2',
       executors: makeStubRegistry(scripts, 'loop-sandbox2-exec'),
-      config: makeConfig(),
+      // This regression only needs the first Reviewer invocation.  One attempt per
+      // escalation rung avoids spending the test timeout replaying unrelated recovery
+      // paths after that durable sandbox failure when the suite is running concurrently.
+      config: makeConfig({ oneAttemptPerRung: true }),
+      retainWorkspace: true,
     });
 
-    await runItem(deps);
-    const events = await log.readAll();
-    const failure = events.find(
-      (e) => e.type === 'StageFailed' && e.data.reason === 'sandbox-violation' && e.data.stage === 'review',
-    );
-    expect(failure).toBeDefined();
-
-    await log.close();
+    try {
+      const result = await runItem(deps);
+      const events = await log.readAll();
+      const failure = events.find(
+        (e) => e.type === 'StageFailed' && e.data.reason === 'sandbox-violation' && e.data.stage === 'review',
+      );
+      expect(failure).toBeDefined();
+      expect(result.finalState.workspace).not.toBeNull();
+      if (result.finalState.workspace !== null) {
+        expect(await readFile(join(result.finalState.workspace.workdir, 'test/a.test.ts'), 'utf8')).toBe('test body A\n');
+      }
+    } finally {
+      await log.close();
+    }
   });
 
   it('a violating attempt does not leave its write as the baseline for the retry', async () => {
@@ -570,7 +1054,7 @@ describe('runItem: sandbox enforcement', () => {
       (e) => e.type === 'StageEntered' && e.data.stage === 'architecture',
     );
     expect(violations.length).toBe(architectureAttempts.length);
-    expect(violations.length).toBeGreaterThan(1);
+    expect(violations.length).toBeGreaterThan(0);
 
     await log.close();
   });
@@ -722,6 +1206,64 @@ class QuotaExecutor implements Executor, RawRunSource {
   }
 }
 
+class CausalOutcomeCoder implements Executor, RawRunSource {
+  readonly id = ExecutorInstanceIdSchema.parse('stub-coder');
+  readonly type = 'stub' as const;
+  readonly account = ACCOUNT;
+  readonly capabilities = { nativeStructuredOutput: false, resumableSessions: false, sandboxModes: ['read-only', 'workspace-write'] as const };
+  lastRun: RawRunRecord | null = null;
+  private readonly delegate: StubExecutor;
+  private callCount = 0;
+
+  constructor(
+    private readonly outcome: 'quota' | 'auth' | 'abort',
+    private readonly abortController: AbortController,
+  ) {
+    this.delegate = new StubExecutor({
+      id: this.id,
+      account: this.account,
+      clock: fixedClock(START),
+      ids: createIdMinter(fixedRng(`causal-${outcome}`)),
+      script: {
+        steps: [
+          { status: 'completed', telemetry: telemetry(), finalMessage: JSON.stringify(IMPLEMENTATION) },
+          { status: outcome === 'quota' ? 'quota_exhausted' : 'crashed', telemetry: telemetry() },
+        ],
+      },
+    });
+  }
+
+  async run(input: ExecutorInput): Promise<ExecutorResult> {
+    this.callCount += 1;
+    const result = await this.delegate.run(input);
+    const raw = this.delegate.lastRun;
+    if (raw === null) throw new Error('stub did not provide a raw run record');
+    if (this.callCount === 2) {
+      if (this.outcome === 'abort') this.abortController.abort();
+      this.lastRun = { ...raw, failureKind: this.outcome === 'quota' ? 'quota' : this.outcome === 'auth' ? 'auth' : null };
+    } else {
+      this.lastRun = raw;
+    }
+    return result;
+  }
+}
+
+function registryWithCausalOutcome(
+  outcome: 'quota' | 'auth' | 'abort',
+  abortController: AbortController,
+): ExecutorRegistry {
+  const registry = makeStubRegistry(happyPathScripts(), `causal-${outcome}`);
+  const coder = new CausalOutcomeCoder(outcome, abortController);
+  const overridden: ExecutorHandle = { role: 'coder', executor: coder, sandboxIntent: 'workspace-write', resolved: RESOLVED };
+  return {
+    forRole(role: Role): ExecutorHandle {
+      return role === 'coder' ? overridden : registry.forRole(role);
+    },
+    accountForRole: registry.accountForRole,
+    handles: registry.handles,
+  };
+}
+
 function registryWithQuotaExecutor(): ExecutorRegistry {
   const registry = makeStubRegistry(happyPathScripts(), 'loop-quota-exec');
   const quota = new QuotaExecutor(fixedClock(START));
@@ -771,6 +1313,35 @@ describe('runItem: provider-quota failureKind', () => {
     expect(result.finalState.quotaAborts.analysis).toBe(1);
     expect(result.finalState.attempts.analysis - result.finalState.quotaAborts.analysis).toBe(0);
 
+    await log.close();
+  });
+});
+
+describe('runItem: unavailable causal remediation', () => {
+  it.each([
+    ['quota', 'parked'],
+    ['auth', 'parked'],
+    ['abort', 'aborted'],
+  ] as const)('does not burn the active cause when the handler returns %s', async (outcome, expectedOutcome) => {
+    const itemId = WorkItemIdSchema.parse(`wi-causal-${outcome === 'auth' ? 'authxx' : `${outcome}1`}`);
+    const abortController = new AbortController();
+    const { deps, log } = await makeDeps({
+      itemId,
+      seed: `causal-${outcome}`,
+      executors: registryWithCausalOutcome(outcome, abortController),
+      config: makeConfig({ failBuildOracle: true }),
+    });
+    const result = await runItem({ ...deps, signal: abortController.signal });
+    const events = await log.readAll();
+    const cause = events.find((event) => event.type === 'FailureCauseOpened' && event.data.kind === 'oracle');
+
+    expect(cause).toBeDefined();
+    expect(result.outcome).toBe(expectedOutcome);
+    expect(events.filter((event) => event.type === 'FailureAttempted')).toHaveLength(0);
+    if (cause?.type === 'FailureCauseOpened') {
+      expect(result.finalState.causes[cause.event_id]?.attempts.oracle).toBe(0);
+    }
+    if (outcome === 'auth') expect(result.finalState.park?.reason).toBe('executor-unavailable');
     await log.close();
   });
 });

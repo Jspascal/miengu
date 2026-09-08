@@ -499,6 +499,13 @@ describe('checkImplementation (coder)', () => {
     expect(failures).toContain("task_id 'task-example-9' does not match the dispatched task");
   });
 
+  it('binds validation to the state-selected task rather than graph order', () => {
+    const selected = { ...VALID_TASK_GRAPH.tasks[0]!, task_id: 'task-example-2' as never };
+    expect(checkImplementation(VALID_IMPLEMENTATION, ctx({ taskGraph: VALID_TASK_GRAPH }), selected)).toContain(
+      "task_id 'task-example-1' does not match the dispatched task",
+    );
+  });
+
   it('rejects a deviation whose from_decision_id does not resolve', () => {
     const bad: Implementation = {
       ...VALID_IMPLEMENTATION,
@@ -551,5 +558,18 @@ describe('checkReviewVerdict (reviewer)', () => {
     const bad: ReviewVerdict = { ...VALID_REVIEW_VERDICT, task_id: 'task-example-9' as never };
     const failures = checkReviewVerdict(bad, ctx({ taskGraph: VALID_TASK_GRAPH }));
     expect(failures).toContain("task_id 'task-example-9' does not match the reviewed task");
+  });
+
+  it('rejects acceptance while an active T1 oracle failure remains', () => {
+    expect(checkReviewVerdict(VALID_REVIEW_VERDICT, ctx(), null, true)).toContain(
+      "verdict: 'accept' while an active T1 oracle failure remains",
+    );
+  });
+
+  it('rejects escalation that does not move strictly above the active cause', () => {
+    const escalating: ReviewVerdict = { ...VALID_REVIEW_VERDICT, verdict: 'escalate', escalate_to: 'planner' };
+    expect(checkReviewVerdict(escalating, ctx(), null, false, 'planner')).toContain(
+      "escalate_to 'planner' must be strictly above active cause level 'planner'",
+    );
   });
 });

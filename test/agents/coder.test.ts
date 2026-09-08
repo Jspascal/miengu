@@ -31,7 +31,8 @@ function emptyRaw(): PackBuildInput['raw'] {
     frozenTestBodies: [],
     diff: null,
     oracleResults: null,
-    reviewerFindings: null,
+    currentTaskReviewerFindings: null,
+    escalationContext: null,
     assumptions: [],
   };
 }
@@ -76,35 +77,37 @@ function pack(overrides: Partial<PackBuildInput['raw']> = {}, ctxOverrides: Part
   return {
     itemId,
     checkContext: checkContext(ctxOverrides),
-    task: null,
+    task: TWO_TASK_GRAPH.tasks[0]!,
+    activeT1OracleFailure: false,
+    activeCauseLevel: null,
     raw: { ...emptyRaw(), ...overrides },
   };
 }
 
-describe('coder.buildCandidates / buildTaskSection dispatch the first topological task', () => {
-  it("buildTaskSection dispatches task-example-1 (first in topoOrder), not task-example-2", () => {
+describe('coder.buildCandidates / buildTaskSection use the state-selected task', () => {
+  it('buildTaskSection dispatches task-example-2 (the selected task), not task-example-1', () => {
     const text = buildTaskSection(pack());
-    expect(text).toContain('task-example-1');
-    expect(text).not.toContain('task-example-2');
+    expect(text).toContain('task-example-2');
+    expect(text).not.toContain('task-example-1');
   });
 
-  it("buildCandidates' pack contains only the first topological task", () => {
+  it("buildCandidates' pack contains only the selected task", () => {
     const sections = buildCandidates(
       pack({ sourceFiles: [{ path: 'src/a.ts', body: 'a' }, { path: 'src/b.ts', body: 'b' }] }),
     );
     const taskSection = sections.find((s) => s.kind === 'task');
-    expect(taskSection?.body).toContain('task-example-1');
-    expect(taskSection?.body).not.toContain('task-example-2');
+    expect(taskSection?.body).toContain('task-example-2');
+    expect(taskSection?.body).toContain('"task_id": "task-example-2"');
 
     const sourceSection = sections.find((s) => s.kind === 'source-files');
-    expect(sourceSection?.body).toContain('src/a.ts');
-    expect(sourceSection?.body).not.toContain('src/b.ts');
+    expect(sourceSection?.body).not.toContain('src/a.ts');
+    expect(sourceSection?.body).toContain('src/b.ts');
   });
 
-  it('never emits prd, wiki-index, requirement-set, task-graph, coder-transcript or reviewer-findings', () => {
+  it('never emits prd, wiki-index, requirement-set, task-graph, coder-transcript or other-task findings', () => {
     const sections = buildCandidates(pack());
     const kinds = sections.map((s) => s.kind);
-    for (const forbidden of ['prd', 'wiki-index', 'requirement-set', 'task-graph', 'coder-transcript', 'reviewer-findings']) {
+    for (const forbidden of ['prd', 'wiki-index', 'requirement-set', 'task-graph', 'coder-transcript', 'other-task-reviewer-findings']) {
       expect(kinds).not.toContain(forbidden);
     }
   });

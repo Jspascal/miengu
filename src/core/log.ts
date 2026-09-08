@@ -19,7 +19,7 @@ import type { IdMinter } from './idgen.js';
 import { WorkItemIdSchema } from './ids.js';
 import type { EventId, RunId, WorkItemId } from './ids.js';
 import type { ProvenanceTier } from './provenance.js';
-import { DEFAULT_TIER, EVENT_SCHEMA_VERSION, MienguEventSchema } from './events.js';
+import { DEFAULT_TIER, EVENT_SCHEMA_VERSION, MienguEventSchema, StoredEventSchema } from './events.js';
 import type { Actor, EventType, MienguEvent } from './events.js';
 
 export const LOG_FILENAME = 'events.jsonl';
@@ -32,6 +32,7 @@ export interface ItemPaths {
   readonly snapshotsDir: string;
   readonly transcriptsDir: string;
   readonly diffsDir: string;
+  readonly oraclesDir: string;
   readonly workspacesDir: string;
 }
 
@@ -44,6 +45,7 @@ export function itemPaths(storeDir: string, itemId: WorkItemId): ItemPaths {
     snapshotsDir: join(itemDir, 'snapshots'),
     transcriptsDir: join(itemDir, 'transcripts'),
     diffsDir: join(itemDir, 'diffs'),
+    oraclesDir: join(itemDir, 'oracles'),
     workspacesDir: join(itemDir, 'workspaces'),
   };
 }
@@ -167,6 +169,32 @@ interface ScanResult {
   readonly lastSeq: number;
   readonly lastEventId: EventId | null;
   readonly truncatedBytes: number;
+  readonly containsV2: boolean;
+}
+
+/**
+ * Writable v2 refusal must happen before either the writer lock or torn-tail recovery.
+ * A legacy log may itself have a torn final line, so this intentionally examines the raw
+ * bytes instead of asking the v3 event parser to validate every line first.
+ */
+async function containsV2Envelope(eventsFile: string): Promise<boolean> {
+  const content = await readFile(eventsFile);
+  // Preflight is non-mutating and only considers complete JSONL envelopes.  This avoids
+  // treating a payload string as a legacy header while a complete v2 prefix protects any
+  // torn tail from writable-open recovery.
+  const complete = content.lastIndexOf(NEWLINE_BYTE);
+  if (complete < 0) return false;
+  for (const line of content.subarray(0, complete).toString('utf8').split('\n')) {
+    if (line.length === 0) continue;
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) &&
+        (parsed as Record<string, unknown>)['schema_version'] === 2) return true;
+    } catch {
+      // The normal scan reports malformed complete lines after writable preflight.
+    }
+  }
+  return false;
 }
 
 async function scanAndRecover(
@@ -194,6 +222,7 @@ async function scanAndRecover(
 
   let lastSeq = 0;
   let lastEventId: EventId | null = null;
+  let containsV2 = false;
   for (let i = 0; i < lines.length; i += 1) {
     const lineNumber = i + 1;
     const line = lines[i];
@@ -208,13 +237,14 @@ async function scanAndRecover(
         `${eventsFile}: line ${String(lineNumber)}: not valid JSON`,
       );
     }
-    const result = MienguEventSchema.safeParse(parsedJson);
+    const result = StoredEventSchema.safeParse(parsedJson);
     if (!result.success) {
       throw new LogCorruptError(
         `${eventsFile}: line ${String(lineNumber)}: failed schema validation: ${result.error.message}`,
       );
     }
     const event = result.data;
+    if (parsedJson !== null && typeof parsedJson === 'object' && (parsedJson as Record<string, unknown>)['schema_version'] === 2) containsV2 = true;
     if (event.item_id !== itemId) {
       throw new LogCorruptError(
         `${eventsFile}: line ${String(lineNumber)}: item_id "${event.item_id}" does not match expected "${itemId}"`,
@@ -235,7 +265,7 @@ async function scanAndRecover(
     lastEventId = event.event_id;
   }
 
-  return { lastSeq, lastEventId, truncatedBytes };
+  return { lastSeq, lastEventId, truncatedBytes, containsV2 };
 }
 
 export interface AppendInput {
@@ -301,6 +331,7 @@ export class EventLog {
     await mkdir(paths.snapshotsDir, { recursive: true });
     await mkdir(paths.transcriptsDir, { recursive: true });
     await mkdir(paths.diffsDir, { recursive: true });
+    await mkdir(paths.oraclesDir, { recursive: true });
     await mkdir(paths.workspacesDir, { recursive: true });
     const createHandle = await fsOpen(paths.eventsFile, 'wx');
     await createHandle.close();
@@ -315,14 +346,20 @@ export class EventLog {
       throw new StoreError(`unknown work item: ${o.itemId}`, { itemDir: paths.itemDir });
     }
 
-    await acquireLock(paths.lockFile, o);
-
     if (!(await pathExists(paths.eventsFile))) {
       throw new LogCorruptError(
         `${paths.eventsFile} is missing for a known item directory`,
         { eventsFile: paths.eventsFile },
       );
     }
+
+    // Never acquire a writer lock or repair a legacy file.  V2 is replay-only; the raw
+    // check deliberately also recognizes a v2 header in a torn final record.
+    if (await containsV2Envelope(paths.eventsFile)) {
+      throw new StoreError('v2 event logs are read-only; writable open is refused', { eventsFile: paths.eventsFile });
+    }
+
+    await acquireLock(paths.lockFile, o);
 
     const scan = await scanAndRecover(paths.eventsFile, o.itemId, o.logger);
     if (scan.truncatedBytes > 0) {
@@ -412,7 +449,7 @@ export class EventLog {
       const lines = raw.length === 0 ? raw.split('\n').slice(0, 0) : raw.split('\n').slice(0, -1);
       for (const line of lines) {
         const parsedJson: unknown = JSON.parse(line);
-        const event = MienguEventSchema.parse(parsedJson);
+        const event = StoredEventSchema.parse(parsedJson);
         if (event.seq >= fromSeq) {
           yield event;
         }

@@ -13,6 +13,8 @@ bodies).
 It deliberately omits — load-bearing: `coder-transcript` (the Coder's transcript,
 reasoning, or justification) · `frozen-test-bodies` · `task-graph` · `prd` ·
 `source-files`. A reviewer that shares the author's context agrees with the author.
+You may receive current-task findings and the current task oracle sweep, but never another task's
+findings or the Coder's reasoning.
 
 {{PACK}}
 
@@ -36,6 +38,7 @@ Your output must be a single JSON object conforming exactly to the following con
 5. Set `escalate_to` only when the fault is above the Coder: the task is wrong
    (`planner`), the design is wrong (`architect`), the requirement is ambiguous
    (`analyst`).
+6. You must not accept while a T1 oracle is failing. Revise or escalate based on the evidence.
 
 ## 5. PROHIBITIONS
 

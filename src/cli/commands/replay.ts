@@ -1,6 +1,6 @@
 import { readFile, stat } from 'node:fs/promises';
 import { canonicalJson } from '../../core/canonical.js';
-import { MienguEventSchema } from '../../core/events.js';
+import { StoredEventSchema } from '../../core/events.js';
 import type { MienguEvent } from '../../core/events.js';
 import { itemPaths } from '../../core/log.js';
 import type { EventId, WorkItemId } from '../../core/ids.js';
@@ -60,7 +60,7 @@ async function readEventsReadOnly(eventsFile: string, itemId: WorkItemId): Promi
     } catch {
       throw new LogCorruptError(`${eventsFile}: line ${String(lineNumber)}: not valid JSON`);
     }
-    const result = MienguEventSchema.safeParse(parsedJson);
+    const result = StoredEventSchema.safeParse(parsedJson);
     if (!result.success) {
       throw new LogCorruptError(
         `${eventsFile}: line ${String(lineNumber)}: failed schema validation: ${result.error.message}`,
@@ -93,6 +93,7 @@ async function readEventsReadOnly(eventsFile: string, itemId: WorkItemId): Promi
 async function scanEventIds(eventsFile: string): Promise<{
   lastSeq: number;
   seqToEventId: Map<number, EventId>;
+  containsV2: boolean;
 }> {
   let raw: Buffer;
   try {
@@ -112,9 +113,11 @@ async function scanEventIds(eventsFile: string): Promise<{
 
   const seqToEventId = new Map<number, EventId>();
   let lastSeq = 0;
+  let containsV2 = false;
   for (const line of lines) {
     try {
       const parsed: unknown = JSON.parse(line);
+      if (parsed !== null && typeof parsed === 'object' && (parsed as Record<string, unknown>)['schema_version'] === 2) containsV2 = true;
       if (
         parsed !== null &&
         typeof parsed === 'object' &&
@@ -136,7 +139,7 @@ async function scanEventIds(eventsFile: string): Promise<{
       // store treats an unresolvable seq as invalid and falls back, never crashing here.
     }
   }
-  return { lastSeq, seqToEventId };
+  return { lastSeq, seqToEventId, containsV2 };
 }
 
 export interface AcceleratedProjection {
@@ -166,7 +169,7 @@ export async function projectAccelerated(
     throw new StoreError(`unknown work item: ${itemId}`, { itemDir: paths.itemDir });
   }
 
-  const { lastSeq, seqToEventId } = await scanEventIds(paths.eventsFile);
+  const { lastSeq, seqToEventId, containsV2 } = await scanEventIds(paths.eventsFile);
 
   const snapshots = createSnapshotStore<WorkItemState>({
     dir: paths.snapshotsDir,
@@ -176,7 +179,7 @@ export async function projectAccelerated(
     parseState: (v) => WorkItemStateSchema.parse(v),
   });
 
-  const snapshot = await snapshots.latestValid({
+  const snapshot = containsV2 ? null : await snapshots.latestValid({
     lastSeq,
     eventIdAt: (seq) => Promise.resolve(seqToEventId.get(seq) ?? null),
   });

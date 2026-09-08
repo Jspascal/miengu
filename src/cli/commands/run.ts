@@ -133,11 +133,13 @@ export async function runCommand(options: RunCommandOptions): Promise<number> {
     const schemasDir = join(paths.itemDir, 'schemas');
     const messagesDir = join(paths.itemDir, 'messages');
     const frozenTestsDir = join(paths.itemDir, 'frozen-tests');
+    const oraclesDir = paths.oraclesDir;
     await Promise.all([
       mkdir(promptsDir, { recursive: true }),
       mkdir(schemasDir, { recursive: true }),
       mkdir(messagesDir, { recursive: true }),
       mkdir(frozenTestsDir, { recursive: true }),
+      mkdir(oraclesDir, { recursive: true }),
     ]);
 
     const executors = buildExecutorRegistry({
@@ -171,6 +173,7 @@ export async function runCommand(options: RunCommandOptions): Promise<number> {
       schemasDir,
       messagesDir,
       frozenTestsDir,
+      oraclesDir,
       clock,
       ids,
       logger,

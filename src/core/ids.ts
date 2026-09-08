@@ -70,6 +70,10 @@ export type TestId = z.infer<typeof TestIdSchema>;
 export type SuiteId = z.infer<typeof SuiteIdSchema>;
 export type WorkItemId = z.infer<typeof WorkItemIdSchema>;
 export type EventId = z.infer<typeof EventIdSchema>;
+/** Event ids identify durable causal campaigns and oracle/workspace operations. */
+export type CauseId = EventId;
+export type OracleSweepId = EventId;
+export type WorkspaceCheckpointId = EventId;
 export type RunId = z.infer<typeof RunIdSchema>;
 export type CheckpointId = z.infer<typeof CheckpointIdSchema>;
 export type AccountId = z.infer<typeof AccountIdSchema>;

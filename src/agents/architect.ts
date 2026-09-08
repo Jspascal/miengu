@@ -4,6 +4,7 @@ import type { ArchitecturePlan } from '../contracts/index.js';
 import type { ContextPackSection } from '../wiki/contextpack.js';
 import { checkArchitecturePlan } from './checks.js';
 import type { CheckContext } from './checks.js';
+import { renderEscalationContext } from './agent.js';
 import type { PackBuildInput, PostStepInput, PostStepResult, RoleModule } from './agent.js';
 import type { AppendInput } from '../core/log.js';
 
@@ -59,6 +60,9 @@ export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[
   }
   if (i.raw.assumptions.length > 0) {
     sections.push(section('assumptions', 'Recorded assumptions', JSON.stringify(i.raw.assumptions, null, 2)));
+  }
+  if (i.raw.escalationContext !== null) {
+    sections.push(section('escalation-context', 'Escalation context', renderEscalationContext('architect', i.raw.escalationContext)));
   }
   return sections;
 }

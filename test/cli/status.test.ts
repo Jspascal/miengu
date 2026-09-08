@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execFile } from 'node:child_process';
 import { appendFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -7,7 +7,10 @@ import { promisify } from 'node:util';
 import { runCommand } from '../../src/cli/commands/run.js';
 import { statusCommand } from '../../src/cli/commands/status.js';
 import { EXIT } from '../../src/cli/exit.js';
-import { listItemIds, itemPaths } from '../../src/core/log.js';
+import { EventLog, listItemIds, itemPaths } from '../../src/core/log.js';
+import { fixedClock } from '../../src/core/clock.js';
+import { createIdMinter, fixedRng } from '../../src/core/idgen.js';
+import { silentLogger } from '../../src/logging.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -128,5 +131,53 @@ describe('statusCommand', () => {
 
     const result = await statusCommand({ configPath, json: true });
     expect(result).toBe(EXIT.STORE);
+  });
+
+  it('renders active causal attempt counters in text status', async () => {
+    const prdFile = join(workDir, 'prd.md');
+    await writeFile(prdFile, 'Build a thing.\n', 'utf8');
+    await runCommand({ prdFile, configPath });
+    const storeDir = join(workDir, '.miengu');
+    const [itemId] = await listItemIds(storeDir);
+    expect(itemId).toBeDefined();
+    if (itemId === undefined) return;
+    const ids = createIdMinter(fixedRng('status-causal-attempts'));
+    const { log } = await EventLog.open({
+      storeDir,
+      itemId,
+      runId: ids.runId(),
+      clock: fixedClock('2024-01-01T00:00:00.000Z'),
+      ids,
+      logger: silentLogger,
+    });
+    try {
+      const cause = await log.append({
+        type: 'FailureCauseOpened',
+        data: {
+          trigger_event_id: log.lastEventId!, parent_cause_id: null, kind: 'agent-output', task_id: null,
+          initial_level: 'reviewer', affects: { req_ids: [], component_ids: [], task_ids: [] }, summary: 'status fixture',
+        },
+        actor: { kind: 'supervisor', id: null }, causationId: log.lastEventId,
+      });
+      await log.append({
+        type: 'FailureAttempted',
+        data: { cause_id: cause.event_id, task_id: null, level: 'reviewer', bucket: 'reviewer', attempt: 1, limit: 2, handler_stage: 'review' },
+        actor: { kind: 'supervisor', id: null }, causationId: log.lastEventId,
+      });
+    } finally {
+      await log.close();
+    }
+    let output = '';
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      output += String(chunk);
+      return true;
+    });
+    try {
+      expect(await statusCommand({ configPath })).toBe(EXIT.OK);
+    } finally {
+      write.mockRestore();
+    }
+    expect(output).toContain('CAUSE ATTEMPTS');
+    expect(output).toContain('reviewer=1');
   });
 });

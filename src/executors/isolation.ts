@@ -1,6 +1,8 @@
 import { execFile } from 'node:child_process';
-import { access, readFile, rm } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { dirname } from 'node:path';
+import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 import { assertNever } from '../core/events.js';
 import type { TargetMode } from '../core/events.js';
@@ -11,6 +13,8 @@ import { NotImplementedError, WorkspaceError } from '../errors.js';
 const execFileAsync = promisify(execFile);
 
 export const MIENGU_WORKSPACE_PREFIX = 'miengu';
+const SUPERVISOR_CHECKPOINT_MESSAGE = 'miengu supervisor checkpoint';
+const SUPERVISOR_CHECKPOINT_DATE = '1970-01-01T00:00:00Z';
 
 export interface PreparedWorkspace {
   mode: TargetMode;
@@ -33,6 +37,13 @@ export interface CaptureResult {
    * this alongside `diffSha256`.
    */
   untrackedSha256: string;
+  /** Exact pre-invocation bytes used to restore untracked and ignored files. */
+  untrackedFiles: readonly {
+    readonly path: string;
+    readonly contentsBase64: string;
+  }[];
+  /** Binary-safe patch from `headCommit` to the captured tracked working tree. */
+  trackedPatchBase64: string;
   filesTouched: readonly string[];
   untracked: readonly string[];
   insertions: number;
@@ -41,21 +52,26 @@ export interface CaptureResult {
   headCommit: string;
 }
 
+export interface BinaryPatchCapture {
+  readonly patch: Buffer;
+  readonly sha256: string;
+  readonly filesTouched: readonly string[];
+  readonly insertions: number;
+  readonly deletions: number;
+}
+
+export interface SupervisorCheckpoint {
+  readonly parentCommit: string;
+  readonly commit: string;
+  readonly patch: BinaryPatchCapture;
+}
+
 export interface WorkspaceProvider {
   readonly mode: TargetMode;
-  /**
-   * Reverts tracked modifications and deletes any untracked file NOT named in
-   * `keepUntracked`, restoring the workspace toward a known-good capture.
-   *
-   * Used when a `read-only` stage is caught modifying the workspace. Without it the illegal
-   * write stays on disk and becomes the baseline every later comparison is made against, so
-   * the control is bypassable in one retry. `restoredFully` is `false` when a pre-existing
-   * untracked file's BYTES changed — git cannot restore content it never tracked, and the
-   * caller must say so rather than imply a clean revert.
-   */
+  /** Restores the index, tracked tree, and all untracked/ignored bytes to a capture. */
   restore(
     ws: PreparedWorkspace,
-    o: { keepUntracked: readonly string[]; expectUntrackedSha256: string },
+    baseline: CaptureResult,
   ): Promise<{ restoredFully: boolean }>;
   prepare(i: {
     itemId: WorkItemId;
@@ -64,7 +80,20 @@ export interface WorkspaceProvider {
     workspacesDir: string;
     name: string;
   }): Promise<PreparedWorkspace>;
-  capture(ws: PreparedWorkspace): Promise<CaptureResult>;
+  /** `beforeHeadCommit` is the HEAD captured immediately before one executor invocation. */
+  capture(ws: PreparedWorkspace, o?: { beforeHeadCommit?: string }): Promise<CaptureResult>;
+  /** Restores the detached worktree exactly to `commit`, including untracked cleanup. */
+  restoreDetached(ws: PreparedWorkspace, commit: string): Promise<void>;
+  /** Captures a replayable binary patch between two commits without moving any ref. */
+  captureBinaryPatch(
+    ws: PreparedWorkspace,
+    fromCommit: string,
+    toCommit?: string,
+  ): Promise<BinaryPatchCapture>;
+  /** Applies a binary patch to the detached worktree index and working tree. */
+  applyBinaryPatch(ws: PreparedWorkspace, patchPath: string): Promise<void>;
+  /** Commits the current detached tree under the fixed supervisor identity. */
+  checkpoint(ws: PreparedWorkspace): Promise<SupervisorCheckpoint>;
   discard(ws: PreparedWorkspace, o: { retain: boolean }): Promise<void>;
 }
 
@@ -75,7 +104,13 @@ function isExecFileError(err: unknown): err is { stderr?: string } {
 /** Runs `git -C <cwd> <args>` via `execFile` with array args. Never `shell: true`. */
 async function git(cwd: string, args: readonly string[]): Promise<string> {
   try {
-    const { stdout } = await execFileAsync('git', ['-C', cwd, ...args]);
+    const { stdout } = await execFileAsync('git', ['-C', cwd, ...args], {
+      env: {
+        ...process.env,
+        GIT_AUTHOR_DATE: SUPERVISOR_CHECKPOINT_DATE,
+        GIT_COMMITTER_DATE: SUPERVISOR_CHECKPOINT_DATE,
+      },
+    });
     return stdout;
   } catch (err) {
     const stderr = isExecFileError(err) ? (err.stderr ?? '') : '';
@@ -84,6 +119,17 @@ async function git(cwd: string, args: readonly string[]): Promise<string> {
       args,
       stderr,
     });
+  }
+}
+
+/** Like `git`, but preserves the bytes of `git diff --binary` output. */
+async function gitBuffer(cwd: string, args: readonly string[]): Promise<Buffer> {
+  try {
+    const { stdout } = await execFileAsync('git', ['-C', cwd, ...args], { encoding: 'buffer' });
+    return Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
+  } catch (err) {
+    const stderr = isExecFileError(err) ? (err.stderr ?? '') : '';
+    throw new WorkspaceError(`git ${args.join(' ')} failed in ${cwd}`, { cwd, args, stderr });
   }
 }
 
@@ -163,63 +209,152 @@ function createWorktreeProvider(): WorkspaceProvider {
       };
     },
 
-    async capture(ws) {
+    async capture(ws, o = {}) {
       const headCommit = (await git(ws.workdir, ['rev-parse', 'HEAD'])).trim();
-      const diff = await git(ws.workdir, ['diff', '--no-color', 'HEAD']);
+      const trackedPatch = await gitBuffer(ws.workdir, [
+        'diff', '--binary', '--full-index', '--no-color', 'HEAD',
+      ]);
+      const diff = trackedPatch.toString('utf8');
       const numstat = await git(ws.workdir, ['diff', '--numstat', 'HEAD']);
       const untrackedOutput = await git(ws.workdir, [
         'ls-files',
         '--others',
         '--exclude-standard',
       ]);
+      // `--exclude-standard` deliberately omits ignored paths.  Ignored output is still a
+      // workspace mutation (and can be executable code or a frozen test), so capture it in
+      // the same baseline as ordinary untracked output.
+      const ignoredOutput = await git(ws.workdir, [
+        'ls-files',
+        '--others',
+        '--ignored',
+        '--exclude-standard',
+      ]);
       const { filesTouched, insertions, deletions } = parseNumstat(numstat);
-      const untracked = untrackedOutput.split('\n').filter((line) => line.length > 0);
+      const untracked = [...new Set([
+        ...untrackedOutput.split('\n'),
+        ...ignoredOutput.split('\n'),
+      ].filter((line) => line.length > 0))].sort();
 
       // Sorted so the hash is order-independent; `\u0000` separates path from bytes so a
       // path/content boundary cannot be forged by a crafted filename.
-      const untrackedParts: string[] = [];
+      const untrackedFiles: { path: string; contentsBase64: string }[] = [];
       for (const relativePath of [...untracked].sort()) {
-        let bytes: string;
+        let bytes: Buffer;
         try {
-          bytes = await readFile(join(ws.workdir, relativePath), 'utf8');
+          bytes = await readFile(join(ws.workdir, relativePath));
         } catch {
-          bytes = '';
+          bytes = Buffer.alloc(0);
         }
-        untrackedParts.push(`${relativePath}\u0000${bytes}`);
+        untrackedFiles.push({ path: relativePath, contentsBase64: bytes.toString('base64') });
       }
 
       return {
         diff,
-        diffSha256: sha256Hex(diff),
-        untrackedSha256: sha256Hex(untrackedParts.join('\u0000\u0000')),
+        diffSha256: sha256Hex(trackedPatch),
+        untrackedSha256: sha256Hex(
+          untrackedFiles.map((file) => `${file.path}\u0000${file.contentsBase64}`).join('\u0000\u0000'),
+        ),
+        untrackedFiles,
+        trackedPatchBase64: trackedPatch.toString('base64'),
         filesTouched,
         untracked,
         insertions,
         deletions,
-        committedDuringRun: headCommit !== ws.baseCommit,
+        // A detached supervisor checkpoint is legitimate. Only a HEAD move made by the
+        // executor invocation itself is a violation, so compare against that invocation's
+        // pre-run HEAD when it is available.
+        committedDuringRun: headCommit !== (o.beforeHeadCommit ?? ws.baseCommit),
         headCommit,
       };
     },
 
-    async restore(ws, o) {
-      await git(ws.workdir, ['checkout', '--', '.']);
+    async restore(ws, baseline) {
+      // The executor may have changed both the working tree and the index. Reset both to the
+      // invocation-start HEAD, remove every untracked/ignored path, then reconstruct the exact
+      // pre-invocation tracked patch and untracked bytes.
+      await git(ws.workdir, ['reset', '--hard', baseline.headCommit]);
+      await git(ws.workdir, ['clean', '-ffdx']);
 
-      const keep = new Set(o.keepUntracked);
-      const untrackedOutput = await git(ws.workdir, [
-        'ls-files',
-        '--others',
-        '--exclude-standard',
-      ]);
-      for (const relativePath of untrackedOutput.split('\n').filter((l) => l.length > 0)) {
-        if (!keep.has(relativePath)) {
-          await rm(join(ws.workdir, relativePath), { force: true });
+      const trackedPatch = Buffer.from(baseline.trackedPatchBase64, 'base64');
+      if (trackedPatch.length > 0) {
+        const tempDir = await mkdtemp(join(tmpdir(), 'miengu-sandbox-restore-'));
+        const patchPath = join(tempDir, 'baseline.patch');
+        try {
+          await writeFile(patchPath, trackedPatch);
+          await git(ws.workdir, ['apply', '--binary', patchPath]);
+        } finally {
+          await rm(tempDir, { recursive: true, force: true });
         }
       }
 
-      // A kept untracked file whose bytes were rewritten cannot be restored from git — it was
-      // never tracked. Report it instead of pretending the revert was complete.
+      for (const file of baseline.untrackedFiles) {
+        const destination = join(ws.workdir, file.path);
+        await mkdir(dirname(destination), { recursive: true });
+        await writeFile(destination, Buffer.from(file.contentsBase64, 'base64'));
+      }
+
       const after = await this.capture(ws);
-      return { restoredFully: after.untrackedSha256 === o.expectUntrackedSha256 };
+      return {
+        restoredFully:
+          after.headCommit === baseline.headCommit &&
+          after.diffSha256 === baseline.diffSha256 &&
+          after.untrackedSha256 === baseline.untrackedSha256,
+      };
+    },
+
+    async restoreDetached(ws, commit) {
+      // This worktree was created with `--detach`; checkout and reset operate only on its
+      // detached HEAD and cannot advance the operator's target branch.
+      await git(ws.workdir, ['checkout', '--detach', commit]);
+      await git(ws.workdir, ['reset', '--hard', commit]);
+      await git(ws.workdir, ['clean', '-ffdx']);
+    },
+
+    async captureBinaryPatch(ws, fromCommit, toCommit = 'HEAD') {
+      const patch = await gitBuffer(ws.workdir, [
+        'diff', '--binary', '--full-index', '--no-color', fromCommit, toCommit,
+      ]);
+      const numstat = await git(ws.workdir, ['diff', '--numstat', fromCommit, toCommit]);
+      const parsed = parseNumstat(numstat);
+      return {
+        patch,
+        sha256: sha256Hex(patch),
+        filesTouched: parsed.filesTouched,
+        insertions: parsed.insertions,
+        deletions: parsed.deletions,
+      };
+    },
+
+    async applyBinaryPatch(ws, patchPath) {
+      await git(ws.workdir, ['apply', '--binary', '--index', '--whitespace=nowarn', patchPath]);
+    },
+
+    async checkpoint(ws) {
+      const parentCommit = (await git(ws.workdir, ['rev-parse', 'HEAD'])).trim();
+      // `add --all` deliberately includes newly-created tests and files before capturing
+      // the patch. The commit remains reachable only from this detached worktree.
+      await git(ws.workdir, ['add', '--all']);
+      const patchBytes = await gitBuffer(ws.workdir, ['diff', '--cached', '--binary', '--full-index', '--no-color']);
+      const numstat = await git(ws.workdir, ['diff', '--cached', '--numstat']);
+      const parsed = parseNumstat(numstat);
+      await git(ws.workdir, [
+        '-c', 'user.name=miengu-supervisor',
+        '-c', 'user.email=miengu-supervisor@local',
+        'commit', '--no-gpg-sign', '--allow-empty', '-m', SUPERVISOR_CHECKPOINT_MESSAGE,
+      ]);
+      const commit = (await git(ws.workdir, ['rev-parse', 'HEAD'])).trim();
+      return {
+        parentCommit,
+        commit,
+        patch: {
+          patch: patchBytes,
+          sha256: sha256Hex(patchBytes),
+          filesTouched: parsed.filesTouched,
+          insertions: parsed.insertions,
+          deletions: parsed.deletions,
+        },
+      };
     },
 
     async discard(ws, o) {

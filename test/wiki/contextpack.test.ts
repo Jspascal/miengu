@@ -95,6 +95,19 @@ describe('(c) the two load-bearing rows, asserted by name', () => {
   it('reviewer.omits contains coder-transcript', () => {
     expect(ROLE_PACK_POLICY.reviewer.omits).toContain('coder-transcript');
   });
+
+  it('allows current-task findings only for Coder and Reviewer, and escalation context only upstream', () => {
+    for (const role of ['coder', 'reviewer'] as const) {
+      expect(ROLE_PACK_POLICY[role].includes).toContain('current-task-reviewer-findings');
+    }
+    for (const role of ['analyst', 'architect', 'planner'] as const) {
+      expect(ROLE_PACK_POLICY[role].includes).toContain('escalation-context');
+      expect(ROLE_PACK_POLICY[role].omits).toContain('current-task-reviewer-findings');
+    }
+    for (const role of ROLES) {
+      expect(ROLE_PACK_POLICY[role].omits).toContain('other-task-reviewer-findings');
+    }
+  });
 });
 
 describe('(d) budget bounds', () => {

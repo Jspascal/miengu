@@ -9,6 +9,8 @@ import {
   CheckpointIdSchema,
   AssumptionIdSchema,
   TaskIdSchema,
+  ReqIdSchema,
+  ComponentIdSchema,
   SuiteIdSchema,
   ClaimIdSchema,
   AccountIdSchema,
@@ -19,7 +21,7 @@ import {
 // has zero commits and no production runs; EventLog.open already hard-refuses any line whose
 // schema_version !== EVENT_SCHEMA_VERSION with LogCorruptError, and that refusal is the
 // migration story.
-export const EVENT_SCHEMA_VERSION = 2;
+export const EVENT_SCHEMA_VERSION = 3;
 
 export const ACTOR_KINDS = ['supervisor', 'executor', 'human', 'oracle', 'system'] as const;
 export type ActorKind = (typeof ACTOR_KINDS)[number];
@@ -105,6 +107,21 @@ export const EVENT_TYPES = [
   'TestsTampered',
   'ItemArtifactRecorded',
   'DriftDetected',
+  // H — task execution, causal escalation, and integration
+  'TaskGraphActivated',
+  'TaskStarted',
+  'TaskAccepted',
+  'FailureCauseOpened',
+  'FailureAttempted',
+  'EscalationAdvanced',
+  'FailureCauseResolved',
+  'ArtifactsInvalidated',
+  'OracleSweepStarted',
+  'OracleResultRecorded',
+  'OracleSweepCompleted',
+  'WorkspaceCheckpointed',
+  'WorkspaceRestored',
+  'FinalPatchCaptured',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 
@@ -183,11 +200,29 @@ export const CHECKPOINT_KINDS = [
   'agent-originated',
   'blast-radius',
   'assumption-gate',
+  'escalation',
 ] as const;
 export type CheckpointKind = (typeof CHECKPOINT_KINDS)[number];
 
 export const KILL_MODES = ['none', 'sigterm', 'sigkill'] as const;
 export type KillMode = (typeof KILL_MODES)[number];
+
+export const ESCALATION_LEVELS = ['coder', 'reviewer', 'planner', 'architect', 'analyst', 'human'] as const;
+export type EscalationLevel = (typeof ESCALATION_LEVELS)[number];
+export const FAILURE_KINDS = ['oracle', 'test', 'review-revision', 'task-design', 'architecture', 'requirements', 'agent-output', 'sandbox', 'integration'] as const;
+export type FailureKind = (typeof FAILURE_KINDS)[number];
+export const FAILURE_ATTEMPT_BUCKETS = ['oracle', 'test', 'review', 'reviewer', 'planner', 'architect', 'analyst'] as const;
+export type FailureAttemptBucket = (typeof FAILURE_ATTEMPT_BUCKETS)[number];
+export const ORACLE_KINDS = ['build', 'typecheck', 'lint', 'test'] as const;
+export type OracleKind = (typeof ORACLE_KINDS)[number];
+export const ORACLE_SCOPES = ['task', 'integration'] as const;
+export type OracleScope = (typeof ORACLE_SCOPES)[number];
+export const ORACLE_RESULT_STATUSES = ['passed', 'failed', 'timed-out', 'aborted', 'spawn-error'] as const;
+export type OracleResultStatus = (typeof ORACLE_RESULT_STATUSES)[number];
+export const INVALIDATION_TARGETS = ['coder', 'planner', 'architect', 'analyst'] as const;
+export type InvalidationTarget = (typeof INVALIDATION_TARGETS)[number];
+export const WORKSPACE_CHECKPOINT_KINDS = ['tests-frozen', 'task-accepted'] as const;
+export type WorkspaceCheckpointKind = (typeof WORKSPACE_CHECKPOINT_KINDS)[number];
 
 const FAILURE_KIND_SCHEMA = z
   .union([
@@ -550,6 +585,133 @@ export const DriftDetectedData = z
   })
   .strict();
 
+export const AffectedScopeSchema = z.object({
+  req_ids: z.array(ReqIdSchema),
+  component_ids: z.array(ComponentIdSchema),
+  task_ids: z.array(TaskIdSchema),
+}).strict();
+export type AffectedScope = z.infer<typeof AffectedScopeSchema>;
+
+export const EvidenceRefSchema = z.object({
+  sha256: z.string(),
+  path: z.string(),
+  bytes: z.number().int().nonnegative(),
+}).strict();
+export type EvidenceRef = z.infer<typeof EvidenceRefSchema>;
+
+const OracleCommandSchema = z.object({
+  kind: z.enum(ORACLE_KINDS), command: z.string().nullable(), sha256: z.string().nullable(),
+}).strict();
+
+export const TaskGraphActivatedData = z.object({
+  graph_event_id: EventIdSchema,
+  ordered_task_ids: z.array(TaskIdSchema),
+}).strict();
+export const TaskStartedData = z.object({
+  task_id: TaskIdSchema,
+  order_index: z.number().int().nonnegative(),
+  graph_event_id: EventIdSchema,
+}).strict();
+export const TaskAcceptedData = z.object({
+  task_id: TaskIdSchema,
+  implementation_event_id: EventIdSchema,
+  review_event_id: EventIdSchema,
+  oracle_sweep_id: EventIdSchema,
+  checkpoint_event_id: EventIdSchema,
+}).strict();
+export const FailureCauseOpenedData = z.object({
+  trigger_event_id: EventIdSchema,
+  parent_cause_id: EventIdSchema.nullable(),
+  kind: z.enum(FAILURE_KINDS),
+  task_id: TaskIdSchema.nullable(),
+  initial_level: z.enum(ESCALATION_LEVELS),
+  affects: AffectedScopeSchema,
+  summary: z.string(),
+}).strict();
+export const FailureAttemptedData = z.object({
+  cause_id: EventIdSchema,
+  task_id: TaskIdSchema.nullable(),
+  level: z.enum(ESCALATION_LEVELS),
+  bucket: z.enum(FAILURE_ATTEMPT_BUCKETS),
+  attempt: z.number().int().min(1),
+  limit: z.number().int().min(1),
+  handler_stage: z.enum(STAGES),
+}).strict();
+export const EscalationAdvancedData = z.object({
+  cause_id: EventIdSchema,
+  task_id: TaskIdSchema.nullable(),
+  from_level: z.enum(ESCALATION_LEVELS),
+  to_level: z.enum(ESCALATION_LEVELS),
+  exhausted_bucket: z.enum(FAILURE_ATTEMPT_BUCKETS),
+  attempts_used: z.number().int().nonnegative(),
+  reason: z.string(),
+}).strict();
+export const FailureCauseResolvedData = z.object({
+  cause_id: EventIdSchema,
+  resolution: z.string(),
+  task_id: TaskIdSchema.nullable(),
+}).strict();
+export const ArtifactsInvalidatedData = z.object({
+  cause_id: EventIdSchema,
+  target: z.enum(INVALIDATION_TARGETS),
+  affected_ids: AffectedScopeSchema,
+  artifact_event_ids: z.array(EventIdSchema),
+  reason: z.string(),
+}).strict();
+export const OracleSweepStartedData = z.object({
+  scope: z.enum(ORACLE_SCOPES),
+  task_id: TaskIdSchema.nullable(),
+  cause_id: EventIdSchema.nullable(),
+  commands: z.array(OracleCommandSchema),
+}).strict();
+export const OracleResultRecordedData = z.object({
+  sweep_id: EventIdSchema,
+  scope: z.enum(ORACLE_SCOPES),
+  task_id: TaskIdSchema.nullable(),
+  kind: z.enum(ORACLE_KINDS),
+  command: z.string().nullable(),
+  command_sha256: z.string().nullable(),
+  status: z.enum(ORACLE_RESULT_STATUSES),
+  exit_code: z.number().int().nullable(),
+  signal: z.string().nullable(),
+  duration_ms: z.number().int().nonnegative(),
+  // Every executed command, including spawn errors and aborts, persists both streams. Empty
+  // output is represented by a zero-byte EvidenceRef, never by a missing reference.
+  stdout: EvidenceRefSchema,
+  stderr: EvidenceRefSchema,
+}).strict();
+export const OracleSweepCompletedData = z.object({
+  sweep_id: EventIdSchema,
+  scope: z.enum(ORACLE_SCOPES),
+  task_id: TaskIdSchema.nullable(),
+  outcome: z.enum(['passed', 'failed', 'aborted']),
+  failed_kind: z.enum(ORACLE_KINDS).nullable(),
+  result_event_ids: z.array(EventIdSchema),
+}).strict();
+export const WorkspaceCheckpointedData = z.object({
+  kind: z.enum(WORKSPACE_CHECKPOINT_KINDS),
+  task_id: TaskIdSchema.nullable(),
+  parent_commit: z.string(),
+  commit: z.string(),
+  patch: EvidenceRefSchema.nullable(),
+}).strict();
+export const WorkspaceRestoredData = z.object({
+  cause_id: EventIdSchema,
+  target: z.enum(INVALIDATION_TARGETS),
+  base_checkpoint_event_id: EventIdSchema,
+  base_commit: z.string(),
+  retained_task_commits: z.array(z.object({ task_id: TaskIdSchema, commit: z.string() }).strict()),
+  invalidated_task_ids: z.array(TaskIdSchema),
+}).strict();
+export const FinalPatchCapturedData = z.object({
+  original_base_commit: z.string(),
+  accepted_head_commit: z.string(),
+  patch: EvidenceRefSchema,
+  files: z.array(z.string()),
+  insertions: z.number().int().nonnegative(),
+  deletions: z.number().int().nonnegative(),
+}).strict();
+
 const MEMBERS = {
   WorkItemCreated: EnvelopeSchema.extend({
     type: z.literal('WorkItemCreated'),
@@ -663,6 +825,20 @@ const MEMBERS = {
     type: z.literal('DriftDetected'),
     data: DriftDetectedData,
   }),
+  TaskGraphActivated: EnvelopeSchema.extend({ type: z.literal('TaskGraphActivated'), data: TaskGraphActivatedData }),
+  TaskStarted: EnvelopeSchema.extend({ type: z.literal('TaskStarted'), data: TaskStartedData }),
+  TaskAccepted: EnvelopeSchema.extend({ type: z.literal('TaskAccepted'), data: TaskAcceptedData }),
+  FailureCauseOpened: EnvelopeSchema.extend({ type: z.literal('FailureCauseOpened'), data: FailureCauseOpenedData }),
+  FailureAttempted: EnvelopeSchema.extend({ type: z.literal('FailureAttempted'), data: FailureAttemptedData }),
+  EscalationAdvanced: EnvelopeSchema.extend({ type: z.literal('EscalationAdvanced'), data: EscalationAdvancedData }),
+  FailureCauseResolved: EnvelopeSchema.extend({ type: z.literal('FailureCauseResolved'), data: FailureCauseResolvedData }),
+  ArtifactsInvalidated: EnvelopeSchema.extend({ type: z.literal('ArtifactsInvalidated'), data: ArtifactsInvalidatedData }),
+  OracleSweepStarted: EnvelopeSchema.extend({ type: z.literal('OracleSweepStarted'), data: OracleSweepStartedData }),
+  OracleResultRecorded: EnvelopeSchema.extend({ type: z.literal('OracleResultRecorded'), data: OracleResultRecordedData }),
+  OracleSweepCompleted: EnvelopeSchema.extend({ type: z.literal('OracleSweepCompleted'), data: OracleSweepCompletedData }),
+  WorkspaceCheckpointed: EnvelopeSchema.extend({ type: z.literal('WorkspaceCheckpointed'), data: WorkspaceCheckpointedData }),
+  WorkspaceRestored: EnvelopeSchema.extend({ type: z.literal('WorkspaceRestored'), data: WorkspaceRestoredData }),
+  FinalPatchCaptured: EnvelopeSchema.extend({ type: z.literal('FinalPatchCaptured'), data: FinalPatchCapturedData }),
 } satisfies Record<EventType, z.ZodObject<{ type: z.ZodLiteral<EventType> } & z.ZodRawShape>>;
 
 export const MienguEventSchema = z.discriminatedUnion(
@@ -671,6 +847,37 @@ export const MienguEventSchema = z.discriminatedUnion(
 );
 export type MienguEvent = z.infer<typeof MienguEventSchema>;
 export type EventOf<T extends EventType> = Extract<MienguEvent, { type: T }>;
+
+// V2 remains an input-only storage format. Its members deliberately reuse the Phase 2 data
+// schemas above; only the envelope version differs. Parsed legacy events are upcast in memory
+// to the sole current domain union and are never written back to disk.
+const V2EnvelopeSchema = EnvelopeSchema.extend({ schema_version: z.literal(2) });
+const V2_DATA = {
+  WorkItemCreated: WorkItemCreatedData, WorkItemParked: WorkItemParkedData,
+  WorkItemResumed: WorkItemResumedData, WorkItemCompleted: WorkItemCompletedData,
+  WorkItemFailed: WorkItemFailedData, RunStarted: RunStartedData, RunFinished: RunFinishedData,
+  StageEntered: StageEnteredData, StageCompleted: StageCompletedData, StageFailed: StageFailedData,
+  ArtifactValidationFailed: ArtifactValidationFailedData, WorkspacePrepared: WorkspacePreparedData,
+  WorkspaceDiscarded: WorkspaceDiscardedData, WorktreeLockAcquired: WorktreeLockAcquiredData,
+  WorktreeLockReleased: WorktreeLockReleasedData, ExecutorInvoked: ExecutorInvokedData,
+  ExecutorReturned: ExecutorReturnedData, DiffCaptured: DiffCapturedData, BudgetConsumed: BudgetConsumedData,
+  BudgetExhausted: BudgetExhaustedData, CheckpointRaised: CheckpointRaisedData,
+  CheckpointDecided: CheckpointDecidedData, AutoApproved: AutoApprovedData,
+  AssumptionRecorded: AssumptionRecordedData, TestsFrozen: TestsFrozenData, TestsTampered: TestsTamperedData,
+  ItemArtifactRecorded: ItemArtifactRecordedData, DriftDetected: DriftDetectedData,
+} as const;
+const V2_EVENT_TYPES = Object.keys(V2_DATA) as readonly (keyof typeof V2_DATA)[];
+const V2_MEMBERS = Object.fromEntries(V2_EVENT_TYPES.map((type) => [
+  type,
+  V2EnvelopeSchema.extend({ type: z.literal(type), data: V2_DATA[type] }),
+])) as unknown as { [T in keyof typeof V2_DATA]: z.ZodObject<z.ZodRawShape> };
+const V2StoredEventSchema = z.discriminatedUnion(
+  'type', Object.values(V2_MEMBERS) as [z.ZodDiscriminatedUnionOption<'type'>, ...z.ZodDiscriminatedUnionOption<'type'>[]],
+);
+export const StoredEventSchema: z.ZodType<MienguEvent> = z.union([MienguEventSchema, V2StoredEventSchema]).transform((event) =>
+  event.schema_version === 2 ? MienguEventSchema.parse({ ...event, schema_version: EVENT_SCHEMA_VERSION }) : event,
+ ) as unknown as z.ZodType<MienguEvent>;
+export type StoredEvent = z.infer<typeof StoredEventSchema>;
 
 /** §7 default provenance per event type. The appender uses this unless overridden. */
 export const DEFAULT_TIER = {
@@ -702,6 +909,20 @@ export const DEFAULT_TIER = {
   TestsTampered: 'T1',
   ItemArtifactRecorded: 'T2',
   DriftDetected: 'T1',
+  TaskGraphActivated: 'T1',
+  TaskStarted: 'T1',
+  TaskAccepted: 'T1',
+  FailureCauseOpened: 'T1',
+  FailureAttempted: 'T1',
+  EscalationAdvanced: 'T1',
+  FailureCauseResolved: 'T1',
+  ArtifactsInvalidated: 'T1',
+  OracleSweepStarted: 'T1',
+  OracleResultRecorded: 'T1',
+  OracleSweepCompleted: 'T1',
+  WorkspaceCheckpointed: 'T1',
+  WorkspaceRestored: 'T1',
+  FinalPatchCaptured: 'T1',
 } satisfies Record<EventType, ProvenanceTier>;
 
 export function assertNever(x: never): never {

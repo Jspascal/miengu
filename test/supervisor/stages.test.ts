@@ -29,9 +29,8 @@ describe('runSupervisorStage', () => {
     expect(outcome).toEqual({ kind: 'completed', artifact: null, derived: [], executorResult: null });
   });
 
-  it('completes "integration" with a null artifact, no derived events, and no executor call', () => {
-    const outcome = runSupervisorStage('integration');
-    expect(outcome).toEqual({ kind: 'completed', artifact: null, derived: [], executorResult: null });
+  it('does not treat integration as a no-op supervisor stage', () => {
+    expect(() => runSupervisorStage('integration')).toThrow();
   });
 
   it('throws for any stage that is not supervisor-only', () => {

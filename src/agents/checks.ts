@@ -8,6 +8,8 @@ import type {
 } from '../contracts/index.js';
 import { parseSerial } from '../core/ids.js';
 import type { ComponentId, DecisionId, ReqId, TaskId } from '../core/ids.js';
+import type { EscalationLevel } from '../core/events.js';
+import { escalationRank } from '../supervisor/escalation.js';
 
 export interface CheckContext {
   readonly requirementSet: RequirementSet | null;
@@ -386,12 +388,16 @@ export function checkTestSuiteSpec(a: TestSuiteSpecDraft, c: CheckContext): read
   return failures;
 }
 
-export function checkImplementation(a: Implementation, c: CheckContext): readonly string[] {
+export function checkImplementation(
+  a: Implementation,
+  c: CheckContext,
+  selectedTask: TaskGraph['tasks'][number] | null = null,
+): readonly string[] {
   const failures: string[] = [];
 
-  if (c.taskGraph !== null) {
-    const taskIds = new Set(c.taskGraph.tasks.map((task) => task.task_id));
-    if (!taskIds.has(a.task_id)) {
+  const task = selectedTask ?? (c.taskGraph === null ? null : dispatchedTask(c.taskGraph));
+  if (task !== null) {
+    if (a.task_id !== task.task_id) {
       failures.push(`task_id '${a.task_id}' does not match the dispatched task`);
     }
   }
@@ -419,7 +425,13 @@ export function checkImplementation(a: Implementation, c: CheckContext): readonl
   return failures;
 }
 
-export function checkReviewVerdict(a: ReviewVerdict, c: CheckContext): readonly string[] {
+export function checkReviewVerdict(
+  a: ReviewVerdict,
+  c: CheckContext,
+  selectedTask: TaskGraph['tasks'][number] | null = null,
+  activeT1OracleFailure = false,
+  activeCauseLevel: EscalationLevel | null = null,
+): readonly string[] {
   const failures: string[] = [];
 
   const escalating = a.verdict === 'escalate';
@@ -427,15 +439,23 @@ export function checkReviewVerdict(a: ReviewVerdict, c: CheckContext): readonly 
     failures.push("escalate_to must be non-null iff verdict === 'escalate'");
   }
 
-  if (c.taskGraph !== null) {
-    const taskIds = new Set(c.taskGraph.tasks.map((task) => task.task_id));
-    if (!taskIds.has(a.task_id)) {
+  const task = selectedTask ?? (c.taskGraph === null ? null : dispatchedTask(c.taskGraph));
+  if (task !== null) {
+    if (a.task_id !== task.task_id) {
       failures.push(`task_id '${a.task_id}' does not match the reviewed task`);
     }
   }
 
   if (a.verdict === 'accept' && a.findings.some((finding) => finding.severity === 'blocking')) {
     failures.push("verdict: 'accept' with a blocking finding is incoherent");
+  }
+  if (a.verdict === 'accept' && activeT1OracleFailure) {
+    failures.push("verdict: 'accept' while an active T1 oracle failure remains");
+  }
+  if (a.verdict === 'escalate' && activeCauseLevel !== null && a.escalate_to !== null) {
+    if (escalationRank(a.escalate_to) <= escalationRank(activeCauseLevel)) {
+      failures.push(`escalate_to '${a.escalate_to}' must be strictly above active cause level '${activeCauseLevel}'`);
+    }
   }
 
   return failures;

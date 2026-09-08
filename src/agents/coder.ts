@@ -1,7 +1,7 @@
 import type { Implementation } from '../contracts/index.js';
 import type { ContextPackSection } from '../wiki/contextpack.js';
 import { restoreFrozenTests, verifyFrozenTests } from '../supervisor/freeze.js';
-import { checkImplementation, dispatchedTask } from './checks.js';
+import { checkImplementation } from './checks.js';
 import type { CheckContext } from './checks.js';
 import type { PackBuildInput, PostStepInput, PostStepResult, RoleModule } from './agent.js';
 
@@ -17,11 +17,12 @@ function section(
  * §15.5 pack: exactly one `Task` · files under its `expected_paths` plus their direct
  * dependencies · the frozen tests matching its `req_ids` · the `interfaces` it implements
  * · only those decisions whose `req_ids` intersect the task's. Never emits `prd`,
- * `wiki-index`, `requirement-set`, `task-graph`, `coder-transcript` or `reviewer-findings`.
+ * `wiki-index`, `requirement-set`, `task-graph`, `coder-transcript`, other-task findings, or
+ * escalation context.
  */
 export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[] {
   const sections: ContextPackSection[] = [];
-  const task = i.checkContext.taskGraph !== null ? dispatchedTask(i.checkContext.taskGraph) : null;
+  const task = i.task;
 
   if (i.raw.existingReqIds.length > 0) {
     sections.push(
@@ -102,6 +103,9 @@ export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[
   if (i.raw.oracleResults !== null) {
     sections.push(section('oracle-results', 'Oracle results', i.raw.oracleResults));
   }
+  if (i.raw.currentTaskReviewerFindings !== null) {
+    sections.push(section('current-task-reviewer-findings', 'Current task reviewer findings', i.raw.currentTaskReviewerFindings));
+  }
   if (i.raw.assumptions.length > 0) {
     sections.push(section('assumptions', 'Recorded assumptions', JSON.stringify(i.raw.assumptions, null, 2)));
   }
@@ -109,7 +113,7 @@ export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[
 }
 
 export function buildTaskSection(i: PackBuildInput): string {
-  const task = i.checkContext.taskGraph !== null ? dispatchedTask(i.checkContext.taskGraph) : null;
+  const task = i.task;
   if (task === null) {
     throw new Error('coder.buildTaskSection: no dispatched task (empty or cyclic TaskGraph)');
   }
@@ -120,8 +124,8 @@ export function buildTaskSection(i: PackBuildInput): string {
   );
 }
 
-export function validate(artifact: unknown, c: CheckContext): readonly string[] {
-  return checkImplementation(artifact as Implementation, c);
+export function validate(artifact: unknown, c: CheckContext, pack: PackBuildInput): readonly string[] {
+  return checkImplementation(artifact as Implementation, c, pack.task);
 }
 
 /**

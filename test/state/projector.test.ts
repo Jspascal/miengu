@@ -17,10 +17,17 @@ const RUN_ID = ids.runId();
 const ACCOUNT_CC = AccountIdSchema.parse('claude-personal');
 const ACCOUNT_CX = AccountIdSchema.parse('codex-personal');
 const EXECUTOR_CC = ExecutorInstanceIdSchema.parse('cc-sonnet');
+const skippedOracleCommands = [
+  { kind: 'build', command: null, sha256: null },
+  { kind: 'typecheck', command: null, sha256: null },
+  { kind: 'lint', command: null, sha256: null },
+  { kind: 'test', command: null, sha256: null },
+];
+const oracleEvidence = { sha256: '0'.repeat(64), path: '/tmp/oracle.out', bytes: 0 };
 
-function mkEvent(seq: number, type: EventType, data: unknown): MienguEvent {
+function mkEvent(seq: number, type: EventType, data: unknown, causationId: MienguEvent['causation_id'] = null): MienguEvent {
   return MienguEventSchema.parse({
-    schema_version: 2,
+    schema_version: 3,
     event_id: ids.eventId(),
     seq,
     item_id: ITEM_ID,
@@ -28,7 +35,7 @@ function mkEvent(seq: number, type: EventType, data: unknown): MienguEvent {
     ts: clock.now(),
     tier: DEFAULT_TIER[type],
     actor: { kind: 'system', id: null },
-    causation_id: null,
+    causation_id: causationId,
     type,
     data,
   });
@@ -86,7 +93,6 @@ function buildFixture(): MienguEvent[] {
     validation_attempt: 1,
     context_pack_id: null,
     context_pack_estimated_tokens: null,
-    session_id: null,
     resolved: { model: 'sonnet', effort: 'medium', max_turns: 10, context_budget_tokens: 1000 },
     budget: { max_turns: 10, max_wall_seconds: 60 },
     command_line: ['claude'],
@@ -369,6 +375,7 @@ describe('applyEvent: one fixture per event type asserts the exact state delta',
       ...before,
       seq: event.seq,
       lastEventId: event.event_id,
+      priorEventIds: [...(before.priorEventIds ?? []), event.event_id],
       updatedAt: event.ts,
     });
   });
@@ -424,12 +431,12 @@ describe('applyEvent: one fixture per event type asserts the exact state delta',
     );
   });
 
-  apply('StageCompleted with a non-null artifact records an ArtifactRef', () => {
-    expect(state.artifacts.intake).toEqual({
-      kind: 'stub',
-      sha256: 'c'.repeat(64),
-      stage: 'intake',
-      eventId: state.lastEventId,
+  apply('StageCompleted records only the declared active item artifact kinds', () => {
+    expect(state.artifacts).toEqual({
+      requirementSet: null,
+      architecturePlan: null,
+      taskGraph: null,
+      testSuiteSpec: null,
     });
   });
 
@@ -851,7 +858,7 @@ describe('applyEvent: error paths', () => {
   it('throws on a mismatched item_id', () => {
     const state = applyEvent(null, events[0] as MienguEvent);
     const wrongItem = MienguEventSchema.parse({
-      schema_version: 2,
+      schema_version: 3,
       event_id: ids.eventId(),
       seq: 2,
       item_id: 'wi-other-abc123',
@@ -883,5 +890,527 @@ describe('applyEvent: immutability', () => {
 
     expect(frozen).toEqual(snapshotBeforeApply);
     expect(next).not.toBe(frozen);
+  });
+});
+
+describe('applyEvent: Phase 3 tamper rejection', () => {
+  function taskRuntime(): {
+    state: ReturnType<typeof applyEvent>;
+    append: (type: EventType, data: unknown, causationId?: MienguEvent['causation_id']) => MienguEvent;
+  } {
+    let state = applyEvent(null, mkEvent(1, 'WorkItemCreated', {
+      title: 'phase three', slug: 'phase-three',
+      source: { kind: 'prd-file', path: 'prd.md', sha256: 'a'.repeat(64), bytes: 1 },
+      config_hash: 'b'.repeat(64),
+    }));
+    const append = (type: EventType, data: unknown, causationId: MienguEvent['causation_id'] = null): MienguEvent => {
+      const event = mkEvent(state.seq + 1, type, data, causationId);
+      state = applyEvent(state, event);
+      return event;
+    };
+    const graph = append('StageCompleted', {
+      stage: 'planning', attempt: 1,
+      artifact: { kind: 'task-graph', sha256: 'c'.repeat(64), body: { tasks: [{ task_id: 'task-example-1' }] } },
+    });
+    append('TaskGraphActivated', { graph_event_id: graph.event_id, ordered_task_ids: ['task-example-1'] });
+    append('TaskStarted', { task_id: 'task-example-1', order_index: 0, graph_event_id: graph.event_id });
+    const implementation = append('StageCompleted', {
+      stage: 'implementation', attempt: 1,
+      artifact: { kind: 'implementation', sha256: 'd'.repeat(64), body: {} },
+    });
+    const review = append('StageCompleted', {
+      stage: 'review', attempt: 1,
+      artifact: { kind: 'review-verdict', sha256: 'e'.repeat(64), body: { verdict: 'accept' } },
+    });
+    void implementation;
+    void review;
+    return { get state() { return state; }, append };
+  }
+
+  function acceptCurrentTask(fixture: ReturnType<typeof taskRuntime>): void {
+    const task = fixture.state.tasks!.records['task-example-1']!;
+    const sweep = fixture.append('OracleSweepStarted', {
+      scope: 'task', task_id: task.taskId, cause_id: null, commands: skippedOracleCommands,
+    });
+    fixture.append('OracleSweepCompleted', {
+      sweep_id: sweep.event_id, scope: 'task', task_id: task.taskId,
+      outcome: 'passed', failed_kind: null, result_event_ids: [],
+    });
+    const review = fixture.append('StageCompleted', {
+      stage: 'review', attempt: 2,
+      artifact: { kind: 'review-verdict', sha256: 'b'.repeat(64), body: { verdict: 'accept' } },
+    });
+    const checkpoint = fixture.append('WorkspaceCheckpointed', {
+      kind: 'task-accepted', task_id: task.taskId, parent_commit: 'a'.repeat(40),
+      commit: 'b'.repeat(40), patch: { sha256: 'a'.repeat(64), path: '/tmp/a.patch', bytes: 1 },
+    });
+    fixture.append('TaskAccepted', {
+      task_id: task.taskId, implementation_event_id: task.implementation!.eventId,
+      review_event_id: review.event_id, oracle_sweep_id: sweep.event_id,
+      checkpoint_event_id: checkpoint.event_id,
+    }, checkpoint.event_id);
+  }
+
+  it('rejects a duplicate task activation order', () => {
+    const state = applyEvent(null, mkEvent(1, 'WorkItemCreated', {
+      title: 'phase three', slug: 'phase-three',
+      source: { kind: 'prd-file', path: 'prd.md', sha256: 'a'.repeat(64), bytes: 1 }, config_hash: 'b'.repeat(64),
+    }));
+    const graph = mkEvent(2, 'StageCompleted', {
+      stage: 'planning', attempt: 1,
+      artifact: { kind: 'task-graph', sha256: 'c'.repeat(64), body: { tasks: [{ task_id: 'task-example-1' }] } },
+    });
+    const planned = applyEvent(state, graph);
+    const activation = mkEvent(3, 'TaskGraphActivated', {
+      graph_event_id: graph.event_id, ordered_task_ids: ['task-example-1', 'task-example-1'],
+    });
+    expect(() => applyEvent(planned, activation)).toThrow(ProjectionError);
+  });
+
+  it('rejects FailureCauseOpened with a trigger that is not an existing prior event', () => {
+    const fixture = taskRuntime();
+    expect(() => fixture.append('FailureCauseOpened', {
+      trigger_event_id: 'evt-01234567-89ab-cdef-0123-456789abcdef', parent_cause_id: null,
+      kind: 'oracle', task_id: 'task-example-1', initial_level: 'coder',
+      affects: { req_ids: [], component_ids: [], task_ids: ['task-example-1'] }, summary: 'tampered',
+    })).toThrow(/existing prior event/);
+  });
+
+  it('rejects ArtifactsInvalidated without its active cause, active artifact ids, and active task set', () => {
+    const fixture = taskRuntime();
+    const task = fixture.state.tasks!.records['task-example-1']!;
+    const cause = fixture.append('FailureCauseOpened', {
+      trigger_event_id: task.implementation!.eventId, parent_cause_id: null, kind: 'oracle',
+      task_id: task.taskId, initial_level: 'coder',
+      affects: { req_ids: [], component_ids: [], task_ids: [task.taskId] }, summary: 'oracle',
+    });
+    expect(() => fixture.append('ArtifactsInvalidated', {
+      cause_id: cause.event_id, target: 'coder',
+      affected_ids: { req_ids: [], component_ids: [], task_ids: ['task-example-2'] },
+      artifact_event_ids: [task.implementation!.eventId], reason: 'tampered task set',
+    })).toThrow(/valid active task set/);
+    expect(() => fixture.append('ArtifactsInvalidated', {
+      cause_id: cause.event_id, target: 'coder',
+      affected_ids: { req_ids: [], component_ids: [], task_ids: [task.taskId] },
+      artifact_event_ids: ['evt-01234567-89ab-cdef-0123-456789abcdef'], reason: 'tampered artifact id',
+    })).toThrow(/currently active artifacts/);
+    fixture.append('FailureCauseResolved', {
+      cause_id: cause.event_id, task_id: task.taskId, resolution: 'done',
+    });
+    expect(() => fixture.append('ArtifactsInvalidated', {
+      cause_id: cause.event_id, target: 'coder',
+      affected_ids: { req_ids: [], component_ids: [], task_ids: [task.taskId] },
+      artifact_event_ids: [task.implementation!.eventId], reason: 'resolved cause',
+    })).toThrow(/currently active matching cause/);
+  });
+
+  it('rejects FinalPatchCaptured until all tasks are accepted and the current integration sweep passed', () => {
+    const fixture = taskRuntime();
+    const data = {
+      original_base_commit: 'a'.repeat(40), accepted_head_commit: 'b'.repeat(40),
+      patch: { sha256: 'c'.repeat(64), path: '/tmp/final.patch', bytes: 1 },
+      files: [], insertions: 0, deletions: 0,
+    };
+    expect(() => fixture.append('FinalPatchCaptured', data)).toThrow(/all tasks accepted/);
+    acceptCurrentTask(fixture);
+    expect(() => fixture.append('FinalPatchCaptured', data)).toThrow(/current integration sweep/);
+    const sweep = fixture.append('OracleSweepStarted', {
+      scope: 'integration', task_id: null, cause_id: null, commands: skippedOracleCommands,
+    });
+    fixture.append('OracleSweepCompleted', {
+      sweep_id: sweep.event_id, scope: 'integration', task_id: null,
+      outcome: 'passed', failed_kind: null, result_event_ids: [],
+    });
+    expect(fixture.append('FinalPatchCaptured', data).type).toBe('FinalPatchCaptured');
+  });
+
+  it('requires the persisted task order to be Kahn-topological with ascending task-id ties', () => {
+    const state = applyEvent(null, mkEvent(1, 'WorkItemCreated', {
+      title: 'phase three', slug: 'phase-three',
+      source: { kind: 'prd-file', path: 'prd.md', sha256: 'a'.repeat(64), bytes: 1 }, config_hash: 'b'.repeat(64),
+    }));
+    // task-example-3 is deliberately declared before its dependency; task-example-1,
+    // task-example-2, and task-example-4 are initially independent.
+    const graph = mkEvent(2, 'StageCompleted', {
+      stage: 'planning', attempt: 1,
+      artifact: { kind: 'task-graph', sha256: 'c'.repeat(64), body: { tasks: [
+        { task_id: 'task-example-3', depends_on: ['task-example-2'] },
+        { task_id: 'task-example-4', depends_on: [] },
+        { task_id: 'task-example-2', depends_on: [] },
+        { task_id: 'task-example-1', depends_on: [] },
+      ] } },
+    });
+    const planned = applyEvent(state, graph);
+    const declarationOrder = mkEvent(3, 'TaskGraphActivated', {
+      graph_event_id: graph.event_id,
+      ordered_task_ids: ['task-example-3', 'task-example-4', 'task-example-2', 'task-example-1'],
+    });
+    expect(() => applyEvent(planned, declarationOrder)).toThrow(/deterministic topological order/);
+
+    const canonical = mkEvent(3, 'TaskGraphActivated', {
+      graph_event_id: graph.event_id,
+      ordered_task_ids: ['task-example-1', 'task-example-2', 'task-example-3', 'task-example-4'],
+    });
+    expect(applyEvent(planned, canonical).tasks?.order).toEqual(canonical.data.ordered_task_ids);
+  });
+
+  it('rejects a TaskAccepted event tied to a failed sweep', () => {
+    const fixture = taskRuntime();
+    const sweep = fixture.append('OracleSweepStarted', {
+      scope: 'task', task_id: 'task-example-1', cause_id: null, commands: [
+        { kind: 'build', command: 'false', sha256: 'f'.repeat(64) },
+        { kind: 'typecheck', command: null, sha256: null },
+        { kind: 'lint', command: null, sha256: null },
+        { kind: 'test', command: null, sha256: null },
+      ],
+    });
+    const result = fixture.append('OracleResultRecorded', {
+      sweep_id: sweep.event_id, scope: 'task', task_id: 'task-example-1', kind: 'build',
+      command: 'false', command_sha256: 'f'.repeat(64), status: 'failed', exit_code: 1,
+      signal: null, duration_ms: 1, stdout: oracleEvidence, stderr: oracleEvidence,
+    });
+    fixture.append('OracleSweepCompleted', {
+      sweep_id: sweep.event_id, scope: 'task', task_id: 'task-example-1', outcome: 'failed',
+      failed_kind: 'build', result_event_ids: [result.event_id],
+    });
+    const checkpoint = fixture.append('WorkspaceCheckpointed', {
+      kind: 'task-accepted', task_id: 'task-example-1', parent_commit: 'a'.repeat(40),
+      commit: 'b'.repeat(40), patch: { sha256: 'a'.repeat(64), path: '/tmp/a.patch', bytes: 1 },
+    });
+    const task = fixture.state.tasks?.records['task-example-1'];
+    expect(task).toBeDefined();
+    expect(() => fixture.append('TaskAccepted', {
+      task_id: 'task-example-1', implementation_event_id: task!.implementation!.eventId,
+      review_event_id: task!.review!.eventId, oracle_sweep_id: sweep.event_id,
+      checkpoint_event_id: checkpoint.event_id,
+    })).toThrow(ProjectionError);
+  });
+
+  it('rejects an in-memory tampered oracle result missing either durable stream reference', () => {
+    const fixture = taskRuntime();
+    const sweep = fixture.append('OracleSweepStarted', {
+      scope: 'task', task_id: 'task-example-1', cause_id: null,
+      commands: [
+        { kind: 'build', command: 'build', sha256: 'a'.repeat(64) },
+        { kind: 'typecheck', command: null, sha256: null },
+        { kind: 'lint', command: null, sha256: null },
+        { kind: 'test', command: null, sha256: null },
+      ],
+    });
+    const valid = mkEvent(fixture.state.seq + 1, 'OracleResultRecorded', {
+      sweep_id: sweep.event_id, scope: 'task', task_id: 'task-example-1', kind: 'build',
+      command: 'build', command_sha256: 'a'.repeat(64), status: 'passed', exit_code: 0,
+      signal: null, duration_ms: 0, stdout: oracleEvidence, stderr: oracleEvidence,
+    });
+    for (const missing of ['stdout', 'stderr'] as const) {
+      const tampered = {
+        ...valid,
+        data: { ...valid.data, [missing]: null },
+      } as unknown as MienguEvent;
+      expect(() => applyEvent(fixture.state, tampered)).toThrow(/durable stdout and stderr evidence/);
+    }
+  });
+
+  it('rejects a historical passing sweep after a newer implementation was recorded', () => {
+    const fixture = taskRuntime();
+    const passing = fixture.append('OracleSweepStarted', {
+      scope: 'task', task_id: 'task-example-1', cause_id: null, commands: skippedOracleCommands,
+    });
+    fixture.append('OracleSweepCompleted', {
+      sweep_id: passing.event_id, scope: 'task', task_id: 'task-example-1', outcome: 'passed',
+      failed_kind: null, result_event_ids: [],
+    });
+    fixture.append('StageCompleted', {
+      stage: 'implementation', attempt: 2,
+      artifact: { kind: 'implementation', sha256: '1'.repeat(64), body: {} },
+    });
+    const currentReview = fixture.append('StageCompleted', {
+      stage: 'review', attempt: 2,
+      artifact: { kind: 'review-verdict', sha256: '2'.repeat(64), body: { verdict: 'accept' } },
+    });
+    const checkpoint = fixture.append('WorkspaceCheckpointed', {
+      kind: 'task-accepted', task_id: 'task-example-1', parent_commit: 'a'.repeat(40),
+      commit: 'b'.repeat(40), patch: { sha256: 'a'.repeat(64), path: '/tmp/a.patch', bytes: 1 },
+    });
+    const task = fixture.state.tasks!.records['task-example-1']!;
+    expect(() => fixture.append('TaskAccepted', {
+      task_id: 'task-example-1', implementation_event_id: task.implementation!.eventId,
+      review_event_id: currentReview.event_id, oracle_sweep_id: passing.event_id,
+      checkpoint_event_id: checkpoint.event_id,
+    })).toThrow(ProjectionError);
+  });
+
+  it('rejects a passing sweep superseded by a newer sweep for the same implementation', () => {
+    const fixture = taskRuntime();
+    const passing = fixture.append('OracleSweepStarted', {
+      scope: 'task', task_id: 'task-example-1', cause_id: null, commands: skippedOracleCommands,
+    });
+    fixture.append('OracleSweepCompleted', {
+      sweep_id: passing.event_id, scope: 'task', task_id: 'task-example-1', outcome: 'passed',
+      failed_kind: null, result_event_ids: [],
+    });
+    const failing = fixture.append('OracleSweepStarted', {
+      scope: 'task', task_id: 'task-example-1', cause_id: null, commands: [
+        { kind: 'build', command: 'false', sha256: '3'.repeat(64) },
+        { kind: 'typecheck', command: null, sha256: null },
+        { kind: 'lint', command: null, sha256: null },
+        { kind: 'test', command: null, sha256: null },
+      ],
+    });
+    const result = fixture.append('OracleResultRecorded', {
+      sweep_id: failing.event_id, scope: 'task', task_id: 'task-example-1', kind: 'build',
+      command: 'false', command_sha256: '3'.repeat(64), status: 'failed', exit_code: 1,
+      signal: null, duration_ms: 1, stdout: oracleEvidence, stderr: oracleEvidence,
+    });
+    fixture.append('OracleSweepCompleted', {
+      sweep_id: failing.event_id, scope: 'task', task_id: 'task-example-1', outcome: 'failed',
+      failed_kind: 'build', result_event_ids: [result.event_id],
+    });
+    const checkpoint = fixture.append('WorkspaceCheckpointed', {
+      kind: 'task-accepted', task_id: 'task-example-1', parent_commit: 'a'.repeat(40),
+      commit: 'b'.repeat(40), patch: { sha256: 'a'.repeat(64), path: '/tmp/a.patch', bytes: 1 },
+    });
+    const task = fixture.state.tasks!.records['task-example-1']!;
+    expect(() => fixture.append('TaskAccepted', {
+      task_id: 'task-example-1', implementation_event_id: task.implementation!.eventId,
+      review_event_id: task.review!.eventId, oracle_sweep_id: passing.event_id,
+      checkpoint_event_id: checkpoint.event_id,
+    })).toThrow(/latest completed passing sweep/);
+  });
+
+  it('rejects a task checkpoint created before the current implementation, sweep, and review', () => {
+    const fixture = taskRuntime();
+    const staleCheckpoint = fixture.append('WorkspaceCheckpointed', {
+      kind: 'task-accepted', task_id: 'task-example-1', parent_commit: 'a'.repeat(40),
+      commit: 'b'.repeat(40), patch: { sha256: 'a'.repeat(64), path: '/tmp/a.patch', bytes: 1 },
+    });
+    const implementation = fixture.append('StageCompleted', {
+      stage: 'implementation', attempt: 2,
+      artifact: { kind: 'implementation', sha256: '1'.repeat(64), body: {} },
+    });
+    const sweep = fixture.append('OracleSweepStarted', {
+      scope: 'task', task_id: 'task-example-1', cause_id: null, commands: skippedOracleCommands,
+    });
+    fixture.append('OracleSweepCompleted', {
+      sweep_id: sweep.event_id, scope: 'task', task_id: 'task-example-1', outcome: 'passed',
+      failed_kind: null, result_event_ids: [],
+    });
+    const review = fixture.append('StageCompleted', {
+      stage: 'review', attempt: 2,
+      artifact: { kind: 'review-verdict', sha256: '2'.repeat(64), body: { verdict: 'accept' } },
+    });
+    expect(() => fixture.append('TaskAccepted', {
+      task_id: 'task-example-1', implementation_event_id: implementation.event_id,
+      review_event_id: review.event_id, oracle_sweep_id: sweep.event_id,
+      checkpoint_event_id: staleCheckpoint.event_id,
+    }, staleCheckpoint.event_id)).toThrow(/checkpoint causally created after/);
+  });
+
+  it('rejects a checkpoint that is temporally fresh but not the TaskAccepted cause', () => {
+    const fixture = taskRuntime();
+    const implementation = fixture.append('StageCompleted', {
+      stage: 'implementation', attempt: 2,
+      artifact: { kind: 'implementation', sha256: '1'.repeat(64), body: {} },
+    });
+    const sweep = fixture.append('OracleSweepStarted', {
+      scope: 'task', task_id: 'task-example-1', cause_id: null, commands: skippedOracleCommands,
+    });
+    fixture.append('OracleSweepCompleted', {
+      sweep_id: sweep.event_id, scope: 'task', task_id: 'task-example-1', outcome: 'passed',
+      failed_kind: null, result_event_ids: [],
+    });
+    const review = fixture.append('StageCompleted', {
+      stage: 'review', attempt: 2,
+      artifact: { kind: 'review-verdict', sha256: '2'.repeat(64), body: { verdict: 'accept' } },
+    });
+    const checkpoint = fixture.append('WorkspaceCheckpointed', {
+      kind: 'task-accepted', task_id: 'task-example-1', parent_commit: 'a'.repeat(40),
+      commit: 'b'.repeat(40), patch: { sha256: 'a'.repeat(64), path: '/tmp/a.patch', bytes: 1 },
+    });
+    expect(() => fixture.append('TaskAccepted', {
+      task_id: 'task-example-1', implementation_event_id: implementation.event_id,
+      review_event_id: review.event_id, oracle_sweep_id: sweep.event_id,
+      checkpoint_event_id: checkpoint.event_id,
+    })).toThrow(/checkpoint causally created after/);
+  });
+
+  it('rejects TaskAccepted when its referenced ReviewVerdict is not accept', () => {
+    const fixture = taskRuntime();
+    const task = fixture.state.tasks!.records['task-example-1']!;
+    const sweep = fixture.append('OracleSweepStarted', { scope: 'task', task_id: task.taskId, cause_id: null, commands: skippedOracleCommands });
+    fixture.append('OracleSweepCompleted', { sweep_id: sweep.event_id, scope: 'task', task_id: task.taskId, outcome: 'passed', failed_kind: null, result_event_ids: [] });
+    const review = fixture.append('StageCompleted', { stage: 'review', attempt: 2, artifact: { kind: 'review-verdict', sha256: '3'.repeat(64), body: { verdict: 'revise' } } });
+    const checkpoint = fixture.append('WorkspaceCheckpointed', { kind: 'task-accepted', task_id: task.taskId, parent_commit: 'a'.repeat(40), commit: 'b'.repeat(40), patch: { sha256: 'a'.repeat(64), path: '/tmp/a.patch', bytes: 1 } });
+    expect(() => fixture.append('TaskAccepted', {
+      task_id: task.taskId, implementation_event_id: task.implementation!.eventId, review_event_id: review.event_id,
+      oracle_sweep_id: sweep.event_id, checkpoint_event_id: checkpoint.event_id,
+    }, checkpoint.event_id)).toThrow(/accepting ReviewVerdict/);
+  });
+
+  it.each(['oracle', 'test', 'review-revision'] as const)('rejects TaskAccepted while an active corrective %s cause remains after a passing sweep', (kind) => {
+    const fixture = taskRuntime();
+    const task = fixture.state.tasks!.records['task-example-1']!;
+    const cause = fixture.append('FailureCauseOpened', {
+      trigger_event_id: task.implementation!.eventId, parent_cause_id: null, kind, task_id: task.taskId,
+      initial_level: 'coder', affects: { req_ids: [], component_ids: [], task_ids: [task.taskId] }, summary: kind,
+    });
+    const sweep = fixture.append('OracleSweepStarted', { scope: 'task', task_id: task.taskId, cause_id: cause.event_id, commands: skippedOracleCommands });
+    fixture.append('OracleSweepCompleted', { sweep_id: sweep.event_id, scope: 'task', task_id: task.taskId, outcome: 'passed', failed_kind: null, result_event_ids: [] });
+    const review = fixture.append('StageCompleted', { stage: 'review', attempt: 2, artifact: { kind: 'review-verdict', sha256: '3'.repeat(64), body: { verdict: 'accept' } } });
+    const checkpoint = fixture.append('WorkspaceCheckpointed', { kind: 'task-accepted', task_id: task.taskId, parent_commit: 'a'.repeat(40), commit: 'b'.repeat(40), patch: { sha256: 'a'.repeat(64), path: '/tmp/a.patch', bytes: 1 } });
+    expect(() => fixture.append('TaskAccepted', {
+      task_id: task.taskId, implementation_event_id: task.implementation!.eventId, review_event_id: review.event_id,
+      oracle_sweep_id: sweep.event_id, checkpoint_event_id: checkpoint.event_id,
+    }, checkpoint.event_id)).toThrow(/active failure cause/);
+  });
+
+  it('rejects a task-accepted checkpoint without patch evidence', () => {
+    const fixture = taskRuntime();
+    expect(() => fixture.append('WorkspaceCheckpointed', {
+      kind: 'task-accepted', task_id: 'task-example-1', parent_commit: 'a'.repeat(40),
+      commit: 'b'.repeat(40), patch: null,
+    })).toThrow(/patch evidence/);
+  });
+
+  it('rejects a repeat acceptance after the task is already accepted', () => {
+    const fixture = taskRuntime();
+    const task = fixture.state.tasks!.records['task-example-1']!;
+    const sweep = fixture.append('OracleSweepStarted', { scope: 'task', task_id: task.taskId, cause_id: null, commands: skippedOracleCommands });
+    fixture.append('OracleSweepCompleted', { sweep_id: sweep.event_id, scope: 'task', task_id: task.taskId, outcome: 'passed', failed_kind: null, result_event_ids: [] });
+    const review = fixture.append('StageCompleted', { stage: 'review', attempt: 2, artifact: { kind: 'review-verdict', sha256: '3'.repeat(64), body: { verdict: 'accept' } } });
+    const checkpoint = fixture.append('WorkspaceCheckpointed', { kind: 'task-accepted', task_id: task.taskId, parent_commit: 'a'.repeat(40), commit: 'b'.repeat(40), patch: { sha256: 'a'.repeat(64), path: '/tmp/a.patch', bytes: 1 } });
+    fixture.append('TaskAccepted', {
+      task_id: task.taskId, implementation_event_id: task.implementation!.eventId, review_event_id: review.event_id,
+      oracle_sweep_id: sweep.event_id, checkpoint_event_id: checkpoint.event_id,
+    }, checkpoint.event_id);
+    expect(() => fixture.append('TaskAccepted', {
+      task_id: task.taskId, implementation_event_id: task.implementation!.eventId, review_event_id: review.event_id,
+      oracle_sweep_id: sweep.event_id, checkpoint_event_id: checkpoint.event_id,
+    }, checkpoint.event_id)).toThrow(/already accepted/);
+  });
+
+  it('requires complete fixed oracle declarations and an exact passing result prefix', () => {
+    const fixture = taskRuntime();
+    expect(() => fixture.append('OracleSweepStarted', {
+      scope: 'task', task_id: 'task-example-1', cause_id: null,
+      commands: [
+        { kind: 'build', command: 'build', sha256: 'a'.repeat(64) },
+        { kind: 'lint', command: 'lint', sha256: 'b'.repeat(64) },
+      ],
+    })).toThrow(/complete fixed/);
+    const sweep = fixture.append('OracleSweepStarted', {
+      scope: 'task', task_id: 'task-example-1', cause_id: null,
+      commands: [
+        { kind: 'build', command: 'build', sha256: 'a'.repeat(64) },
+        { kind: 'typecheck', command: null, sha256: null },
+        { kind: 'lint', command: 'lint', sha256: 'b'.repeat(64) },
+        { kind: 'test', command: null, sha256: null },
+      ],
+    });
+    expect(() => fixture.append('OracleResultRecorded', {
+      sweep_id: sweep.event_id, scope: 'task', task_id: 'task-example-1', kind: 'lint',
+      command: 'lint', command_sha256: 'b'.repeat(64), status: 'passed', exit_code: 0,
+      signal: null, duration_ms: 0, stdout: oracleEvidence, stderr: oracleEvidence,
+    })).toThrow(/next declared oracle command/);
+    fixture.append('OracleResultRecorded', {
+      sweep_id: sweep.event_id, scope: 'task', task_id: 'task-example-1', kind: 'build',
+      command: 'build', command_sha256: 'a'.repeat(64), status: 'passed', exit_code: 0,
+      signal: null, duration_ms: 0, stdout: oracleEvidence, stderr: oracleEvidence,
+    });
+    expect(() => fixture.append('OracleSweepCompleted', {
+      sweep_id: sweep.event_id, scope: 'task', task_id: 'task-example-1', outcome: 'passed',
+      failed_kind: null, result_event_ids: fixture.state.oracleSweeps[sweep.event_id]!.resultEventIds,
+    })).toThrow(/exact executed oracle prefix/);
+    expect(() => fixture.append('OracleResultRecorded', {
+      sweep_id: sweep.event_id, scope: 'task', task_id: 'task-example-1', kind: 'lint',
+      command: 'lint --changed', command_sha256: 'b'.repeat(64), status: 'passed', exit_code: 0,
+      signal: null, duration_ms: 0, stdout: oracleEvidence, stderr: oracleEvidence,
+    })).toThrow(/next declared oracle command/);
+    expect(() => fixture.append('OracleSweepStarted', {
+      scope: 'task', task_id: 'task-example-1', cause_id: null,
+      commands: [
+        { kind: 'typecheck', command: null, sha256: null },
+        { kind: 'build', command: null, sha256: null },
+        { kind: 'lint', command: null, sha256: null },
+        { kind: 'test', command: null, sha256: null },
+      ],
+    })).toThrow(/complete fixed/);
+  });
+
+  it('rejects an oracle result appended after the first non-passing result', () => {
+    const fixture = taskRuntime();
+    const sweep = fixture.append('OracleSweepStarted', {
+      scope: 'task', task_id: 'task-example-1', cause_id: null,
+      commands: [
+        { kind: 'build', command: 'build', sha256: 'a'.repeat(64) },
+        { kind: 'typecheck', command: 'typecheck', sha256: 'b'.repeat(64) },
+        { kind: 'lint', command: null, sha256: null },
+        { kind: 'test', command: null, sha256: null },
+      ],
+    });
+    fixture.append('OracleResultRecorded', {
+      sweep_id: sweep.event_id, scope: 'task', task_id: 'task-example-1', kind: 'build',
+      command: 'build', command_sha256: 'a'.repeat(64), status: 'failed', exit_code: 1,
+      signal: null, duration_ms: 0, stdout: oracleEvidence, stderr: oracleEvidence,
+    });
+    expect(() => fixture.append('OracleResultRecorded', {
+      sweep_id: sweep.event_id, scope: 'task', task_id: 'task-example-1', kind: 'typecheck',
+      command: 'typecheck', command_sha256: 'b'.repeat(64), status: 'passed', exit_code: 0,
+      signal: null, duration_ms: 0, stdout: oracleEvidence, stderr: oracleEvidence,
+    })).toThrow(/cannot follow a non-passing/);
+  });
+
+  it('validates WorkspaceRestored against its preceding invalidation, frozen checkpoint, and retained mapping', () => {
+    const fixture = taskRuntime();
+    const task = fixture.state.tasks!.records['task-example-1']!;
+    const frozen = fixture.append('WorkspaceCheckpointed', {
+      kind: 'tests-frozen', task_id: null, parent_commit: 'a'.repeat(40), commit: 'b'.repeat(40), patch: null,
+    });
+    const cause = fixture.append('FailureCauseOpened', {
+      trigger_event_id: task.implementation!.eventId, parent_cause_id: null, kind: 'review-revision', task_id: task.taskId,
+      initial_level: 'coder', affects: { req_ids: [], component_ids: [], task_ids: [task.taskId] }, summary: 'review',
+    });
+    fixture.append('ArtifactsInvalidated', {
+      cause_id: cause.event_id, target: 'coder', affected_ids: { req_ids: [], component_ids: [], task_ids: [task.taskId] },
+      artifact_event_ids: [task.implementation!.eventId, task.review!.eventId], reason: 'retry',
+    });
+    expect(() => fixture.append('WorkspaceRestored', {
+      cause_id: cause.event_id, target: 'coder', base_checkpoint_event_id: frozen.event_id, base_commit: 'a'.repeat(40),
+      retained_task_commits: [], invalidated_task_ids: [],
+    })).toThrow(/invalidated task set/);
+    expect(fixture.append('WorkspaceRestored', {
+      cause_id: cause.event_id, target: 'coder', base_checkpoint_event_id: frozen.event_id, base_commit: 'a'.repeat(40),
+      retained_task_commits: [], invalidated_task_ids: [task.taskId],
+    }).type).toBe('WorkspaceRestored');
+  });
+
+  it.each(['architect', 'analyst'] as const)('clears integration sweep and final patch when %s invalidates artifacts', (target) => {
+    const fixture = taskRuntime();
+    const testSuite = fixture.append('StageCompleted', {
+      stage: 'test-authoring', attempt: 1,
+      artifact: { kind: 'test-suite-spec', sha256: 'a'.repeat(64), body: {} },
+    });
+    fixture.append('TestsFrozen', {
+      suite_id: 'suite-example-1', content_hash: 'a'.repeat(64),
+      files: [], frozen_copy_dir: '/tmp/frozen',
+    });
+    const frozenCheckpoint = fixture.append('WorkspaceCheckpointed', {
+      kind: 'tests-frozen', task_id: null, parent_commit: 'a'.repeat(40), commit: 'b'.repeat(40), patch: null,
+    });
+    acceptCurrentTask(fixture);
+    const sweep = fixture.append('OracleSweepStarted', { scope: 'integration', task_id: null, cause_id: null, commands: skippedOracleCommands });
+    fixture.append('OracleSweepCompleted', { sweep_id: sweep.event_id, scope: 'integration', task_id: null, outcome: 'passed', failed_kind: null, result_event_ids: [] });
+    fixture.append('FinalPatchCaptured', { original_base_commit: 'a'.repeat(40), accepted_head_commit: 'b'.repeat(40), patch: { sha256: 'c'.repeat(64), path: '/tmp/final.patch', bytes: 1 }, files: [], insertions: 0, deletions: 0 });
+    const cause = fixture.append('FailureCauseOpened', {
+      trigger_event_id: sweep.event_id, parent_cause_id: null, kind: target === 'architect' ? 'architecture' : 'requirements', task_id: null,
+      initial_level: target, affects: { req_ids: [], component_ids: [], task_ids: [] }, summary: target,
+    });
+    const state = applyEvent(fixture.state, mkEvent(fixture.state.seq + 1, 'ArtifactsInvalidated', {
+      cause_id: cause.event_id, target, affected_ids: { req_ids: [], component_ids: [], task_ids: [] }, artifact_event_ids: [testSuite.event_id], reason: target,
+    }));
+    expect(state.integration).toEqual({ status: 'pending', sweepId: null, finalPatch: null });
+    expect(state.artifacts.testSuiteSpec).toBeNull();
+    expect(state.frozenTests).toBeNull();
+    expect(state.workspaceCheckpoints[frozenCheckpoint.event_id]).toBeUndefined();
   });
 });

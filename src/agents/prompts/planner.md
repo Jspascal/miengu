@@ -11,8 +11,9 @@ Your context pack contains: the `RequirementSet` · the `ArchitecturePlan` (deci
 components, interfaces) · a file map.
 
 It deliberately omits: `prd` · `frozen-test-bodies` · `source-files` · `diff` ·
-`coder-transcript` · `reviewer-findings`. You are not shown implementation or test
-bodies.
+`coder-transcript` · other-task findings. When routed an escalation, its context is sanitized:
+category, affected requirement ids, summary, task ids, and current-task findings only. You are not
+shown implementation or test bodies.
 
 {{PACK}}
 
@@ -31,6 +32,7 @@ Your output must be a single JSON object conforming exactly to the following con
 3. `definition_of_done` entries are observable, not aspirational. "Handles errors" is not
    a DoD; "returns 422 with a field-level error body on invalid input" is.
 4. Order by dependency only. Do not encode priority — priority lives on requirements.
+5. For an escalation, repair the task decomposition using only the sanitized context.
 
 ## 5. PROHIBITIONS
 

@@ -11,7 +11,7 @@ import type { EventType } from '../../src/core/events.js';
 type DiscriminatedMember = z.ZodObject<{ type: z.ZodLiteral<EventType> }>;
 
 const BASE_ENVELOPE = {
-  schema_version: 2,
+  schema_version: EVENT_SCHEMA_VERSION,
   event_id: 'evt-01234567-89ab-cdef-0123-456789abcdef',
   seq: 1,
   item_id: 'wi-example-abc123',
@@ -21,6 +21,8 @@ const BASE_ENVELOPE = {
   actor: { kind: 'system', id: null },
   causation_id: null,
 };
+
+const ORACLE_EVIDENCE = { sha256: 'a'.repeat(64), path: '/tmp/oracle.out', bytes: 0 };
 
 const VALID_DATA: Record<EventType, Record<string, unknown>> = {
   WorkItemCreated: {
@@ -96,7 +98,6 @@ const VALID_DATA: Record<EventType, Record<string, unknown>> = {
     validation_attempt: 1,
     context_pack_id: null,
     context_pack_estimated_tokens: null,
-    session_id: null,
     resolved: { model: null, effort: null, max_turns: 10, context_budget_tokens: 1000 },
     budget: { max_turns: 10, max_wall_seconds: 60 },
     command_line: ['stub'],
@@ -200,6 +201,20 @@ const VALID_DATA: Record<EventType, Record<string, unknown>> = {
     summary: 'x',
   },
   DriftDetected: { claim: 'claim-example-1', expected: 'a', observed: 'b', area: null },
+  TaskGraphActivated: { graph_event_id: 'evt-01234567-89ab-cdef-0123-456789abcdef', ordered_task_ids: ['task-example-1'] },
+  TaskStarted: { task_id: 'task-example-1', order_index: 0, graph_event_id: 'evt-01234567-89ab-cdef-0123-456789abcdef' },
+  TaskAccepted: { task_id: 'task-example-1', implementation_event_id: 'evt-01234567-89ab-cdef-0123-456789abcdef', review_event_id: 'evt-01234567-89ab-cdef-0123-456789abcdef', oracle_sweep_id: 'evt-01234567-89ab-cdef-0123-456789abcdef', checkpoint_event_id: 'evt-01234567-89ab-cdef-0123-456789abcdef' },
+  FailureCauseOpened: { trigger_event_id: 'evt-01234567-89ab-cdef-0123-456789abcdef', parent_cause_id: null, kind: 'oracle', task_id: 'task-example-1', initial_level: 'coder', affects: { req_ids: [], component_ids: [], task_ids: ['task-example-1'] }, summary: 'x' },
+  FailureAttempted: { cause_id: 'evt-01234567-89ab-cdef-0123-456789abcdef', task_id: 'task-example-1', level: 'coder', bucket: 'oracle', attempt: 1, limit: 2, handler_stage: 'implementation' },
+  EscalationAdvanced: { cause_id: 'evt-01234567-89ab-cdef-0123-456789abcdef', task_id: 'task-example-1', from_level: 'coder', to_level: 'reviewer', exhausted_bucket: 'oracle', attempts_used: 2, reason: 'x' },
+  FailureCauseResolved: { cause_id: 'evt-01234567-89ab-cdef-0123-456789abcdef', resolution: 'fixed', task_id: 'task-example-1' },
+  ArtifactsInvalidated: { cause_id: 'evt-01234567-89ab-cdef-0123-456789abcdef', target: 'coder', affected_ids: { req_ids: [], component_ids: [], task_ids: ['task-example-1'] }, artifact_event_ids: [], reason: 'x' },
+  OracleSweepStarted: { scope: 'task', task_id: 'task-example-1', cause_id: null, commands: [{ kind: 'build', command: 'npm run build', sha256: 'a'.repeat(64) }] },
+  OracleResultRecorded: { sweep_id: 'evt-01234567-89ab-cdef-0123-456789abcdef', scope: 'task', task_id: 'task-example-1', kind: 'build', command: 'npm run build', command_sha256: 'a'.repeat(64), status: 'passed', exit_code: 0, signal: null, duration_ms: 1, stdout: ORACLE_EVIDENCE, stderr: ORACLE_EVIDENCE },
+  OracleSweepCompleted: { sweep_id: 'evt-01234567-89ab-cdef-0123-456789abcdef', scope: 'task', task_id: 'task-example-1', outcome: 'passed', failed_kind: null, result_event_ids: [] },
+  WorkspaceCheckpointed: { kind: 'task-accepted', task_id: 'task-example-1', parent_commit: 'a'.repeat(40), commit: 'b'.repeat(40), patch: null },
+  WorkspaceRestored: { cause_id: 'evt-01234567-89ab-cdef-0123-456789abcdef', target: 'coder', base_checkpoint_event_id: 'evt-01234567-89ab-cdef-0123-456789abcdef', base_commit: 'a'.repeat(40), retained_task_commits: [], invalidated_task_ids: ['task-example-1'] },
+  FinalPatchCaptured: { original_base_commit: 'a'.repeat(40), accepted_head_commit: 'b'.repeat(40), patch: { sha256: 'c'.repeat(64), path: '/tmp/p.patch', bytes: 1 }, files: [], insertions: 0, deletions: 0 },
 };
 
 function buildEvent(type: EventType): Record<string, unknown> {
@@ -207,8 +222,8 @@ function buildEvent(type: EventType): Record<string, unknown> {
 }
 
 describe('EVENT_SCHEMA_VERSION', () => {
-  it('is 2 — the clean v2 break, binding decision 7', () => {
-    expect(EVENT_SCHEMA_VERSION).toBe(2);
+  it('is 3 with v2 accepted only at the stored-event compatibility boundary', () => {
+    expect(EVENT_SCHEMA_VERSION).toBe(3);
   });
 });
 
@@ -250,6 +265,16 @@ describe('(d) one valid + one invalid fixture per event type', () => {
       expect(result.success).toBe(false);
     });
   }
+});
+
+describe('OracleResultRecorded durable stream evidence', () => {
+  it.each(['stdout', 'stderr'] as const)('rejects a null %s reference for every result status', (stream) => {
+    for (const status of ['passed', 'failed', 'timed-out', 'spawn-error', 'aborted'] as const) {
+      const event = buildEvent('OracleResultRecorded');
+      const data = { ...(event.data as Record<string, unknown>), status, [stream]: null };
+      expect(MienguEventSchema.safeParse({ ...event, data }).success).toBe(false);
+    }
+  });
 });
 
 describe('tier assignment', () => {

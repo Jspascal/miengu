@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { extractJson, runAgentStage } from '../../src/agents/agent.js';
+import { extractJson, renderEscalationContext, runAgentStage } from '../../src/agents/agent.js';
 import type { AppendFn, PackBuildInput, RoleModule } from '../../src/agents/agent.js';
 import { checkRequirementSet } from '../../src/agents/checks.js';
 import type { CheckContext } from '../../src/agents/checks.js';
@@ -60,6 +60,26 @@ const VALID: RequirementSet = RequirementSetSchema.parse({
   out_of_scope: [],
 });
 
+describe('renderEscalationContext', () => {
+  const context = {
+    category: 'task-design',
+    affectedRequirementIds: ['REQ-example-1' as never],
+    summary: 'task boundary is wrong',
+    componentIds: ['component-example-1'],
+    t1OracleSummaries: ['typecheck failed'],
+    taskIds: ['task-example-1'],
+    currentTaskReviewerFindings: 'missing validation',
+  };
+
+  it('discloses only the recipient-specific escalation fields', () => {
+    expect(renderEscalationContext('analyst', context)).not.toContain('component_ids');
+    expect(renderEscalationContext('architect', context)).toContain('t1_oracle_summaries');
+    expect(renderEscalationContext('architect', context)).not.toContain('task_ids');
+    expect(renderEscalationContext('planner', context)).toContain('current_task_reviewer_findings');
+    expect(renderEscalationContext('planner', context)).not.toContain('t1_oracle_summaries');
+  });
+});
+
 // Fails checkRequirementSet's duplicate-req_id check.
 const INVALID = {
   requirements: [
@@ -98,6 +118,8 @@ const PACK: PackBuildInput = {
   itemId,
   checkContext: CHECK_CONTEXT,
   task: null,
+  activeT1OracleFailure: false,
+  activeCauseLevel: null,
   raw: {
     prd: null,
     wikiIndex: null,
@@ -110,7 +132,8 @@ const PACK: PackBuildInput = {
     sourceFiles: [],
     diff: null,
     oracleResults: null,
-    reviewerFindings: null,
+    currentTaskReviewerFindings: null,
+    escalationContext: null,
     assumptions: [],
   },
 };

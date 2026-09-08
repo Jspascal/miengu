@@ -1,8 +1,10 @@
 import type { CheckpointId } from '../core/ids.js';
 import type { AccountId } from '../core/ids.js';
 import type { ParkReason, Stage } from '../core/events.js';
+import type { EscalationLevel, FailureAttemptBucket } from '../core/events.js';
 import { STAGE_ORDER, roleForStage } from '../state/workitem.js';
 import type { WorkItemState } from '../state/workitem.js';
+import { bucketLimit, nextEscalationLevel } from './escalation.js';
 
 // The determinism-zone lint rule for this file restricts every `../config/*` import
 // declaration, including `import type`, because the base ESLint rule cannot see TypeScript's
@@ -23,8 +25,31 @@ export interface StagePolicy {
   readonly stageAccounts: Readonly<Record<Stage, AccountId | null>>;
 }
 
+export type SupervisorAction =
+  | 'activate-task-graph'
+  | 'checkpoint-tests'
+  | 'start-task'
+  | 'task-oracle'
+  | 'review-task'
+  | 'accept-task'
+  | 'invalidate-artifacts'
+  | 'advance-escalation'
+  | 'integration-oracle'
+  | 'capture-final-patch';
+
 export type StageDecision =
-  | { readonly kind: 'run'; readonly stage: Stage; readonly attempt: number; readonly needsHuman: false }
+  | {
+      readonly kind: 'run';
+      readonly stage: Stage;
+      readonly attempt: number;
+      readonly needsHuman: false;
+      /** Present only for the Phase 3 supervisor path; Group F materializes it durably. */
+      readonly action?: SupervisorAction;
+      readonly taskId?: string | null;
+      readonly causeId?: string | null;
+      readonly level?: EscalationLevel;
+      readonly bucket?: FailureAttemptBucket;
+    }
   | {
       readonly kind: 'checkpoint';
       readonly stage: Stage;
@@ -60,6 +85,170 @@ export function limitForStage(stage: Stage, policy: StagePolicy): number {
  */
 export function effectiveAttempts(state: WorkItemState, stage: Stage): number {
   return Math.max(0, state.attempts[stage] - state.quotaAborts[stage]);
+}
+
+function action(
+  state: WorkItemState,
+  kind: SupervisorAction,
+  values: {
+    readonly taskId?: string | null;
+    readonly causeId?: string | null;
+    readonly level?: EscalationLevel;
+    readonly bucket?: FailureAttemptBucket;
+    readonly stage?: Stage;
+  } = {},
+): StageDecision {
+  return {
+    kind: 'run',
+    stage: values.stage ?? state.stage,
+    attempt: 0,
+    needsHuman: false,
+    action: kind,
+    ...values,
+  };
+}
+
+function completedTaskSweep(
+  state: WorkItemState,
+  taskId: string,
+  implementationEventId: string,
+): 'passed' | 'failed' | null {
+  const sweeps = Object.values(state.oracleSweeps)
+    // Object insertion order is projection/event order. Event IDs are random and must never
+    // be used to infer recency.
+    .filter((sweep) => sweep.scope === 'task' && sweep.taskId === taskId && sweep.implementationEventId === implementationEventId && sweep.outcome !== 'running');
+  const latest = sweeps.at(-1);
+  if (latest === undefined || latest.outcome === 'aborted' || latest.outcome === 'running') return null;
+  return latest.outcome;
+}
+
+function handlerStageForLevel(level: EscalationLevel): Stage | null {
+  switch (level) {
+    case 'coder': return 'implementation';
+    case 'reviewer': return 'review';
+    case 'planner': return 'planning';
+    case 'architect': return 'architecture';
+    case 'analyst': return 'analysis';
+    case 'human': return null;
+  }
+}
+
+function v3Decision(state: WorkItemState, policy: StagePolicy): StageDecision | null {
+  const activeCauseId = state.activeCauseId ?? null;
+  const activeCause = activeCauseId === null ? null : (state.causes ?? {})[activeCauseId] ?? null;
+  // Escalation remains authoritative while an upstream handler has invalidated the graph.
+  // Checking `tasks === null` first stranded Architect/Analyst causes in the legacy stage
+  // limit guard instead of letting the finite ladder reach human.
+  if (activeCause !== null) {
+    if (activeCause.status === 'human' || activeCause.level === 'human') {
+      return { kind: 'park', reason: 'awaiting-human', detail: `failure cause ${activeCause.causeId} reached human escalation`, account: null };
+    }
+    const bucket: FailureAttemptBucket =
+      activeCause.level === 'coder'
+        ? activeCause.kind === 'oracle' ? 'oracle' : activeCause.kind === 'test' ? 'test' : 'review'
+        : activeCause.level;
+    const used = activeCause.attempts[bucket];
+    // A StageFailed can enter the Phase 3 ladder before its originating stage has exhausted
+    // its configured retry budget. Once the ladder reaches that same handler again, do not
+    // grant a surplus invocation: advance the active cause instead of falling back to a
+    // legacy park. This retains causal routing while preserving the Phase 1/2 stage bound.
+    const triggerFailure = state.failures.find((failure) => failure.eventId === activeCause.triggerEventId);
+    const handlerStage = handlerStageForLevel(activeCause.level);
+    if (
+      triggerFailure !== undefined &&
+      handlerStage === triggerFailure.stage &&
+      effectiveAttempts(state, triggerFailure.stage) >= limitForStage(triggerFailure.stage, policy)
+    ) {
+      const next = nextEscalationLevel(activeCause.level);
+      return next === null
+        ? { kind: 'park', reason: 'awaiting-human', detail: `failure cause ${activeCause.causeId} reached human escalation`, account: null }
+        : action(state, 'advance-escalation', { taskId: activeCause.taskId, causeId: activeCause.causeId, level: next, bucket });
+    }
+    if (activeCause.level === 'coder' && activeCause.taskId !== null && state.tasks !== null) {
+      const task = state.tasks.records[activeCause.taskId];
+      const latest = Object.values(state.oracleSweeps)
+        .filter((sweep) => sweep.scope === 'task' && sweep.taskId === activeCause.taskId && sweep.implementationEventId === task?.implementation?.eventId)
+        .at(-1);
+      if (used > 0 && (latest === undefined || latest.causeId !== activeCause.causeId || latest.outcome === 'running')) {
+        return action(state, 'task-oracle', { taskId: activeCause.taskId, causeId: activeCause.causeId });
+      }
+      if (latest?.causeId === activeCause.causeId && latest.outcome === 'passed') {
+        // A non-accepting review is durable remediation failure, not an instruction to keep
+        // retrying accept-task.  The completed Coder attempt already consumed this cause's
+        // bucket; retry its invalidation or advance the finite ladder.
+        if (task?.review !== null && task?.reviewAccepted !== true) {
+          return used >= bucketLimit(bucket, policy.limits)
+            ? action(state, 'advance-escalation', { taskId: activeCause.taskId, causeId: activeCause.causeId, level: nextEscalationLevel(activeCause.level)!, bucket })
+            : action(state, 'invalidate-artifacts', { taskId: activeCause.taskId, causeId: activeCause.causeId, level: activeCause.level, bucket });
+        }
+        return task?.review === null
+          ? action(state, 'review-task', { taskId: activeCause.taskId })
+          : action(state, 'accept-task', { taskId: activeCause.taskId });
+      }
+    }
+    if (used >= bucketLimit(bucket, policy.limits)) {
+      const next = nextEscalationLevel(activeCause.level);
+      return next === null
+        ? { kind: 'park', reason: 'awaiting-human', detail: `failure cause ${activeCause.causeId} reached human escalation`, account: null }
+        : action(state, 'advance-escalation', { taskId: activeCause.taskId, causeId: activeCause.causeId, level: next, bucket });
+    }
+    return action(state, 'invalidate-artifacts', { taskId: activeCause.taskId, causeId: activeCause.causeId, level: activeCause.level, bucket });
+  }
+  // A completed test-authoring artifact activates the v3 task runtime. Keeping the old path
+  // when no task graph exists preserves replay of Phase 1/2 snapshots and table rows.
+  if (state.tasks === null || state.tasks === undefined) {
+    if (state.artifacts.taskGraph !== null && state.artifacts.taskGraph !== undefined) {
+      return action(state, 'activate-task-graph');
+    }
+    // An accepted upstream remediation invalidates the graph and then re-enters its normal
+    // stage sequence. Those regenerated stages must not inherit the old global stage quota;
+    // their finite bound is the causal ladder that led here.
+    if (((state.frozenTests !== null && state.frozenTests !== undefined) || (state.lastInvalidation ?? null) !== null) && state.stage !== 'done') {
+      return {
+        kind: 'run',
+        stage: state.stage,
+        attempt: effectiveAttempts(state, state.stage) + 1,
+        needsHuman: false,
+      };
+    }
+    return null;
+  }
+  if (state.frozenTests === null || state.frozenTests === undefined) {
+    return (state.lastInvalidation ?? null) === null
+      ? null
+      : {
+          kind: 'run',
+          stage: state.stage,
+          attempt: effectiveAttempts(state, state.stage) + 1,
+          needsHuman: false,
+        };
+  }
+  if (!Object.values(state.workspaceCheckpoints ?? {}).some((checkpoint) => checkpoint.kind === 'tests-frozen')) {
+    return action(state, 'checkpoint-tests');
+  }
+
+  const currentTaskId = state.tasks.currentTaskId;
+  if (currentTaskId === null) {
+    const pending = state.tasks.order.find((id) => state.tasks?.records[id]?.status === 'pending');
+    if (pending !== undefined) return action(state, 'start-task', { taskId: pending });
+    if (state.integration.status === 'pending' || state.integration.status === 'failed') return action(state, 'integration-oracle');
+    if (state.integration.status === 'passed' && state.integration.finalPatch === null) return action(state, 'capture-final-patch');
+    return state.integration.finalPatch === null
+      ? action(state, 'integration-oracle')
+      : { kind: 'done', outcome: 'completed' };
+  }
+
+  const task = state.tasks.records[currentTaskId];
+  if (task === undefined) return null;
+  if (task.implementation === null) {
+    return { kind: 'run', stage: 'implementation', attempt: effectiveAttempts(state, 'implementation') + 1, needsHuman: false };
+  }
+  const sweep = completedTaskSweep(state, currentTaskId, task.implementation.eventId);
+  if (sweep === null || sweep === 'failed') return action(state, 'task-oracle', { taskId: currentTaskId, causeId: null });
+  if (task.review === null) {
+    return action(state, 'review-task', { taskId: currentTaskId });
+  }
+  return action(state, 'accept-task', { taskId: currentTaskId });
 }
 
 /**
@@ -152,6 +341,9 @@ export function nextStage(state: WorkItemState, policy: StagePolicy): StageDecis
       return { kind: 'park', reason: 'provider-quota', detail, account };
     }
   }
+
+  const v3 = v3Decision(state, policy);
+  if (v3 !== null) return v3;
 
   // 8. effectiveAttempts(state, stage) >= limitForStage(stage, policy)
   //    -> park('attempts-exhausted', detail, null). detail byte-identical to Phase 1.

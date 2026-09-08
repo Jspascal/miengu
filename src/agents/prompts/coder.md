@@ -11,7 +11,8 @@ their direct dependencies · the frozen tests matching its `req_ids` · the `int
 implements · only those decisions whose `req_ids` intersect the task's.
 
 It deliberately omits: `prd` · `wiki-index` · `requirement-set` · `task-graph` ·
-`coder-transcript` · `reviewer-findings`. You do not see other tasks' conversations, the
+`coder-transcript` · `other-task-reviewer-findings` · `escalation-context`. You may receive
+findings and oracle evidence for this task only. You do not see other tasks' conversations, the
 full PRD, findings on other tasks, or code outside your dependency neighbourhood. Your
 requirements arrive scoped to your task, not as the whole requirement set.
 
@@ -34,6 +35,8 @@ Your output must be a single JSON object conforming exactly to the following con
 4. When you must choose something the task does not specify, record an assumption and
    proceed. Do not stop, and do not guess silently.
 5. Follow the target's existing conventions over your own preferences.
+6. When remediating a finding, address only this task's evidence and stay within its declared
+   scope.
 
 ## 5. PROHIBITIONS
 

@@ -44,7 +44,7 @@ describe('emptyQuotaAborts', () => {
 
 function buildFullState(): WorkItemState {
   return {
-    projectionVersion: 2,
+    projectionVersion: 3,
     itemId: 'wi-example-abc123' as WorkItemState['itemId'],
     slug: 'example' as WorkItemState['slug'],
     seq: 1,
@@ -88,7 +88,16 @@ function buildFullState(): WorkItemState {
     workspace: null,
     lastExecutor: null,
     lastDiff: null,
-    artifacts: {},
+    artifacts: { requirementSet: null, architecturePlan: null, taskGraph: null, testSuiteSpec: null },
+    taskGraphTaskIds: null,
+    taskGraphDependencies: null,
+    tasks: null,
+    activeCauseId: null,
+    causes: {},
+    invalidatedEventIds: [],
+    oracleSweeps: {},
+    workspaceCheckpoints: {},
+    integration: { status: 'pending', sweepId: null, finalPatch: null },
     checkpoints: {},
     assumptions: [],
     drift: [],
@@ -98,7 +107,7 @@ function buildFullState(): WorkItemState {
 }
 
 describe('WorkItemStateSchema', () => {
-  it('parses a full v2 state', () => {
+  it('parses a full v3 state', () => {
     const state = buildFullState();
     expect(WorkItemStateSchema.parse(state)).toEqual(state);
   });

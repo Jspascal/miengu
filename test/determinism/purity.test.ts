@@ -21,7 +21,7 @@ function tsAt(n: number): string {
 
 function mkEvent(seq: number, type: EventType, data: unknown): MienguEvent {
   return MienguEventSchema.parse({
-    schema_version: 2,
+    schema_version: 3,
     event_id: hexId('evt', seq),
     seq,
     item_id: ITEM_ID,
@@ -67,7 +67,6 @@ function executorInvoked(seq: number, stage: Stage, account: (typeof ACCOUNTS)[n
     validation_attempt: 1,
     context_pack_id: null,
     context_pack_estimated_tokens: null,
-    session_id: null,
     resolved: { model: null, effort: null, max_turns: 10, context_budget_tokens: 1000 },
     budget: { max_turns: 10, max_wall_seconds: 60 },
     command_line: ['stub'],

@@ -114,6 +114,11 @@ function readAndBumpCounter() {
 
 async function main() {
   const args = process.argv.slice(2);
+  const mode = process.env['FAKE_CODEX_MODE'] ?? 'success';
+  if (mode === 'hang') {
+    // Install before any async setup so the timeout test cannot race the handler.
+    process.on('SIGTERM', () => {});
+  }
   if (args.includes('--version')) {
     process.stdout.write('codex-cli 0.149.1 (fake-codex)\n');
     process.exit(0);
@@ -133,8 +138,6 @@ async function main() {
     outputLastMessageIndex >= 0 ? args[outputLastMessageIndex + 1] : undefined;
 
   await drainStdin();
-
-  const mode = process.env['FAKE_CODEX_MODE'] ?? 'success';
 
   const writeFinalMessage = (text) => {
     if (outputLastMessagePath !== undefined) {
@@ -318,7 +321,6 @@ async function main() {
     }
     case 'hang': {
       // deliberately ignores SIGTERM to exercise miengu's SIGKILL ladder
-      process.on('SIGTERM', () => {});
       emit({ type: 'thread.started', thread_id: THREAD_ID });
       emit({ type: 'turn.started' });
       await sleep(600_000);

@@ -90,12 +90,13 @@ export function failureReasonFor(
 }
 
 /**
- * `intake` / `integration`: complete immediately with no executor (binding decision 5).
+ * `intake` completes immediately with no executor. Integration is an oracle sweep owned
+ * by the loop, not an agent or a no-op stage.
  * Any other stage is a caller defect — there is no supervisor-only handling for an
  * agent-run stage.
  */
 export function runSupervisorStage(stage: Stage): StageOutcome {
-  if (stage === 'intake' || stage === 'integration') {
+  if (stage === 'intake') {
     return { kind: 'completed', artifact: null, derived: [], executorResult: null };
   }
   throw new AgentError(`runSupervisorStage: "${stage}" is not a supervisor-only stage`, { stage });

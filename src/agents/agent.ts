@@ -5,13 +5,14 @@ import type { IdMinter } from '../core/idgen.js';
 import { sha256Canonical } from '../core/hash.js';
 import type {
   ArtifactKind,
+  EscalationLevel,
   ExecutorType,
   Role,
   SandboxIntent,
   Stage,
   StageFailureReason,
 } from '../core/events.js';
-import type { AccountId, Slug, WorkItemId } from '../core/ids.js';
+import type { AccountId, EventId, Slug, WorkItemId } from '../core/ids.js';
 import type { AppendInput } from '../core/log.js';
 import { AgentError } from '../errors.js';
 import { contractFor } from '../contracts/index.js';
@@ -39,7 +40,7 @@ import { reviewerModule } from './reviewer.js';
  */
 export type AppendFn = (
   input: Omit<AppendInput, 'causationId'>,
-) => Promise<{ readonly ts: IsoTimestamp }>;
+) => Promise<{ readonly ts: IsoTimestamp; readonly eventId: EventId }>;
 
 /**
  * Raw pack materials this phase has no fetcher for (wiki index generation, file-map
@@ -63,7 +64,10 @@ export interface RawPackMaterials {
   readonly frozenTestBodies: readonly { readonly path: string; readonly body: string }[];
   readonly diff: string | null;
   readonly oracleResults: string | null;
-  readonly reviewerFindings: string | null;
+  /** Findings from the selected task only; no raw field exists for other-task findings. */
+  readonly currentTaskReviewerFindings: string | null;
+  /** Safe escalation facts, reduced further for each upstream recipient. */
+  readonly escalationContext: EscalationContext | null;
   readonly assumptions: readonly {
     readonly question: string;
     readonly chosen: string;
@@ -71,11 +75,40 @@ export interface RawPackMaterials {
   }[];
 }
 
+export interface EscalationContext {
+  readonly category: string;
+  readonly affectedRequirementIds: readonly ReqId[];
+  readonly summary: string;
+  readonly componentIds: readonly string[];
+  readonly t1OracleSummaries: readonly string[];
+  readonly taskIds: readonly string[];
+  readonly currentTaskReviewerFindings: string | null;
+}
+
+/** §7's role-specific, body-free escalation disclosure. */
+export function renderEscalationContext(
+  role: 'analyst' | 'architect' | 'planner',
+  context: EscalationContext,
+): string {
+  const base = {
+    category: context.category,
+    affected_requirement_ids: context.affectedRequirementIds,
+    summary: context.summary,
+  };
+  if (role === 'analyst') return JSON.stringify(base, null, 2);
+  if (role === 'architect') {
+    return JSON.stringify({ ...base, component_ids: context.componentIds, t1_oracle_summaries: context.t1OracleSummaries }, null, 2);
+  }
+  return JSON.stringify({ ...base, task_ids: context.taskIds, current_task_reviewer_findings: context.currentTaskReviewerFindings }, null, 2);
+}
+
 export interface PackBuildInput {
   readonly itemId: WorkItemId;
   readonly checkContext: CheckContext;
   /** The dispatched task (binding decision 6), for the Coder and the Reviewer. */
   readonly task: TaskGraph['tasks'][number] | null;
+  readonly activeT1OracleFailure: boolean;
+  readonly activeCauseLevel: EscalationLevel | null;
   readonly raw: RawPackMaterials;
 }
 
@@ -113,7 +146,7 @@ export interface RoleModule {
   readonly artifactKind: ArtifactKind;
   buildCandidates(i: PackBuildInput): readonly ContextPackSection[];
   buildTaskSection(i: PackBuildInput): string;
-  validate(artifact: unknown, c: CheckContext): readonly string[];
+  validate(artifact: unknown, c: CheckContext, pack: PackBuildInput): readonly string[];
   postStep(i: PostStepInput): Promise<PostStepResult>;
 }
 
@@ -552,7 +585,7 @@ async function validateArtifact(
     return { ok: false, errors };
   }
 
-  const mechanicalErrors = i.module.validate(result.data, i.checkContext);
+  const mechanicalErrors = i.module.validate(result.data, i.checkContext, i.pack);
   if (mechanicalErrors.length > 0) {
     await appendValidationFailed(i, validationAttempt, 'mechanical', mechanicalErrors);
     return { ok: false, errors: mechanicalErrors };
@@ -582,4 +615,3 @@ async function appendValidationFailed(
     actor: { kind: 'supervisor', id: null },
   });
 }
-

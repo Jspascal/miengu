@@ -27,7 +27,9 @@ export const PACK_SOURCE_KINDS = [
   'oracle-results',
   'assumptions',
   'coder-transcript',
-  'reviewer-findings',
+  'current-task-reviewer-findings',
+  'other-task-reviewer-findings',
+  'escalation-context',
 ] as const;
 export type PackSourceKind = (typeof PACK_SOURCE_KINDS)[number];
 
@@ -58,7 +60,10 @@ function rolePolicy(
  */
 export const ROLE_PACK_POLICY = {
   analyst: rolePolicy(
-    ['prd', 'wiki-index', 'existing-req-ids', 'prior-out-of-scope', 'stack-facts', 'requirement-set', 'assumptions'],
+    [
+      'prd', 'wiki-index', 'existing-req-ids', 'prior-out-of-scope', 'stack-facts',
+      'requirement-set', 'assumptions', 'escalation-context',
+    ],
     ['prd'],
     [
       'system-skeleton',
@@ -75,7 +80,8 @@ export const ROLE_PACK_POLICY = {
       'diff',
       'oracle-results',
       'coder-transcript',
-      'reviewer-findings',
+      'current-task-reviewer-findings',
+      'other-task-reviewer-findings',
     ],
   ),
   architect: rolePolicy(
@@ -93,6 +99,7 @@ export const ROLE_PACK_POLICY = {
       'test-conventions',
       'frozen-test-list',
       'assumptions',
+      'escalation-context',
     ],
     ['requirement-set'],
     [
@@ -104,7 +111,8 @@ export const ROLE_PACK_POLICY = {
       'diff',
       'oracle-results',
       'coder-transcript',
-      'reviewer-findings',
+      'current-task-reviewer-findings',
+      'other-task-reviewer-findings',
     ],
   ),
   planner: rolePolicy(
@@ -125,9 +133,13 @@ export const ROLE_PACK_POLICY = {
       'frozen-test-list',
       'oracle-results',
       'assumptions',
+      'escalation-context',
     ],
     ['requirement-set', 'architecture-decisions', 'architecture-components', 'architecture-interfaces'],
-    ['prd', 'frozen-test-bodies', 'source-files', 'diff', 'coder-transcript', 'reviewer-findings'],
+    [
+      'prd', 'frozen-test-bodies', 'source-files', 'diff', 'coder-transcript',
+      'current-task-reviewer-findings', 'other-task-reviewer-findings',
+    ],
   ),
   testAuthor: rolePolicy(
     [
@@ -155,7 +167,9 @@ export const ROLE_PACK_POLICY = {
       'diff',
       'oracle-results',
       'coder-transcript',
-      'reviewer-findings',
+      'current-task-reviewer-findings',
+      'other-task-reviewer-findings',
+      'escalation-context',
     ],
   ),
   coder: rolePolicy(
@@ -176,9 +190,13 @@ export const ROLE_PACK_POLICY = {
       'diff',
       'oracle-results',
       'assumptions',
+      'current-task-reviewer-findings',
     ],
     ['task', 'frozen-test-bodies', 'architecture-interfaces'],
-    ['prd', 'wiki-index', 'requirement-set', 'task-graph', 'coder-transcript', 'reviewer-findings'],
+    [
+      'prd', 'wiki-index', 'requirement-set', 'task-graph', 'coder-transcript',
+      'other-task-reviewer-findings', 'escalation-context',
+    ],
   ),
   reviewer: rolePolicy(
     [
@@ -198,10 +216,13 @@ export const ROLE_PACK_POLICY = {
       'diff',
       'oracle-results',
       'assumptions',
-      'reviewer-findings',
+      'current-task-reviewer-findings',
     ],
     ['diff', 'requirement-set', 'frozen-test-list'],
-    ['prd', 'task-graph', 'frozen-test-bodies', 'source-files', 'coder-transcript'],
+    [
+      'prd', 'task-graph', 'frozen-test-bodies', 'source-files', 'coder-transcript',
+      'other-task-reviewer-findings', 'escalation-context',
+    ],
   ),
 } satisfies Record<Role, RolePackPolicy>;
 

@@ -14,6 +14,14 @@ import {
   STAGES,
   TARGET_MODES,
   VALIDATION_FAILURE_KINDS,
+  ESCALATION_LEVELS,
+  FAILURE_KINDS,
+  FAILURE_ATTEMPT_BUCKETS,
+  ORACLE_KINDS,
+  ORACLE_SCOPES,
+  ORACLE_RESULT_STATUSES,
+  WORKSPACE_CHECKPOINT_KINDS,
+  INVALIDATION_TARGETS,
 } from '../core/events.js';
 import type {
   ArtifactKind,
@@ -30,6 +38,14 @@ import type {
   StageFailureReason,
   TargetMode,
   ValidationFailureKind,
+  EscalationLevel,
+  FailureKind,
+  FailureAttemptBucket,
+  OracleKind,
+  OracleScope,
+  OracleResultStatus,
+  WorkspaceCheckpointKind,
+  InvalidationTarget,
 } from '../core/events.js';
 import {
   AccountIdSchema,
@@ -43,6 +59,8 @@ import {
   SuiteIdSchema,
   TaskIdSchema,
   WorkItemIdSchema,
+  ComponentIdSchema,
+  ReqIdSchema,
 } from '../core/ids.js';
 import type {
   AccountId,
@@ -56,9 +74,14 @@ import type {
   SuiteId,
   TaskId,
   WorkItemId,
+  CauseId,
+  OracleSweepId,
+  WorkspaceCheckpointId,
+  ComponentId,
+  ReqId,
 } from '../core/ids.js';
 
-export const PROJECTION_VERSION = 2;
+export const PROJECTION_VERSION = 3;
 
 export const STAGE_ORDER: readonly Stage[] = STAGES;
 
@@ -168,6 +191,91 @@ export interface ArtifactRef {
   sha256: string;
   stage: Stage;
   eventId: EventId;
+  /** Durable event order, used to reject acceptance from a stale checkpoint. */
+  seq?: number;
+}
+
+export interface ActiveArtifacts {
+  readonly requirementSet: ArtifactRef | null;
+  readonly architecturePlan: ArtifactRef | null;
+  readonly taskGraph: ArtifactRef | null;
+  readonly testSuiteSpec: ArtifactRef | null;
+}
+
+export interface WorkspaceCheckpointState {
+  readonly eventId: WorkspaceCheckpointId;
+  readonly kind: WorkspaceCheckpointKind;
+  readonly taskId: TaskId | null;
+  readonly parentCommit: string;
+  readonly commit: string;
+  readonly patch: { sha256: string; path: string; bytes: number } | null;
+  /** Durable event order, used to prove this checkpoint follows the accepted evidence. */
+  readonly seq?: number;
+}
+
+export interface TaskExecutionState {
+  readonly taskId: TaskId;
+  readonly orderIndex: number;
+  readonly status: 'pending' | 'active' | 'accepted';
+  readonly implementation: ArtifactRef | null;
+  readonly review: ArtifactRef | null;
+  /** Copied from the durable ReviewVerdict artifact for replay-time acceptance checks. */
+  readonly reviewAccepted: boolean | null;
+  readonly acceptedAt: IsoTimestamp | null;
+  readonly checkpoint: WorkspaceCheckpointState | null;
+}
+
+export interface TaskRuntimeState {
+  readonly taskGraphEventId: EventId;
+  readonly activationEventId: EventId;
+  readonly order: readonly TaskId[];
+  readonly currentTaskId: TaskId | null;
+  readonly records: Readonly<Record<TaskId, TaskExecutionState>>;
+}
+
+export interface FailureCauseState {
+  readonly causeId: CauseId;
+  readonly triggerEventId: EventId;
+  readonly parentCauseId: CauseId | null;
+  readonly kind: FailureKind;
+  readonly taskId: TaskId | null;
+  readonly status: 'active' | 'resolved' | 'human';
+  readonly level: EscalationLevel;
+  readonly affects: { readonly reqIds: readonly ReqId[]; readonly componentIds: readonly ComponentId[]; readonly taskIds: readonly TaskId[] };
+  readonly attempts: Readonly<Record<FailureAttemptBucket, number>>;
+  readonly exhausted: readonly FailureAttemptBucket[];
+  readonly openedAt: IsoTimestamp;
+  readonly resolvedAt: IsoTimestamp | null;
+}
+
+export interface OracleResultState {
+  readonly eventId: EventId;
+  readonly kind: OracleKind;
+  readonly status: OracleResultStatus;
+  readonly command: string | null;
+  readonly commandSha256: string | null;
+  readonly exitCode: number | null;
+  readonly signal: string | null;
+  readonly durationMs: number;
+  readonly stdout: { sha256: string; path: string; bytes: number };
+  readonly stderr: { sha256: string; path: string; bytes: number };
+}
+
+export interface OracleSweepState {
+  readonly sweepId: OracleSweepId;
+  readonly scope: OracleScope;
+  readonly taskId: TaskId | null;
+  /** Immutable command declaration from OracleSweepStarted. */
+  readonly commands: readonly { readonly kind: OracleKind; readonly command: string | null; readonly sha256: string | null }[];
+  /** The active implementation when this task sweep began; null for integration. */
+  readonly implementationEventId: EventId | null;
+  readonly causeId: CauseId | null;
+  readonly resultEventIds: readonly EventId[];
+  readonly results: readonly OracleResultState[];
+  readonly outcome: 'running' | 'passed' | 'failed' | 'aborted';
+  readonly failedKind: OracleKind | null;
+  /** Sequence of OracleSweepCompleted; absent only in legacy/synthetic projection state. */
+  readonly completedSeq?: number;
 }
 
 export interface BudgetLedger {
@@ -248,6 +356,8 @@ export interface WorkItemState {
   readonly slug: Slug;
   readonly seq: number;
   readonly lastEventId: EventId | null;
+  /** Every event ID folded into this state; needed to validate durable causal references. */
+  readonly priorEventIds?: readonly EventId[];
   readonly createdAt: IsoTimestamp;
   readonly updatedAt: IsoTimestamp;
   readonly title: string;
@@ -297,7 +407,24 @@ export interface WorkItemState {
     deletions: number;
     committedDuringRun: boolean;
   } | null;
-  readonly artifacts: Readonly<Partial<Record<Stage, ArtifactRef>>>;
+  readonly artifacts: ActiveArtifacts;
+  /** Task IDs from the active TaskGraph artifact, retained for activation integrity checks. */
+  readonly taskGraphTaskIds: readonly TaskId[] | null;
+  /** Dependency edges retained with the graph so replay can validate its durable scheduler order. */
+  readonly taskGraphDependencies: Readonly<Record<TaskId, readonly TaskId[]>> | null;
+  readonly tasks: TaskRuntimeState | null;
+  readonly activeCauseId: CauseId | null;
+  readonly causes: Readonly<Record<CauseId, FailureCauseState>>;
+  readonly invalidatedEventIds: readonly EventId[];
+  /** Most recent invalidation boundary, retained to validate its following workspace rebuild. */
+  readonly lastInvalidation?: { readonly causeId: CauseId; readonly target: InvalidationTarget; readonly taskIds: readonly TaskId[] } | null;
+  readonly oracleSweeps: Readonly<Record<OracleSweepId, OracleSweepState>>;
+  readonly workspaceCheckpoints: Readonly<Record<WorkspaceCheckpointId, WorkspaceCheckpointState>>;
+  readonly integration: {
+    status: 'pending' | 'running' | 'passed' | 'failed';
+    sweepId: OracleSweepId | null;
+    finalPatch: { sha256: string; path: string; bytes: number } | null;
+  };
   readonly checkpoints: Readonly<Record<string, CheckpointStateRecord>>;
   readonly assumptions: readonly AssumptionRecord[];
   readonly drift: readonly {
@@ -520,22 +647,48 @@ const ArtifactRefSchema = z
     sha256: z.string(),
     stage: z.enum(STAGES),
     eventId: EventIdSchema,
+    seq: z.number().int().positive().optional(),
   })
   .strict();
 
-const ArtifactsSchema = z
+const ActiveArtifactsSchema = z
   .object({
-    intake: ArtifactRefSchema.optional(),
-    analysis: ArtifactRefSchema.optional(),
-    architecture: ArtifactRefSchema.optional(),
-    planning: ArtifactRefSchema.optional(),
-    'test-authoring': ArtifactRefSchema.optional(),
-    implementation: ArtifactRefSchema.optional(),
-    review: ArtifactRefSchema.optional(),
-    integration: ArtifactRefSchema.optional(),
-    done: ArtifactRefSchema.optional(),
+    requirementSet: ArtifactRefSchema.nullable(),
+    architecturePlan: ArtifactRefSchema.nullable(),
+    taskGraph: ArtifactRefSchema.nullable(),
+    testSuiteSpec: ArtifactRefSchema.nullable(),
   })
   .strict();
+
+const EvidenceRefSchema = z.object({ sha256: z.string(), path: z.string(), bytes: z.number().int().nonnegative() }).strict();
+const WorkspaceCheckpointStateSchema = z.object({
+  eventId: EventIdSchema, kind: z.enum(WORKSPACE_CHECKPOINT_KINDS), taskId: TaskIdSchema.nullable(),
+  parentCommit: z.string(), commit: z.string(), patch: EvidenceRefSchema.nullable(), seq: z.number().int().positive().optional(),
+}).strict();
+const TaskExecutionStateSchema = z.object({
+  taskId: TaskIdSchema, orderIndex: z.number().int().nonnegative(), status: z.enum(['pending', 'active', 'accepted']),
+  implementation: ArtifactRefSchema.nullable(), review: ArtifactRefSchema.nullable(),
+  reviewAccepted: z.boolean().nullable(),
+  acceptedAt: IsoTimestampSchema.nullable(), checkpoint: WorkspaceCheckpointStateSchema.nullable(),
+}).strict();
+const TaskRuntimeStateSchema = z.object({
+  taskGraphEventId: EventIdSchema, activationEventId: EventIdSchema, order: z.array(TaskIdSchema),
+  currentTaskId: TaskIdSchema.nullable(), records: z.record(TaskIdSchema, TaskExecutionStateSchema),
+}).strict().nullable();
+const FailureAttemptsSchema = z.object({ oracle: z.number().int().nonnegative(), test: z.number().int().nonnegative(), review: z.number().int().nonnegative(), reviewer: z.number().int().nonnegative(), planner: z.number().int().nonnegative(), architect: z.number().int().nonnegative(), analyst: z.number().int().nonnegative() }).strict();
+const FailureCauseStateSchema = z.object({
+  causeId: EventIdSchema, triggerEventId: EventIdSchema, parentCauseId: EventIdSchema.nullable(), kind: z.enum(FAILURE_KINDS), taskId: TaskIdSchema.nullable(), status: z.enum(['active', 'resolved', 'human']), level: z.enum(ESCALATION_LEVELS),
+  affects: z.object({ reqIds: z.array(ReqIdSchema), componentIds: z.array(ComponentIdSchema), taskIds: z.array(TaskIdSchema) }).strict(),
+  attempts: FailureAttemptsSchema, exhausted: z.array(z.enum(FAILURE_ATTEMPT_BUCKETS)), openedAt: IsoTimestampSchema, resolvedAt: IsoTimestampSchema.nullable(),
+}).strict();
+const LastInvalidationSchema = z.object({ causeId: EventIdSchema, target: z.enum(INVALIDATION_TARGETS), taskIds: z.array(TaskIdSchema) }).strict().nullable().optional();
+const OracleResultStateSchema = z.object({
+  eventId: EventIdSchema, kind: z.enum(ORACLE_KINDS), status: z.enum(ORACLE_RESULT_STATUSES), command: z.string().nullable(), commandSha256: z.string().nullable(), exitCode: z.number().int().nullable(), signal: z.string().nullable(), durationMs: z.number().int().nonnegative(), stdout: EvidenceRefSchema, stderr: EvidenceRefSchema,
+}).strict();
+const OracleSweepStateSchema = z.object({
+  sweepId: EventIdSchema, scope: z.enum(ORACLE_SCOPES), taskId: TaskIdSchema.nullable(), commands: z.array(z.object({ kind: z.enum(ORACLE_KINDS), command: z.string().nullable(), sha256: z.string().nullable() }).strict()), implementationEventId: EventIdSchema.nullable(), causeId: EventIdSchema.nullable(), resultEventIds: z.array(EventIdSchema), results: z.array(OracleResultStateSchema), outcome: z.enum(['running', 'passed', 'failed', 'aborted']), failedKind: z.enum(ORACLE_KINDS).nullable(), completedSeq: z.number().int().positive().optional(),
+}).strict();
+const IntegrationStateSchema = z.object({ status: z.enum(['pending', 'running', 'passed', 'failed']), sweepId: EventIdSchema.nullable(), finalPatch: EvidenceRefSchema.nullable() }).strict();
 
 const CheckpointStateRecordSchema = z
   .object({
@@ -605,6 +758,7 @@ export const WorkItemStateSchema = z
     slug: SlugSchema,
     seq: z.number().int().positive(),
     lastEventId: EventIdSchema.nullable(),
+    priorEventIds: z.array(EventIdSchema).optional(),
     createdAt: IsoTimestampSchema,
     updatedAt: IsoTimestampSchema,
     title: z.string(),
@@ -625,7 +779,17 @@ export const WorkItemStateSchema = z
     workspace: WorkspaceStateSchema,
     lastExecutor: LastExecutorStateSchema,
     lastDiff: LastDiffStateSchema,
-    artifacts: ArtifactsSchema,
+    artifacts: ActiveArtifactsSchema,
+    taskGraphTaskIds: z.array(TaskIdSchema).nullable(),
+    taskGraphDependencies: z.record(TaskIdSchema, z.array(TaskIdSchema)).nullable(),
+    tasks: TaskRuntimeStateSchema,
+    activeCauseId: EventIdSchema.nullable(),
+    causes: z.record(EventIdSchema, FailureCauseStateSchema),
+    invalidatedEventIds: z.array(EventIdSchema),
+    lastInvalidation: LastInvalidationSchema,
+    oracleSweeps: z.record(EventIdSchema, OracleSweepStateSchema),
+    workspaceCheckpoints: z.record(EventIdSchema, WorkspaceCheckpointStateSchema),
+    integration: IntegrationStateSchema,
     checkpoints: z.record(z.string(), CheckpointStateRecordSchema),
     assumptions: z.array(AssumptionRecordSchema),
     drift: z.array(DriftRecordSchema),

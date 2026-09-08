@@ -732,32 +732,34 @@ describe('Phase 2 acceptance: the ten delta criteria', () => {
           targetRepo,
         });
 
-        await runItem(deps);
-        const events = await log.readAll();
+        try {
+          await runItem(deps);
+          const events = await log.readAll();
 
-        const mechanicalFailures = events.filter(
-          (e) => e.type === 'ArtifactValidationFailed' && e.data.stage === 'planning' && e.data.kind === 'mechanical',
-        );
-        // maxAttemptsPerStage: 2 grants 2 real attempts at `planning`; each attempt's own
-        // internal retry (§9.1b) fails mechanical validation twice, so 2 attempts * 2
-        // validation rounds = 4 ArtifactValidationFailed(mechanical) events for the stage.
-        expect(mechanicalFailures.length).toBe(4);
-        for (const failure of mechanicalFailures) {
-          if (failure.type === 'ArtifactValidationFailed') {
-            expect(failure.data.errors).toContain(scenario.expectedMessage);
+          const mechanicalFailures = events.filter(
+            (e) => e.type === 'ArtifactValidationFailed' && e.data.stage === 'planning' && e.data.kind === 'mechanical',
+          );
+          // maxAttemptsPerStage: 2 grants 2 real attempts at `planning`; each attempt's own
+          // internal retry (§9.1b) fails mechanical validation twice, so 2 attempts * 2
+          // validation rounds = 4 ArtifactValidationFailed(mechanical) events for the stage.
+          expect(mechanicalFailures.length).toBe(4);
+          for (const failure of mechanicalFailures) {
+            if (failure.type === 'ArtifactValidationFailed') {
+              expect(failure.data.errors).toContain(scenario.expectedMessage);
+            }
           }
+
+          const invokedForPlanning = events.filter((e) => e.type === 'ExecutorInvoked' && e.data.stage === 'planning');
+          expect(invokedForPlanning).toHaveLength(4);
+
+          const stageFailed = events.find((e) => e.type === 'StageFailed' && e.data.stage === 'planning');
+          expect(stageFailed).toBeDefined();
+          if (stageFailed?.type === 'StageFailed') {
+            expect(stageFailed.data.reason).toBe('validation-failed');
+          }
+        } finally {
+          await log.close();
         }
-
-        const invokedForPlanning = events.filter((e) => e.type === 'ExecutorInvoked' && e.data.stage === 'planning');
-        expect(invokedForPlanning).toHaveLength(4);
-
-        const stageFailed = events.find((e) => e.type === 'StageFailed' && e.data.stage === 'planning');
-        expect(stageFailed).toBeDefined();
-        if (stageFailed?.type === 'StageFailed') {
-          expect(stageFailed.data.reason).toBe('validation-failed');
-        }
-
-        await log.close();
       } finally {
         await rm(targetRepo, { recursive: true, force: true });
         await rm(storeDir, { recursive: true, force: true });
@@ -1064,7 +1066,8 @@ describe('Phase 2 acceptance: the ten delta criteria', () => {
           frozenTestBodies: [],
           diff: null,
           oracleResults: null,
-          reviewerFindings: null,
+          currentTaskReviewerFindings: null,
+          escalationContext: null,
           assumptions: [],
         },
       });

@@ -23,6 +23,10 @@ interface StatusRow {
   readonly stage: string | null;
   readonly status: string | null;
   readonly attemptsOnStage: number | null;
+  readonly currentTaskId: string | null;
+  readonly activeCauseId: string | null;
+  readonly activeCauseLevel: string | null;
+  readonly causalAttempts: Record<string, number> | null;
   readonly park: StatusPark | null;
   readonly updatedAt: string | null;
 }
@@ -37,6 +41,10 @@ async function buildRow(storeDir: string, itemId: WorkItemId): Promise<StatusRow
       stage: state.stage,
       status: state.status,
       attemptsOnStage: state.attempts[state.stage],
+      currentTaskId: state.tasks?.currentTaskId ?? null,
+      activeCauseId: state.activeCauseId,
+      activeCauseLevel: state.activeCauseId === null ? null : (state.causes[state.activeCauseId]?.level ?? null),
+      causalAttempts: state.activeCauseId === null ? null : (state.causes[state.activeCauseId]?.attempts ?? null),
       park:
         state.park === null
           ? null
@@ -56,6 +64,10 @@ async function buildRow(storeDir: string, itemId: WorkItemId): Promise<StatusRow
       stage: null,
       status: null,
       attemptsOnStage: null,
+      currentTaskId: null,
+      activeCauseId: null,
+      activeCauseLevel: null,
+      causalAttempts: null,
       park: null,
       updatedAt: null,
     };
@@ -79,6 +91,10 @@ function pad(value: string, width: number): string {
   return value.length >= width ? value : value + ' '.repeat(width - value.length);
 }
 
+function renderCausalAttempts(attempts: Record<string, number> | null): string {
+  return attempts === null ? '' : Object.entries(attempts).map(([bucket, count]) => `${bucket}=${String(count)}`).join(',');
+}
+
 /**
  * Enumerates `.miengu/items/*` and, for each, opens read-only (no lock): `latestValid` + tail
  * events. One corrupt item is reported as `CORRUPT` with its error and does not fail the whole
@@ -100,7 +116,7 @@ export async function statusCommand(options: StatusCommandOptions): Promise<numb
     return anyCorrupt ? EXIT.STORE : EXIT.OK;
   }
 
-  const header = `${pad('ITEM', 24)}${pad('STAGE', 16)}${pad('STATUS', 12)}${pad('ATTEMPTS', 10)}${pad('PARK', 20)}UPDATED`;
+  const header = `${pad('ITEM', 24)}${pad('STAGE', 16)}${pad('STATUS', 12)}${pad('ATTEMPTS', 10)}${pad('TASK', 18)}${pad('CAUSE', 18)}${pad('CAUSE ATTEMPTS', 64)}${pad('PARK', 20)}UPDATED`;
   const lines = [header];
   for (const row of rows) {
     if (row.corrupt) {
@@ -108,7 +124,7 @@ export async function statusCommand(options: StatusCommandOptions): Promise<numb
       continue;
     }
     lines.push(
-      `${pad(row.itemId, 24)}${pad(row.stage ?? '', 16)}${pad(row.status ?? '', 12)}${pad(String(row.attemptsOnStage ?? ''), 10)}${pad(renderPark(row.park), 20)}${row.updatedAt ?? ''}`,
+      `${pad(row.itemId, 24)}${pad(row.stage ?? '', 16)}${pad(row.status ?? '', 12)}${pad(String(row.attemptsOnStage ?? ''), 10)}${pad(row.currentTaskId ?? '', 18)}${pad(row.activeCauseId === null ? '' : `${row.activeCauseId}:${row.activeCauseLevel ?? ''}`, 18)}${pad(renderCausalAttempts(row.causalAttempts), 64)}${pad(renderPark(row.park), 20)}${row.updatedAt ?? ''}`,
     );
   }
   process.stdout.write(`${lines.join('\n')}\n`);

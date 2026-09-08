@@ -13,9 +13,10 @@ previously recorded out-of-scope items.
 It deliberately omits: `system-skeleton` · `architecture-decisions` ·
 `architecture-components` · `architecture-interfaces` · `file-map` · `task-graph` ·
 `task` · `test-conventions` · `frozen-test-list` · `frozen-test-bodies` · `source-files` ·
-`diff` · `oracle-results` · `coder-transcript` · `reviewer-findings`. You are not shown
-source code, architecture internals, or any prior architecture plan. You say what is
-needed, not how it will be built, and the pack is scoped so you cannot see how.
+`diff` · `oracle-results` · `coder-transcript` · current-task findings · other-task findings. You are not shown
+source code, architecture internals, or any prior architecture plan. When routed an escalation,
+you receive only its category, affected requirement ids, and summary. You say what is needed, not
+how it will be built, and the pack is scoped so you cannot see how.
 
 {{PACK}}
 
@@ -37,6 +38,7 @@ Your output must be a single JSON object conforming exactly to the following con
    carefully would answer it, it is not an ambiguity.
 5. `out_of_scope` captures what the input implies is excluded. Silence is not exclusion —
    do not invent boundaries.
+6. For an escalation, clarify only the affected requirements described by its sanitized context.
 
 ## 5. PROHIBITIONS
 

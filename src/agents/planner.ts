@@ -2,6 +2,7 @@ import type { TaskGraph } from '../contracts/index.js';
 import type { ContextPackSection } from '../wiki/contextpack.js';
 import { checkTaskGraph } from './checks.js';
 import type { CheckContext } from './checks.js';
+import { renderEscalationContext } from './agent.js';
 import type { PackBuildInput, PostStepInput, PostStepResult, RoleModule } from './agent.js';
 
 function section(
@@ -60,6 +61,9 @@ export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[
   }
   if (i.raw.assumptions.length > 0) {
     sections.push(section('assumptions', 'Recorded assumptions', JSON.stringify(i.raw.assumptions, null, 2)));
+  }
+  if (i.raw.escalationContext !== null) {
+    sections.push(section('escalation-context', 'Escalation context', renderEscalationContext('planner', i.raw.escalationContext)));
   }
   return sections;
 }

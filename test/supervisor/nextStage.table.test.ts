@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { canonicalJson } from '../../src/core/canonical.js';
 import { IsoTimestampSchema } from '../../src/core/clock.js';
 import { STAGES } from '../../src/core/events.js';
-import type { AccountId, Stage } from '../../src/core/events.js';
+import type { AccountId, EscalationLevel, FailureAttemptBucket, Stage } from '../../src/core/events.js';
 import {
   AccountIdSchema,
   CheckpointIdSchema,
@@ -17,6 +17,7 @@ import type { StageDecision, StagePolicy } from '../../src/supervisor/nextStage.
 import { EMPTY_LEDGER } from '../../src/supervisor/budget.js';
 import { PROJECTION_VERSION, emptyAttempts, emptyQuotaAborts } from '../../src/state/workitem.js';
 import type { WorkItemState } from '../../src/state/workitem.js';
+import { bucketLimit, escalationRank } from '../../src/supervisor/escalation.js';
 
 const GOLDEN_PATH = fileURLToPath(new URL('../golden/nextStage.table.json', import.meta.url));
 const PHASE1_NONPARK_PATH = fileURLToPath(
@@ -507,5 +508,123 @@ describe('nextStage: 486-row Phase 2 account-aware guard table', () => {
       openBlockingCheckpoint: false,
     });
     expect(decision).toEqual({ kind: 'run', stage: 'analysis', attempt: 1, needsHuman: false });
+  });
+});
+
+// --- Phase 3 dimensions: causal attempts and task runtime ---
+// This is generated, not a hand-maintained routing matrix. It deliberately leaves the Phase 1
+// and 2 goldens untouched: their states have no activated graph and remain replay-compatible.
+const LEVELS = ['coder', 'reviewer', 'planner', 'architect', 'analyst', 'human'] as const;
+const BUCKETS = ['oracle', 'test', 'review', 'reviewer', 'planner', 'architect', 'analyst'] as const;
+const TASK_STATUSES = ['pending', 'active', 'accepted'] as const;
+const ORACLE_STATUSES = ['none', 'passed', 'failed'] as const;
+type TaskStatus = (typeof TASK_STATUSES)[number];
+type OracleStatus = (typeof ORACLE_STATUSES)[number];
+
+function v3State(values: {
+  readonly level: EscalationLevel;
+  readonly bucket: FailureAttemptBucket;
+  readonly count: 'zero' | 'limit-minus-one' | 'limit';
+  readonly taskStatus: TaskStatus;
+  readonly oracle: OracleStatus;
+  readonly budgetExhausted: boolean;
+  readonly checkpoint: boolean;
+  readonly terminal: boolean;
+}): WorkItemState {
+  const limit = bucketLimit(values.bucket, POLICY.limits);
+  const attempts = values.count === 'zero' ? 0 : values.count === 'limit-minus-one' ? limit - 1 : limit;
+  const base = buildState({ stage: 'implementation', status: values.terminal ? 'completed' : 'active', budgetExhausted: values.budgetExhausted ? 'budget-caused' : 'none', attempts: 0, openBlockingCheckpoint: values.checkpoint });
+  const taskId = 'task-a' as WorkItemState['itemId'] as never;
+  const causeId = 'evt-00000000-0000-4000-8000-000000000001' as WorkItemState['lastEventId'];
+  const task = { taskId, orderIndex: 0, status: values.taskStatus, implementation: values.taskStatus === 'pending' ? null : { kind: 'implementation' as const, sha256: 'b'.repeat(64), stage: 'implementation' as const, eventId: EVENT_ID }, review: null, acceptedAt: null, checkpoint: null };
+  const sweep = values.oracle === 'none' ? {} : { [EVENT_ID]: { sweepId: EVENT_ID, scope: 'task' as const, taskId, implementationEventId: EVENT_ID, causeId, resultEventIds: [], results: [], outcome: values.oracle, failedKind: values.oracle === 'failed' ? 'test' as const : null } };
+  return {
+    ...base,
+    artifacts: { requirementSet: null, architecturePlan: null, taskGraph: { kind: 'task-graph', sha256: 'c'.repeat(64), stage: 'planning', eventId: EVENT_ID }, testSuiteSpec: null },
+    frozenTests: { suiteId: 'suite-a' as never, contentHash: 'd'.repeat(64), files: [], frozenCopyDir: 'frozen', at: TIMESTAMP },
+    tasks: { taskGraphEventId: EVENT_ID, activationEventId: EVENT_ID, order: [taskId], currentTaskId: values.taskStatus === 'active' ? taskId : null, records: { [taskId]: task } },
+    activeCauseId: values.level === 'coder' && values.oracle === 'none' ? null : causeId,
+    causes: values.level === 'coder' && values.oracle === 'none' ? {} : { [causeId!]: { causeId: causeId!, triggerEventId: EVENT_ID, parentCauseId: null, kind: values.bucket === 'oracle' ? 'oracle' : values.bucket === 'test' ? 'test' : 'review-revision', taskId, status: values.level === 'human' ? 'human' : 'active', level: values.level, affects: { reqIds: [], componentIds: [], taskIds: [taskId] }, attempts: { oracle: values.bucket === 'oracle' ? attempts : 0, test: values.bucket === 'test' ? attempts : 0, review: values.bucket === 'review' ? attempts : 0, reviewer: values.bucket === 'reviewer' ? attempts : 0, planner: values.bucket === 'planner' ? attempts : 0, architect: values.bucket === 'architect' ? attempts : 0, analyst: values.bucket === 'analyst' ? attempts : 0 }, exhausted: [], openedAt: TIMESTAMP, resolvedAt: null } },
+    oracleSweeps: sweep,
+    integration: { status: 'pending', sweepId: null, finalPatch: null },
+  };
+}
+
+describe('nextStage: generated Phase 3 causal routing table', () => {
+  const rows = [] as Array<{
+    level: EscalationLevel; bucket: FailureAttemptBucket; count: 'zero' | 'limit-minus-one' | 'limit';
+    taskStatus: TaskStatus; oracle: OracleStatus; budgetExhausted: boolean; checkpoint: boolean; terminal: boolean;
+  }>;
+  for (const level of LEVELS) for (const bucket of BUCKETS) for (const count of ['zero', 'limit-minus-one', 'limit'] as const) for (const taskStatus of TASK_STATUSES) for (const oracle of ORACLE_STATUSES) for (const budgetExhausted of [false, true]) for (const checkpoint of [false, true]) {
+    rows.push({ level, bucket, count, taskStatus, oracle, budgetExhausted, checkpoint, terminal: false });
+  }
+
+  it('covers the deterministic causal cross-product', () => {
+    expect(rows).toHaveLength(4536);
+  });
+
+  it('preserves terminal, budget, and checkpoint precedence before causal routing', () => {
+    expect(nextStage(v3State({ ...rows[0]!, terminal: true }), POLICY)).toEqual({ kind: 'done', outcome: 'completed' });
+    expect(nextStage(v3State({ ...rows[0]!, budgetExhausted: true }), POLICY).kind).toBe('park');
+    expect(nextStage(v3State({ ...rows[0]!, checkpoint: true }), POLICY).kind).toBe('checkpoint');
+  });
+
+  it('never lowers a cause rank and exhaustions advance one rung', () => {
+    for (const row of rows) {
+      const decision = nextStage(v3State(row), POLICY);
+      if (decision.action === 'advance-escalation') {
+        expect(decision.level).toBeDefined();
+        expect(escalationRank(decision.level!)).toBeGreaterThan(escalationRank(row.level));
+      }
+    }
+  });
+
+  it('uses finite action choices for every generated state', () => {
+    for (const row of rows) {
+      const decision = nextStage(v3State(row), POLICY);
+      expect(['run', 'park', 'checkpoint', 'done']).toContain(decision.kind);
+      if (decision.kind === 'run' && decision.action !== undefined) {
+        expect(['activate-task-graph', 'checkpoint-tests', 'start-task', 'task-oracle', 'review-task', 'accept-task', 'invalidate-artifacts', 'advance-escalation', 'integration-oracle', 'capture-final-patch']).toContain(decision.action);
+      }
+    }
+  });
+
+  it('advances an exhausted originating handler rather than parking or invoking it again', () => {
+    const base = v3State({ level: 'planner', bucket: 'planner', count: 'zero', taskStatus: 'active', oracle: 'passed', budgetExhausted: false, checkpoint: false, terminal: false });
+    const causeId = base.activeCauseId!;
+    const exhausted: WorkItemState = {
+      ...base,
+      stage: 'planning',
+      attempts: { ...base.attempts, planning: POLICY.limits.maxAttemptsPerStage },
+      failures: [{
+        stage: 'planning', attempt: POLICY.limits.maxAttemptsPerStage,
+        reason: 'validation-failed', detail: 'invalid task graph', at: TIMESTAMP, eventId: EVENT_ID,
+      }],
+      causes: {
+        ...base.causes,
+        [causeId]: { ...base.causes[causeId]!, triggerEventId: EVENT_ID },
+      },
+    };
+    expect(nextStage(exhausted, POLICY)).toMatchObject({
+      kind: 'run', action: 'advance-escalation', causeId, level: 'architect',
+    });
+  });
+
+  it('runs a new task sweep after a corrective Coder implementation supersedes a failed causal sweep', () => {
+    const before = v3State({ level: 'coder', bucket: 'oracle', count: 'limit-minus-one', taskStatus: 'active', oracle: 'failed', budgetExhausted: false, checkpoint: false, terminal: false });
+    const replacement = EventIdSchema.parse('evt-00000000-0000-4000-8000-000000000002');
+    const taskId = before.tasks!.currentTaskId!;
+    const task = before.tasks!.records[taskId]!;
+    const corrected: WorkItemState = {
+      ...before,
+      tasks: {
+        ...before.tasks!,
+        records: {
+          ...before.tasks!.records,
+          [taskId]: { ...task, implementation: { ...task.implementation!, eventId: replacement }, review: null },
+        },
+      },
+    };
+    expect(nextStage(corrected, POLICY)).toMatchObject({ kind: 'run', action: 'task-oracle', taskId });
   });
 });

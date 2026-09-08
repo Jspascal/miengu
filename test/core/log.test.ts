@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventLog, itemPaths, listItemIds } from '../../src/core/log.js';
@@ -58,6 +58,16 @@ afterEach(async () => {
 });
 
 describe('EventLog', () => {
+  it('create initializes every item-layout directory, including oracle evidence', async () => {
+    const { log } = await EventLog.create(makeOptions(storeDir, itemId, 'layout-dirs'));
+    const paths = itemPaths(storeDir, itemId);
+    await Promise.all([
+      access(paths.snapshotsDir), access(paths.transcriptsDir), access(paths.diffsDir),
+      access(paths.oraclesDir), access(paths.workspacesDir),
+    ]);
+    await log.close();
+  });
+
   it('append -> read round trip preserves order and seq', async () => {
     const { log } = await EventLog.create(makeOptions(storeDir, itemId, 'seed-a'));
     await log.append(WORK_ITEM_CREATED);
@@ -168,6 +178,49 @@ describe('EventLog', () => {
     const { log: second } = await EventLog.open(forcedOptions);
     expect(second.lastSeq).toBe(1);
     await second.close();
+    await first.close();
+  });
+
+  it('refuses writable open of a valid v2 log without rewriting its durable bytes', async () => {
+    const { log } = await EventLog.create(makeOptions(storeDir, itemId, 'v2-read-only'));
+    await log.append(WORK_ITEM_CREATED);
+    await log.append(budgetConsumed());
+    await log.close();
+    const paths = itemPaths(storeDir, itemId);
+    const v2 = (await readFile(paths.eventsFile, 'utf8')).trim().split('\n').map((line) => {
+      const event = JSON.parse(line) as Record<string, unknown>;
+      return JSON.stringify({ ...event, schema_version: 2 });
+    }).join('\n').concat('\n');
+    await writeFile(paths.eventsFile, v2, 'utf8');
+    await expect(EventLog.open(makeOptions(storeDir, itemId, 'v2-read-only'))).rejects.toBeInstanceOf(StoreError);
+    expect(await readFile(paths.eventsFile, 'utf8')).toBe(v2);
+    await expect(readFile(paths.lockFile, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('refuses a torn v2 tail without truncating bytes or acquiring a lock', async () => {
+    const { log } = await EventLog.create(makeOptions(storeDir, itemId, 'v2-bad-type'));
+    await log.append(WORK_ITEM_CREATED);
+    await log.close();
+    const paths = itemPaths(storeDir, itemId);
+    const event = JSON.parse((await readFile(paths.eventsFile, 'utf8')).trim()) as Record<string, unknown>;
+    const tornV2 = `${JSON.stringify({ ...event, schema_version: 2 })}\n${JSON.stringify({ ignored: 'torn tail' }).slice(0, -7)}`;
+    await writeFile(paths.eventsFile, tornV2, 'utf8');
+
+    await expect(EventLog.open(makeOptions(storeDir, itemId, 'v2-bad-type'))).rejects.toBeInstanceOf(StoreError);
+    expect(await readFile(paths.eventsFile, 'utf8')).toBe(tornV2);
+    await expect(readFile(paths.lockFile, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('does not misclassify a v3 payload mentioning schema_version 2 as a v2 envelope', async () => {
+    const { log } = await EventLog.create(makeOptions(storeDir, itemId, 'v3-payload-version'));
+    await log.append({
+      ...WORK_ITEM_CREATED,
+      data: { ...WORK_ITEM_CREATED.data, title: 'payload says "schema_version": 2' },
+    });
+    await log.close();
+    const reopened = await EventLog.open(makeOptions(storeDir, itemId, 'v3-payload-version'));
+    expect(reopened.log.lastSeq).toBe(1);
+    await reopened.log.close();
   });
 });
 
