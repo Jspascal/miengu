@@ -73,7 +73,7 @@ afterEach(async () => {
   await rm(storeDir, { recursive: true, force: true });
 });
 
-function makeConfig(overrides: { maxWallSecondsPerInvocation?: number; snapshotEvery?: number; failBuildOracle?: boolean; oneAttemptPerRung?: boolean; oracles?: Record<'build' | 'typecheck' | 'lint' | 'test', string | null> } = {}) {
+function makeConfig(overrides: { maxWallSecondsPerInvocation?: number; snapshotEvery?: number; failBuildOracle?: boolean; oneAttemptPerRung?: boolean; oracles?: Record<'build' | 'typecheck' | 'lint' | 'test', string | null>; checkpoints?: unknown } = {}) {
   return MienguConfigSchema.parse({
     target: { repo: targetRepo },
     accounts: { 'stub-account': {} },
@@ -107,6 +107,7 @@ function makeConfig(overrides: { maxWallSecondsPerInvocation?: number; snapshotE
     oracles: overrides.oracles ?? (overrides.failBuildOracle ? { build: 'node -e "process.exit(1)"' } : {}),
     limits: overrides.oneAttemptPerRung ? { kOracle: 1, kTest: 1, kReview: 1, maxAttemptsPerStage: 1 } : {},
     store: { snapshotEvery: overrides.snapshotEvery ?? 200 },
+    ...(overrides.checkpoints !== undefined ? { checkpoints: overrides.checkpoints } : {}),
   });
 }
 
@@ -1014,15 +1015,16 @@ describe('runItem: sandbox enforcement', () => {
     });
 
     try {
-      const result = await runItem(deps);
+      await runItem(deps);
       const events = await log.readAll();
       const failure = events.find(
         (e) => e.type === 'StageFailed' && e.data.reason === 'sandbox-violation' && e.data.stage === 'review',
       );
       expect(failure).toBeDefined();
-      expect(result.finalState.workspace).not.toBeNull();
-      if (result.finalState.workspace !== null) {
-        expect(await readFile(join(result.finalState.workspace.workdir, 'test/a.test.ts'), 'utf8')).toBe('test body A\n');
+      const prepared = events.find((e) => e.type === 'WorkspacePrepared');
+      expect(prepared).toBeDefined();
+      if (prepared?.type === 'WorkspacePrepared') {
+        expect(await readFile(join(prepared.data.workdir, 'test/a.test.ts'), 'utf8')).toBe('test body A\n');
       }
     } finally {
       await log.close();
@@ -1418,6 +1420,65 @@ describe('runItem: account budget exhaustion', () => {
   });
 });
 
+describe('runItem: resume after a workspace was prepared and discarded', () => {
+  it('re-prepares a fresh workspace on resume instead of reusing the discarded one, and completes', async () => {
+    const itemId = WorkItemIdSchema.parse('wi-resume-fresh1');
+    const script: StubScript = {
+      steps: [
+        {
+          status: 'completed',
+          telemetry: { turns: 1, inputTokens: null, outputTokens: null, cacheReadTokens: null, cacheCreationTokens: null, wallSeconds: 9999 },
+          finalMessage: JSON.stringify(REQUIREMENT_SET),
+        },
+      ],
+    };
+    const scripts = happyPathScripts();
+    scripts.analyst = script;
+    const baseConfig = makeConfig();
+    const lowLimitConfig = MienguConfigSchema.parse({
+      ...baseConfig,
+      accounts: { 'stub-account': { maxWallSecondsPerItem: 10 } },
+    });
+
+    const { deps, log } = await makeDeps({
+      itemId,
+      seed: 'loop-resume',
+      executors: makeStubRegistry(scripts, 'loop-resume-exec'),
+      config: lowLimitConfig,
+    });
+
+    const first = await runItem(deps);
+    expect(first.outcome).toBe('parked');
+    expect(first.finalState.park?.reason).toBe('budget-exhausted');
+
+    const eventsAfterPark = await log.readAll();
+    expect(eventsAfterPark.filter((e) => e.type === 'WorkspacePrepared')).toHaveLength(1);
+    expect(eventsAfterPark.at(-1)?.type).toBe('WorkspaceDiscarded');
+
+    // Resuming raises the account's wall-time cap, exactly as an operator clearing a
+    // budget-exhausted park would; the ledger itself (already over the OLD cap) never resets.
+    await log.append({
+      type: 'WorkItemResumed',
+      data: { previous_reason: 'budget-exhausted', detail: 'operator raised the account limit', account: ACCOUNT },
+      actor: { kind: 'human', id: null },
+      causationId: log.lastEventId,
+    });
+    const highLimitConfig = MienguConfigSchema.parse({
+      ...baseConfig,
+      accounts: { 'stub-account': { maxWallSecondsPerItem: 1_000_000 } },
+    });
+    const resumedDeps: RunItemDeps = { ...deps, config: highLimitConfig, policy: policyFromConfig(highLimitConfig) };
+
+    const second = await runItem(resumedDeps);
+    expect(second.outcome).toBe('completed');
+
+    const finalEvents = await log.readAll();
+    expect(finalEvents.filter((e) => e.type === 'WorkspacePrepared')).toHaveLength(2);
+
+    await log.close();
+  });
+});
+
 describe('runItem: determinism', () => {
   it('two identical runs with the same fixedClock/fixedRng produce byte-identical events.jsonl', async () => {
     async function runOnce(itemId: ReturnType<typeof WorkItemIdSchema.parse>): Promise<Buffer> {
@@ -1443,6 +1504,130 @@ describe('runItem: determinism', () => {
     const second = await runOnce(itemId);
 
     expect(second.equals(first)).toBe(true);
+  });
+});
+
+describe('runItem: blast-radius classification (Phase 5)', () => {
+  it('a blocking blast-radius trigger raises exactly one checkpoint whose causation_id is the invocation\'s DiffCaptured event id, and the item parks', async () => {
+    const itemId = WorkItemIdSchema.parse('wi-example-blast1');
+    const scripts = happyPathScripts();
+    scripts.coder = completedStep(IMPLEMENTATION, { 'src/sensitive-file.ts': 'touches a sensitive surface\n' });
+    const { deps, log } = await makeDeps({
+      itemId,
+      seed: 'loop-blast-blocking',
+      executors: makeStubRegistry(scripts, 'loop-blast-blocking-exec'),
+      config: makeConfig({ checkpoints: { blastRadius: { sensitivePaths: ['src/sensitive-file.ts'] } } }),
+    });
+
+    const result = await runItem(deps);
+    const events = await log.readAll();
+
+    expect(result.outcome).toBe('parked');
+    expect(result.finalState.park?.reason).toBe('awaiting-human');
+
+    const raised = events.filter((e) => e.type === 'CheckpointRaised' && e.data.kind === 'blast-radius');
+    expect(raised).toHaveLength(1);
+    const checkpointEvent = raised[0];
+    expect(checkpointEvent?.data).toMatchObject({ blocking: true });
+
+    const diffCaptured = events.filter((e) => e.type === 'DiffCaptured');
+    // The coder stage's own DiffCaptured is the one carrying the new sensitive path.
+    const coderDiff = diffCaptured.find((e) => e.data.untracked.includes('src/sensitive-file.ts'));
+    expect(coderDiff).toBeDefined();
+    expect(checkpointEvent?.causation_id).toBe(coderDiff?.event_id ?? null);
+
+    await log.close();
+  });
+
+  it('a stage failure never classifies: no blast-radius checkpoint appears', async () => {
+    const itemId = WorkItemIdSchema.parse('wi-example-blast2');
+    const scripts = happyPathScripts();
+    scripts.architect = completedStep(ARCHITECTURE_PLAN, { 'leaked.txt': 'should not be here\n' });
+    const { deps, log } = await makeDeps({
+      itemId,
+      seed: 'loop-blast-failure',
+      executors: makeStubRegistry(scripts, 'loop-blast-failure-exec'),
+      config: makeConfig({
+        oneAttemptPerRung: true,
+        checkpoints: { blastRadius: { sensitivePaths: ['leaked.txt'] } },
+      }),
+    });
+
+    await runItem(deps);
+    const events = await log.readAll();
+    expect(events.some((e) => e.type === 'StageFailed' && e.data.reason === 'sandbox-violation')).toBe(true);
+    expect(events.some((e) => e.type === 'CheckpointRaised' && e.data.kind === 'blast-radius')).toBe(false);
+
+    await log.close();
+  });
+
+  it('a non-blocking trigger auto-approves after its declared SLA, never a CheckpointDecided, and a later cumulative diff raises no second checkpoint', async () => {
+    const itemId = WorkItemIdSchema.parse('wi-example-blast3');
+    const { deps, log } = await makeDeps({
+      itemId,
+      seed: 'loop-blast-sla',
+      executors: makeStubRegistry(happyPathScripts(), 'loop-blast-sla-exec'),
+      config: makeConfig({
+        checkpoints: {
+          reversible: { slaSeconds: 1, default: 'accept' },
+          blastRadius: { maxFilesTouched: 1 },
+        },
+      }),
+    });
+
+    const result = await runItem(deps);
+    const events = await log.readAll();
+
+    expect(result.outcome).toBe('completed');
+    const raised = events.filter((e) => e.type === 'CheckpointRaised' && e.data.kind === 'blast-radius');
+    expect(raised).toHaveLength(1);
+    expect(raised[0]?.data).toMatchObject({ blocking: false });
+
+    const autoApproved = events.filter((e) => e.type === 'AutoApproved');
+    expect(autoApproved).toHaveLength(1);
+    expect(autoApproved[0]?.data).toMatchObject({ checkpoint: raised[0]?.data.checkpoint, after: '1s', no_human_response: true });
+
+    // The audit trail never implies a human looked at something they did not.
+    expect(events.some((e) => e.type === 'CheckpointDecided')).toBe(false);
+
+    // The sweep runs before nextStage, so the AutoApproved is durable before whatever
+    // StageEntered the loop dispatches next.
+    const raisedIndex = events.findIndex((e) => e === raised[0]);
+    const autoApprovedIndex = events.findIndex((e) => e === autoApproved[0]);
+    const nextStageEnteredIndex = events.findIndex((e, i) => i > autoApprovedIndex && e.type === 'StageEntered');
+    expect(autoApprovedIndex).toBeGreaterThan(raisedIndex);
+    expect(nextStageEnteredIndex).toBeGreaterThan(autoApprovedIndex);
+
+    await log.close();
+  });
+
+  it('a blocking checkpoint never auto-approves however far the clock is advanced', async () => {
+    const itemId = WorkItemIdSchema.parse('wi-example-blast4');
+    const scripts = happyPathScripts();
+    scripts.coder = completedStep(IMPLEMENTATION, { 'src/sensitive-file.ts': 'touches a sensitive surface\n' });
+    const { deps, log } = await makeDeps({
+      itemId,
+      seed: 'loop-blast-noauto',
+      executors: makeStubRegistry(scripts, 'loop-blast-noauto-exec'),
+      config: makeConfig({ checkpoints: { blastRadius: { sensitivePaths: ['src/sensitive-file.ts'] } } }),
+    });
+
+    const first = await runItem(deps);
+    expect(first.outcome).toBe('parked');
+
+    // Advance the clock far beyond any plausible SLA, then let the loop run again: an
+    // irreversible/blocking checkpoint carries no SLA (binding decision 7), so it is never a
+    // `slaCandidates` member and can never auto-approve, however far the clock moves.
+    for (let i = 0; i < 100; i += 1) {
+      deps.clock.now();
+    }
+    const second = await runItem(deps);
+    expect(second.outcome).toBe('parked');
+
+    const events = await log.readAll();
+    expect(events.some((e) => e.type === 'AutoApproved')).toBe(false);
+
+    await log.close();
   });
 });
 

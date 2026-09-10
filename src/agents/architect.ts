@@ -1,4 +1,3 @@
-import { formatCheckpointId } from '../core/ids.js';
 import { sha256Canonical } from '../core/hash.js';
 import type { ArchitecturePlan } from '../contracts/index.js';
 import type { ContextPackSection } from '../wiki/contextpack.js';
@@ -8,6 +7,8 @@ import type { CheckContext } from './checks.js';
 import { renderEscalationContext } from './agent.js';
 import type { PackBuildInput, PostStepInput, PostStepResult, RoleModule } from './agent.js';
 import type { AppendInput } from '../core/log.js';
+import { assumptionGateDraft, checkpointDraft } from '../supervisor/checkpointPolicy.js';
+import type { CheckpointDraft } from '../supervisor/checkpointPolicy.js';
 
 /**
  * §15.2 pack: full `RequirementSet` · system skeleton · prior decisions · component map ·
@@ -80,9 +81,32 @@ export function validate(artifact: unknown, c: CheckContext): readonly string[] 
   return checkArchitecturePlan(artifact as ArchitecturePlan, c);
 }
 
+/** Maps a `CheckpointDraft` (`src/supervisor/checkpointPolicy.ts`) onto the snake_case
+ *  `CheckpointRaised` event shape. */
+function checkpointRaisedInput(draft: CheckpointDraft): AppendInput {
+  return {
+    type: 'CheckpointRaised',
+    data: {
+      checkpoint: draft.checkpoint,
+      kind: draft.kind,
+      stage: draft.stage,
+      summary: draft.summary,
+      blocking: draft.blocking,
+      sla_seconds: draft.slaSeconds,
+      default_decision: draft.defaultDecision,
+    },
+    actor: { kind: 'supervisor', id: null },
+    causationId: null,
+  };
+}
+
 /**
  * §15.2 post-step: decisions with `req_ids: []` are flagged `agent-originated`. Decisions
- * with `blast_radius: 'irreversible'` each raise one blocking `CheckpointRaised`.
+ * with `blast_radius: 'irreversible'` each raise one blocking `CheckpointRaised`, with ids
+ * continuing from `i.gate.nextCheckpointSerial` (binding decision 4: never a local counter)
+ * and their blocking/SLA/default chosen by `checkpointDraft`. When at least one such
+ * checkpoint was raised and an unresolved assumption exists with no `assumption-gate`
+ * already open, one blocking assumption-gate checkpoint is raised alongside it.
  */
 export function postStep(i: PostStepInput): Promise<PostStepResult> {
   const artifact = i.artifact as ArchitecturePlan;
@@ -104,26 +128,38 @@ export function postStep(i: PostStepInput): Promise<PostStepResult> {
     });
   }
 
-  let checkpointIndex = 0;
+  let serial = i.gate.nextCheckpointSerial;
+  let raisedBlocking = false;
   for (const decision of artifact.decisions) {
     if (decision.blast_radius !== 'irreversible') {
       continue;
     }
-    checkpointIndex += 1;
-    derived.push({
-      type: 'CheckpointRaised',
-      data: {
-        checkpoint: formatCheckpointId(i.slug, checkpointIndex),
-        kind: 'irreversible',
-        stage: 'architecture',
-        summary: `decision '${decision.decision_id}' is irreversible: ${decision.title}`,
-        blocking: true,
-        sla_seconds: null,
-        default_decision: null,
-      },
-      actor: { kind: 'supervisor', id: null },
-      causationId: null,
+    const draft = checkpointDraft({
+      serial,
+      slug: i.slug,
+      kind: 'irreversible',
+      stage: 'architecture',
+      summary: `decision '${decision.decision_id}' is irreversible: ${decision.title}`,
+      reversibility: 'irreversible',
+      policy: i.gate.policy,
     });
+    serial += 1;
+    raisedBlocking = raisedBlocking || draft.blocking;
+    derived.push(checkpointRaisedInput(draft));
+  }
+
+  if (raisedBlocking) {
+    const gateDraft = assumptionGateDraft({
+      serial,
+      slug: i.slug,
+      stage: 'architecture',
+      open: i.gate.openAssumptions,
+      checkpoints: i.gate.checkpoints,
+      policy: i.gate.policy,
+    });
+    if (gateDraft !== null) {
+      derived.push(checkpointRaisedInput(gateDraft));
+    }
   }
 
   return Promise.resolve({ kind: 'ok', body: artifact, derived });

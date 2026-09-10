@@ -2,6 +2,7 @@ import { access, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { assertNever } from '../core/events.js';
 import type { Actor, FailureAttemptBucket, RunOutcome, Stage } from '../core/events.js';
+import { epochSeconds } from '../core/clock.js';
 import type { Clock, IsoTimestamp } from '../core/clock.js';
 import type { IdMinter } from '../core/idgen.js';
 import { StoreError } from '../errors.js';
@@ -23,7 +24,7 @@ import type { StagePolicy } from './nextStage.js';
 import { runRoleStage, runSupervisorStage } from './stages.js';
 import type { StageRunContext } from './stages.js';
 import type { CheckContext } from '../agents/checks.js';
-import type { AppendFn, PackBuildInput, RawPackMaterials } from '../agents/agent.js';
+import type { AppendFn, GateContext, PackBuildInput, RawPackMaterials } from '../agents/agent.js';
 import type { ArchitecturePlan, RequirementSet, TaskGraph, TestSuiteSpec } from '../contracts/index.js';
 import type { AccountId, ExecutorInstanceId } from '../core/ids.js';
 import type { CauseId, EventId, TaskId } from '../core/ids.js';
@@ -34,6 +35,18 @@ import { checkpointAcceptedTask, checkpointFrozenTests, captureFinalPatch, rebui
 import { bucketLimit, classifyFailure, deterministicTaskOrder, escalationRank, invalidationClosure, nextEscalationLevel } from './escalation.js';
 import type { SupervisorAction } from './nextStage.js';
 import type { ReviewVerdict } from '../contracts/index.js';
+import { openAssumptions } from './assumptions.js';
+import { classifyBlastRadius, blastRadiusInput } from './blastRadius.js';
+import {
+  assumptionGateDraft,
+  autoApprovalAfter,
+  checkpointDraft,
+  gatePolicyFromConfig,
+  nextAssumptionSerial,
+  nextCheckpointSerial,
+  slaCandidates,
+} from './checkpointPolicy.js';
+import type { CheckpointDraft } from './checkpointPolicy.js';
 
 export const MAX_LOOP_ITERATIONS = 1000;
 
@@ -102,9 +115,9 @@ async function maybeSnapshot(
 async function appendEvent(
   deps: RunItemDeps,
   state: WorkItemState,
-  input: Omit<AppendInput, 'causationId'>,
+  input: Omit<AppendInput, 'causationId'> & { readonly causationId?: EventId | null },
 ): Promise<{ readonly state: WorkItemState; readonly ts: IsoTimestamp }> {
-  const event = await deps.log.append({ ...input, causationId: deps.log.lastEventId });
+  const event = await deps.log.append({ ...input, causationId: input.causationId ?? deps.log.lastEventId });
   const next = applyEvent(state, event);
   await maybeSnapshot(deps, next, false);
   return { state: next, ts: event.ts };
@@ -113,7 +126,7 @@ async function appendEvent(
 async function appendAndFold(
   deps: RunItemDeps,
   state: WorkItemState,
-  input: Omit<AppendInput, 'causationId'>,
+  input: Omit<AppendInput, 'causationId'> & { readonly causationId?: EventId | null },
 ): Promise<WorkItemState> {
   const { state: next } = await appendEvent(deps, state, input);
   return next;
@@ -125,7 +138,7 @@ async function finalize(
   outcome: RunOutcome,
 ): Promise<RunItemResult> {
   let finalState = state;
-  if (finalState.workspace !== null && !finalState.workspace.discarded) {
+  if (finalState.workspace !== null) {
     const ws: PreparedWorkspace = {
       mode: finalState.workspace.mode,
       targetRepo: finalState.workspace.targetRepo,
@@ -348,6 +361,28 @@ async function releaseLock(
   });
 }
 
+/** Maps a `CheckpointDraft` (`src/supervisor/checkpointPolicy.ts`) onto the snake_case
+ *  `CheckpointRaised` event shape. */
+function checkpointRaisedInput(
+  draft: CheckpointDraft,
+  causationId?: EventId,
+): Omit<AppendInput, 'causationId'> & { readonly causationId?: EventId } {
+  return {
+    type: 'CheckpointRaised',
+    data: {
+      checkpoint: draft.checkpoint,
+      kind: draft.kind,
+      stage: draft.stage,
+      summary: draft.summary,
+      blocking: draft.blocking,
+      sla_seconds: draft.slaSeconds,
+      default_decision: draft.defaultDecision,
+    },
+    actor: SUPERVISOR_ACTOR,
+    ...(causationId !== undefined ? { causationId } : {}),
+  };
+}
+
 /**
  * Executes one `run` decision to completion, per §3.23's fifteen normative steps:
  * `StageEntered` -> (supervisor-only stages complete immediately, no workspace/lock/executor)
@@ -475,6 +510,14 @@ async function performRunAttempt(
     raw,
   };
 
+  const gate: GateContext = {
+    nextCheckpointSerial: nextCheckpointSerial(state.checkpoints),
+    nextAssumptionSerial: nextAssumptionSerial(state.assumptions),
+    openAssumptions: openAssumptions(events),
+    checkpoints: state.checkpoints,
+    policy: gatePolicyFromConfig(deps.config),
+  };
+
   const append: AppendFn = async (input) => {
     const result = await appendEvent(deps, state, input);
     state = result.state;
@@ -506,6 +549,7 @@ async function performRunAttempt(
     schemasDir: deps.schemasDir,
     messagesDir: deps.messagesDir,
     append,
+    gate,
   };
 
   const outcome = await runRoleStage(decision.stage, ctx);
@@ -525,20 +569,22 @@ async function performRunAttempt(
   if (capture.committedDuringRun) {
     await deps.workspace.restoreDetached(workspaceInfo, before.headCommit);
   }
+  const diffCapturedData = {
+    workdir: workspaceInfo.workdir,
+    diff_sha256: capture.diffSha256,
+    diff_ref: null,
+    files_touched: [...capture.filesTouched],
+    untracked: [...capture.untracked],
+    insertions: capture.insertions,
+    deletions: capture.deletions,
+    committed_during_run: capture.committedDuringRun,
+  };
   state = await appendAndFold(deps, state, {
     type: 'DiffCaptured',
-    data: {
-      workdir: workspaceInfo.workdir,
-      diff_sha256: capture.diffSha256,
-      diff_ref: null,
-      files_touched: capture.filesTouched,
-      untracked: capture.untracked,
-      insertions: capture.insertions,
-      deletions: capture.deletions,
-      committed_during_run: capture.committedDuringRun,
-    },
+    data: diffCapturedData,
     actor: SUPERVISOR_ACTOR,
   });
+  const diffCapturedEventId = deps.log.lastEventId;
 
   // `untrackedSha256` covers untracked file BYTES, not just their names: rewriting an
   // existing untracked file (the category the Test Author creates, including a frozen test)
@@ -674,6 +720,51 @@ async function performRunAttempt(
     data: { stage: decision.stage, attempt: decision.attempt, artifact: outcome.artifact },
     actor: SUPERVISOR_ACTOR,
   });
+
+  // Blast-radius classification (binding decision 11): completion path only, after
+  // `StageCompleted` and before `releaseLock`. Never on a failure path (every failure path
+  // above returns before reaching here) and never from `outcome.artifact`. `capture()` is
+  // cumulative since the item's base commit, so a trigger already gated by an earlier
+  // `DiffCaptured` of this item is excluded from this checkpoint's coverage.
+  if (diffCapturedEventId !== null) {
+    const alreadyGated = new Set<string>();
+    for (const event of events) {
+      if (event.type !== 'DiffCaptured') continue;
+      for (const fired of classifyBlastRadius(blastRadiusInput(event.data), gate.policy.blastRadius).fired) {
+        alreadyGated.add(fired.trigger);
+      }
+    }
+    const verdict = classifyBlastRadius(blastRadiusInput(diffCapturedData), gate.policy.blastRadius);
+    const newFired = verdict.fired.filter((f) => !alreadyGated.has(f.trigger));
+    if (newFired.length > 0) {
+      const newBlocking = newFired.some((f) => f.severity === 'blocking');
+      const draft = checkpointDraft({
+        serial: nextCheckpointSerial(state.checkpoints),
+        slug: state.slug,
+        kind: 'blast-radius',
+        stage: decision.stage,
+        summary: `blast radius: ${newFired.map((f) => f.trigger).join(', ')}`,
+        reversibility: newBlocking ? 'irreversible' : 'reversible',
+        policy: gate.policy,
+      });
+      state = await appendAndFold(deps, state, checkpointRaisedInput(draft, diffCapturedEventId));
+
+      if (draft.blocking) {
+        const gateDraft = assumptionGateDraft({
+          serial: nextCheckpointSerial(state.checkpoints),
+          slug: state.slug,
+          stage: decision.stage,
+          open: gate.openAssumptions,
+          checkpoints: state.checkpoints,
+          policy: gate.policy,
+        });
+        if (gateDraft !== null) {
+          state = await appendAndFold(deps, state, checkpointRaisedInput(gateDraft));
+        }
+      }
+    }
+  }
+
   await releaseLock(deps, state, workspaceInfo.workdir, handle.executor.id, decision.stage);
 }
 
@@ -1084,7 +1175,8 @@ export async function runItem(deps: RunItemDeps): Promise<RunItemResult> {
   let iterations = 0;
   for (;;) {
     iterations += 1;
-    const state = project(await deps.log.readAll());
+    const events = await deps.log.readAll();
+    let state = project(events);
 
     if (deps.signal.aborted) {
       return finalize(deps, state, 'aborted');
@@ -1100,6 +1192,33 @@ export async function runItem(deps: RunItemDeps): Promise<RunItemResult> {
         actor: SUPERVISOR_ACTOR,
       });
       return finalize(deps, failed, 'failed');
+    }
+
+    // SLA sweep (binding decision 8): resolved here, before `nextStage`, so `nextStage`
+    // never observes an unresolved, expired checkpoint. `after` is the DECLARED SLA, never
+    // the observed elapsed time. An irreversible/blocking checkpoint is never a candidate
+    // (it carries no SLA), so this can never auto-approve one, however far the clock moves.
+    const candidates = slaCandidates(events, state);
+    if (candidates.length > 0) {
+      const now = deps.clock.now();
+      let autoApproved = false;
+      for (const candidate of candidates) {
+        if (epochSeconds(now) - epochSeconds(candidate.raisedAt) >= candidate.slaSeconds) {
+          state = await appendAndFold(deps, state, {
+            type: 'AutoApproved',
+            data: {
+              checkpoint: candidate.checkpoint,
+              after: autoApprovalAfter(candidate.slaSeconds),
+              no_human_response: true,
+            },
+            actor: SUPERVISOR_ACTOR,
+          });
+          autoApproved = true;
+        }
+      }
+      if (autoApproved) {
+        continue;
+      }
     }
 
     const decision = nextStage(state, deps.policy);
@@ -1150,23 +1269,18 @@ export async function runItem(deps: RunItemDeps): Promise<RunItemResult> {
         return finalize(deps, next, 'parked');
       }
       case 'checkpoint': {
-        let next = state;
-        const existing = next.checkpoints[decision.checkpoint];
+        // Guard 6 only ever returns an id whose record exists and is `open` — the single
+        // state-derived minting rule (binding decision 4) is what makes a collision, and
+        // therefore this branch, unreachable. A `CheckpointRaised` appended here would mint
+        // a `blast-radius` kind for an arbitrary checkpoint, which is worse than refusing.
+        const existing = state.checkpoints[decision.checkpoint];
         if (existing === undefined || existing.status !== 'open') {
-          next = await appendAndFold(deps, next, {
-            type: 'CheckpointRaised',
-            data: {
-              checkpoint: decision.checkpoint,
-              kind: 'blast-radius',
-              stage: decision.stage,
-              summary: `checkpoint ${decision.checkpoint} requires human review`,
-              blocking: true,
-              sla_seconds: null,
-              default_decision: null,
-            },
-            actor: SUPERVISOR_ACTOR,
-          });
+          throw new StoreError(
+            `nextStage returned checkpoint "${decision.checkpoint}" with no open record`,
+            { checkpoint: decision.checkpoint },
+          );
         }
+        let next = state;
         if (next.status !== 'parked') {
           next = await appendAndFold(deps, next, {
             type: 'WorkItemParked',

@@ -34,6 +34,21 @@ describe('CONFIG_TEMPLATE', () => {
     const parsed = MienguConfigSchema.parse(parseYaml(CONFIG_TEMPLATE));
     expect(parsed.oracles).toEqual({ build: null, test: null, lint: null, typecheck: null });
   });
+
+  it('ships a populated blast-radius starter block (binding decision 6)', () => {
+    const parsed = MienguConfigSchema.parse(parseYaml(CONFIG_TEMPLATE));
+    expect(parsed.checkpoints.defaultOwner).toBe('operator');
+    expect(parsed.checkpoints.reversible).toEqual({ slaSeconds: 86400, default: 'accept' });
+    expect(parsed.checkpoints.irreversible).toEqual({ slaSeconds: null, default: null });
+    expect(parsed.checkpoints.blastRadius.migrationOrSchemaPaths.length).toBeGreaterThan(0);
+    expect(parsed.checkpoints.blastRadius.sensitivePaths.length).toBeGreaterThan(0);
+    expect(parsed.checkpoints.blastRadius.externalContractPaths.length).toBeGreaterThan(0);
+    expect(parsed.checkpoints.blastRadius.protectedPaths.length).toBeGreaterThan(0);
+    expect(parsed.checkpoints.blastRadius.dependencyManifestPaths.length).toBeGreaterThan(0);
+    expect(parsed.checkpoints.blastRadius.severity['diff-size']).toBe('advisory');
+    expect(parsed.checkpoints.blastRadius.severity['migration-or-schema']).toBe('blocking');
+    expect(parsed.assumptions).toEqual({ maxStackDepth: 2 });
+  });
 });
 
 describe('renderConfigTemplate', () => {

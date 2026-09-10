@@ -8,9 +8,12 @@ import { runCommand } from '../../src/cli/commands/run.js';
 import { statusCommand } from '../../src/cli/commands/status.js';
 import { EXIT } from '../../src/cli/exit.js';
 import { EventLog, listItemIds, itemPaths } from '../../src/core/log.js';
+import { slugify } from '../../src/core/ids.js';
+import type { WorkItemId } from '../../src/core/ids.js';
 import { fixedClock } from '../../src/core/clock.js';
 import { createIdMinter, fixedRng } from '../../src/core/idgen.js';
 import { silentLogger } from '../../src/logging.js';
+import { loadConfig } from '../../src/config/load.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -75,6 +78,59 @@ afterEach(async () => {
   await rm(targetRepo, { recursive: true, force: true });
   await rm(workDir, { recursive: true, force: true });
 });
+
+/** Builds an item's log directly (`WorkItemCreated` -> `RunStarted` -> optional fixture
+ *  events -> `WorkItemParked`), bypassing `runCommand` entirely — the same convention
+ *  `test/cli/run.backlog.test.ts`'s `makeParkedItem` uses: `status` reads the store alone,
+ *  so it cannot distinguish a hand-built parked item from one a real run parked. */
+async function makeParkedItem(o: {
+  readonly title: string;
+  readonly seed: string;
+  readonly reason: 'operator-abort' | 'awaiting-human';
+  readonly resumable: boolean;
+  readonly beforePark?: (log: EventLog) => Promise<void>;
+}): Promise<WorkItemId> {
+  const loaded = await loadConfig(configPath);
+  const ids = createIdMinter(fixedRng(o.seed));
+  const slug = slugify(o.title);
+  const itemId = ids.workItemId(slug);
+  const runId = ids.runId();
+  const clock = fixedClock('2024-01-01T00:00:00.000Z');
+  const storeDir = join(workDir, '.miengu');
+
+  const { log } = await EventLog.create({ storeDir, itemId, runId, clock, ids, logger: silentLogger });
+  try {
+    await log.append({
+      type: 'WorkItemCreated',
+      data: {
+        title: o.title,
+        slug,
+        source: { kind: 'prd-file', path: `${o.title}.md`, sha256: 'a'.repeat(64), bytes: 1 },
+        config_hash: loaded.configHash,
+      },
+      actor: { kind: 'human', id: null },
+      causationId: null,
+    });
+    await log.append({
+      type: 'RunStarted',
+      data: { miengu_version: '0.1.0', node_version: process.version, config_hash: loaded.configHash, config: loaded.config },
+      actor: { kind: 'system', id: null },
+      causationId: log.lastEventId,
+    });
+    if (o.beforePark !== undefined) {
+      await o.beforePark(log);
+    }
+    await log.append({
+      type: 'WorkItemParked',
+      data: { reason: o.reason, detail: o.reason === 'operator-abort' ? 'sigint' : 'blocked', resumable: o.resumable, account: null, resets_at: null },
+      actor: { kind: 'system', id: null },
+      causationId: log.lastEventId,
+    });
+  } finally {
+    await log.close();
+  }
+  return itemId;
+}
 
 describe('statusCommand', () => {
   it('reports an item, exit 0', async () => {
@@ -179,5 +235,105 @@ describe('statusCommand', () => {
     }
     expect(output).toContain('CAUSE ATTEMPTS');
     expect(output).toContain('reviewer=1');
+  });
+
+  it('--json: a backlog-ready parked item reports resumable, zero open blocking checkpoints, blastRadiusDeclared false, and backlog.ready true with a null blocker', async () => {
+    const itemId = await makeParkedItem({
+      title: 'ready-item',
+      seed: 'status-backlog-ready',
+      reason: 'operator-abort',
+      resumable: true,
+    });
+
+    let output = '';
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      output += String(chunk);
+      return true;
+    });
+    let result: number;
+    try {
+      result = await statusCommand({ configPath, json: true });
+    } finally {
+      write.mockRestore();
+    }
+    expect(result).toBe(EXIT.OK);
+
+    const rows = JSON.parse(output.trim()) as {
+      itemId: string;
+      resumable: boolean | null;
+      openBlockingCheckpoints: number | null;
+      blastRadiusDeclared: boolean | null;
+      backlog: { ready: boolean; blocker: string | null } | null;
+    }[];
+    const row = rows.find((r) => r.itemId === itemId);
+    expect(row).toBeDefined();
+    expect(row?.resumable).toBe(true);
+    expect(row?.openBlockingCheckpoints).toBe(0);
+    expect(row?.blastRadiusDeclared).toBe(false);
+    expect(row?.backlog).toEqual({ ready: true, blocker: null });
+  });
+
+  it('--json and text: a parked item blocked on an open blocking checkpoint reports resumable, a non-zero openBlockingCheckpoints, and backlog.ready false with a non-null blocker; the text BACKLOG column names it', async () => {
+    const itemId = await makeParkedItem({
+      title: 'blocked-item',
+      seed: 'status-backlog-blocked',
+      reason: 'awaiting-human',
+      resumable: true,
+      beforePark: async (log) => {
+        await log.append({
+          type: 'CheckpointRaised',
+          data: {
+            checkpoint: 'cp-blocked-item-1',
+            kind: 'irreversible',
+            stage: 'architecture',
+            summary: 'irreversible decision',
+            blocking: true,
+            sla_seconds: null,
+            default_decision: null,
+          },
+          actor: { kind: 'supervisor', id: null },
+          causationId: log.lastEventId,
+        });
+      },
+    });
+
+    let jsonOutput = '';
+    const jsonWrite = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      jsonOutput += String(chunk);
+      return true;
+    });
+    let jsonResult: number;
+    try {
+      jsonResult = await statusCommand({ configPath, json: true });
+    } finally {
+      jsonWrite.mockRestore();
+    }
+    expect(jsonResult).toBe(EXIT.OK);
+
+    const rows = JSON.parse(jsonOutput.trim()) as {
+      itemId: string;
+      resumable: boolean | null;
+      openBlockingCheckpoints: number | null;
+      backlog: { ready: boolean; blocker: string | null } | null;
+    }[];
+    const row = rows.find((r) => r.itemId === itemId);
+    expect(row).toBeDefined();
+    expect(row?.resumable).toBe(true);
+    expect(row?.openBlockingCheckpoints).toBe(1);
+    expect(row?.backlog).toEqual({ ready: false, blocker: 'blocking-checkpoint-open' });
+
+    let textOutput = '';
+    const textWrite = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      textOutput += String(chunk);
+      return true;
+    });
+    try {
+      expect(await statusCommand({ configPath })).toBe(EXIT.OK);
+    } finally {
+      textWrite.mockRestore();
+    }
+    expect(textOutput).toContain('BACKLOG');
+    const itemLine = textOutput.split('\n').find((line) => line.startsWith(itemId));
+    expect(itemLine).toContain('blocking-checkpoint-open');
   });
 });

@@ -8,6 +8,10 @@ import type { CheckContext } from './checks.js';
 import { renderEscalationContext } from './agent.js';
 import type { PackBuildInput, PostStepInput, PostStepResult, RoleModule } from './agent.js';
 import type { AppendInput } from '../core/log.js';
+import { assumptionDepth, escalates } from '../supervisor/assumptions.js';
+import type { AssumptionFact } from '../supervisor/assumptions.js';
+import { checkpointDraft } from '../supervisor/checkpointPolicy.js';
+import type { CheckpointDraft } from '../supervisor/checkpointPolicy.js';
 
 /**
  * §15.1 pack: the request/PRD text · the wiki index (component names and one-line
@@ -57,30 +61,78 @@ export function validate(artifact: unknown, c: CheckContext): readonly string[] 
   return checkRequirementSet(artifact as RequirementSet, c);
 }
 
+/** Maps a `CheckpointDraft` (`src/supervisor/checkpointPolicy.ts`) onto the snake_case
+ *  `CheckpointRaised` event shape. */
+function checkpointRaisedInput(draft: CheckpointDraft): AppendInput {
+  return {
+    type: 'CheckpointRaised',
+    data: {
+      checkpoint: draft.checkpoint,
+      kind: draft.kind,
+      stage: draft.stage,
+      summary: draft.summary,
+      blocking: draft.blocking,
+      sla_seconds: draft.slaSeconds,
+      default_decision: draft.defaultDecision,
+    },
+    actor: { kind: 'supervisor', id: null },
+    causationId: null,
+  };
+}
+
 /**
  * §15.1 post-step. For each ambiguity, mint `AssumptionRecorded` choosing `recommended`
- * if present, else `options[0]`. `source_span: null` requirements are tagged `agent-originated`
- * on `ItemArtifactRecorded`. Never blocks — there is no failure path here.
+ * if present, else `options[0]`, with an id continuing from `i.gate.nextAssumptionSerial`
+ * (binding decision 4: never a local counter) and a real chain depth (binding decision 9).
+ * An ambiguity whose depth reaches the configured cap additionally raises one blocking
+ * `escalation` checkpoint; the assumption itself is still recorded, never withheld.
+ * `source_span: null` requirements are tagged `agent-originated` on `ItemArtifactRecorded`.
+ * Never blocks a stage — there is no failure path here.
  */
 export function postStep(i: PostStepInput): Promise<PostStepResult> {
   const artifact = i.artifact as RequirementSet;
   const derived: AppendInput[] = [];
 
+  // `open` accumulates each assumption minted earlier in this same batch, so a later
+  // ambiguity's depth can rest on an earlier one from the same array (binding decision 9).
+  let open: readonly AssumptionFact[] = i.gate.openAssumptions;
+  let checkpointSerial = i.gate.nextCheckpointSerial;
+
   artifact.ambiguities.forEach((ambiguity, index) => {
     const chosen = ambiguity.recommended ?? ambiguity.options[0] ?? '';
+    const id = formatAssumptionId(i.slug, i.gate.nextAssumptionSerial + index);
+    const depth = assumptionDepth(ambiguity.affects, open);
     derived.push({
       type: 'AssumptionRecorded',
       data: {
-        id: formatAssumptionId(i.slug, index + 1),
+        id,
         question: ambiguity.question,
         chosen,
         alternatives: ambiguity.options.filter((option) => option !== chosen),
         affects: ambiguity.affects,
-        depth: 0,
+        depth,
       },
       actor: { kind: 'supervisor', id: null },
       causationId: null,
     });
+    open = [
+      ...open,
+      { id, affects: ambiguity.affects, depth, resolved: false, seq: -1, gateCheckpointId: null },
+    ];
+
+    if (escalates(depth, i.gate.policy.maxStackDepth)) {
+      const draft = checkpointDraft({
+        serial: checkpointSerial,
+        slug: i.slug,
+        kind: 'escalation',
+        stage: 'analysis',
+        summary: `assumption '${id}' escalates at depth ${String(depth)}`,
+        reversibility: 'irreversible',
+        policy: i.gate.policy,
+      });
+      checkpointSerial += 1;
+      derived.push(checkpointRaisedInput(draft));
+    }
   });
 
   const agentOriginatedCount = artifact.requirements.filter((r) => r.source_span === null).length;

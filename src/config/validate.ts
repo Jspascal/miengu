@@ -143,6 +143,44 @@ export function validateConfig(c: MienguConfig): void {
     }
   }
 
+  // V10 — an irreversible checkpoint carries neither an SLA nor a default (§8: no timeout, no default).
+  if (c.checkpoints.irreversible.slaSeconds !== null || c.checkpoints.irreversible.default !== null) {
+    violations.push(
+      'an irreversible checkpoint must declare neither an SLA nor a default decision (§8: no timeout, no default)',
+    );
+  }
+
+  // V11 — every blast-radius pattern is a well-formed glob: non-empty, no leading `/`, no `\`,
+  // no empty segment.
+  const BLAST_RADIUS_PATTERN_LISTS: ReadonlyArray<[string, readonly string[]]> = [
+    ['migrationOrSchemaPaths', c.checkpoints.blastRadius.migrationOrSchemaPaths],
+    ['sensitivePaths', c.checkpoints.blastRadius.sensitivePaths],
+    ['externalContractPaths', c.checkpoints.blastRadius.externalContractPaths],
+    ['protectedPaths', c.checkpoints.blastRadius.protectedPaths],
+    ['dependencyManifestPaths', c.checkpoints.blastRadius.dependencyManifestPaths],
+  ];
+  for (const [listName, patterns] of BLAST_RADIUS_PATTERN_LISTS) {
+    for (const pattern of patterns) {
+      const malformed =
+        pattern.length === 0 ||
+        pattern.startsWith('/') ||
+        pattern.includes('\\') ||
+        pattern.includes('//');
+      if (malformed) {
+        violations.push(
+          `checkpoints.blastRadius.${listName} declares a malformed pattern: ${JSON.stringify(pattern)}`,
+        );
+      }
+    }
+  }
+
+  // V12 — a checkpoint class declares an SLA and a default together, or neither.
+  if (
+    (c.checkpoints.reversible.slaSeconds === null) !== (c.checkpoints.reversible.default === null)
+  ) {
+    violations.push('a checkpoint class must declare an SLA and a default together, or neither');
+  }
+
   if (violations.length > 0) {
     throw new ConfigError(violations.join('\n'), { violations });
   }

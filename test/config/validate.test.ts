@@ -134,6 +134,87 @@ describe('validateConfig', () => {
     );
   });
 
+  it('V10: fails when irreversible declares an SLA', () => {
+    const raw = validRaw();
+    raw['checkpoints'] = { irreversible: { slaSeconds: 3600, default: null } };
+    expect(() => validateConfig(parse(raw))).toThrowError(
+      /an irreversible checkpoint must declare neither an SLA nor a default decision \(§8: no timeout, no default\)/,
+    );
+  });
+
+  it('V10: fails when irreversible declares a default', () => {
+    const raw = validRaw();
+    raw['checkpoints'] = { irreversible: { slaSeconds: null, default: 'accept' } };
+    expect(() => validateConfig(parse(raw))).toThrowError(
+      /an irreversible checkpoint must declare neither an SLA nor a default decision \(§8: no timeout, no default\)/,
+    );
+  });
+
+  it('V10: fails when irreversible declares both an SLA and a default', () => {
+    const raw = validRaw();
+    raw['checkpoints'] = { irreversible: { slaSeconds: 3600, default: 'accept' } };
+    expect(() => validateConfig(parse(raw))).toThrowError(
+      /an irreversible checkpoint must declare neither an SLA nor a default decision \(§8: no timeout, no default\)/,
+    );
+  });
+
+  it('V11: fires for a leading /, a \\, an empty segment and an empty string, one line each', () => {
+    const raw = validRaw();
+    const leadingSlash = '/leading-slash/**';
+    const backslash = 'back\\slash';
+    const emptySegment = 'empty//segment';
+    raw['checkpoints'] = {
+      blastRadius: {
+        migrationOrSchemaPaths: [leadingSlash],
+        sensitivePaths: [backslash],
+        externalContractPaths: [emptySegment],
+      },
+    };
+    try {
+      validateConfig(parse(raw));
+      throw new Error('expected validateConfig to throw');
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      const message = (error as ConfigError).message;
+      expect(message).toContain('migrationOrSchemaPaths');
+      expect(message).toContain(JSON.stringify(leadingSlash));
+      expect(message).toContain('sensitivePaths');
+      expect(message).toContain(JSON.stringify(backslash));
+      expect(message).toContain('externalContractPaths');
+      expect(message).toContain(JSON.stringify(emptySegment));
+      expect(message.split('\n').length).toBe(3);
+    }
+  });
+
+  it('V11: fires for an empty string pattern', () => {
+    const raw = validRaw();
+    const config = parse(raw);
+    const withEmptyPattern: typeof config = {
+      ...config,
+      checkpoints: {
+        ...config.checkpoints,
+        blastRadius: { ...config.checkpoints.blastRadius, protectedPaths: [''] },
+      },
+    };
+    expect(() => validateConfig(withEmptyPattern)).toThrowError(/protectedPaths/);
+  });
+
+  it('V12: fails when reversible declares an SLA without a default', () => {
+    const raw = validRaw();
+    raw['checkpoints'] = { reversible: { slaSeconds: 86400, default: null } };
+    expect(() => validateConfig(parse(raw))).toThrowError(
+      /a checkpoint class must declare an SLA and a default together, or neither/,
+    );
+  });
+
+  it('V12: fails when reversible declares a default without an SLA', () => {
+    const raw = validRaw();
+    raw['checkpoints'] = { reversible: { slaSeconds: null, default: 'accept' } };
+    expect(() => validateConfig(parse(raw))).toThrowError(
+      /a checkpoint class must declare an SLA and a default together, or neither/,
+    );
+  });
+
   it('collects two simultaneous violations into one error naming both', () => {
     const raw = validRaw();
     (raw['executors'] as Record<string, Record<string, unknown>>)['cc-sonnet']['account'] =

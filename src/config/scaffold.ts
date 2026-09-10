@@ -56,6 +56,32 @@ limits:
 planner:
   maxPathsPerTask: 8        # §15.3 mechanical check; no literal in code
 
+# 5. Gates (§8). Blocking is decided by blast radius, never by agent confidence.
+checkpoints:
+  defaultOwner: operator
+  reversible:   { slaSeconds: 86400, default: accept }   # never blocks; auto-approves after the SLA
+  irreversible: { slaSeconds: null,  default: null }     # always blocks: no timeout, no default
+  blastRadius:
+    # miengu never invents a pattern: an undeclared surface is an ungated surface.
+    # Glob subset: \`**\` matches any run of segments, \`*\` matches within one segment.
+    migrationOrSchemaPaths:  ["**/migrations/**", "**/*.sql", "**/schema.prisma"]
+    sensitivePaths:          ["**/auth/**", "**/permissions/**", "**/payment*/**", "**/billing/**"]
+    externalContractPaths:   ["**/openapi*.y*ml", "**/*.proto", "**/public-api/**"]
+    protectedPaths:          ["**/index.ts", "**/*.d.ts"]
+    dependencyManifestPaths: ["package.json", "**/package.json", "requirements.txt", "Cargo.toml", "go.mod"]
+    maxDiffLines:    400
+    maxFilesTouched: 20
+    severity:
+      migration-or-schema:  blocking
+      sensitive-surface:    blocking
+      external-contract:    blocking
+      protected-surface:    blocking
+      dependency-manifest:  blocking
+      diff-size:            advisory
+
+assumptions:
+  maxStackDepth: 2          # an assumption resting on two unresolved assumptions escalates
+
 wiki:
   language: en
 locale: fr

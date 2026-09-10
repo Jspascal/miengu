@@ -352,7 +352,6 @@ describe('applyEvent: one fixture per event type asserts the exact state delta',
       workdir: '/tmp/wd',
       baseRef: 'HEAD',
       baseCommit: 'a'.repeat(40),
-      discarded: false,
     });
   });
 
@@ -598,8 +597,8 @@ describe('applyEvent: one fixture per event type asserts the exact state delta',
     expect(state.budget.accounts[ACCOUNT_CX]?.exhausted).toBeNull();
   });
 
-  apply('WorkspaceDiscarded marks the workspace discarded', () => {
-    expect(state.workspace?.discarded).toBe(true);
+  apply('WorkspaceDiscarded clears the workspace', () => {
+    expect(state.workspace).toBeNull();
   });
 
   apply('WorkItemCompleted marks the item completed', () => {

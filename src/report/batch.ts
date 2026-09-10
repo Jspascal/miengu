@@ -1,7 +1,8 @@
 import { z } from 'zod';
-import type { MienguEvent, EvidenceRef, Stage, CheckpointKind, OracleKind, OracleScope, OracleResultStatus } from '../core/events.js';
+import type { MienguEvent, EvidenceRef, ParkReason, Stage, CheckpointKind, OracleKind, OracleScope, OracleResultStatus } from '../core/events.js';
 import { ORACLE_KINDS } from '../core/events.js';
 import type {
+  AccountId,
   AssumptionId,
   CheckpointId,
   ClaimId,
@@ -17,6 +18,10 @@ import { project } from '../state/projector.js';
 import type { Claim, ClaimSet, ContestedOutcome } from '../wiki/records.js';
 import { activeClaims, claimComponents, deriveClaims } from '../wiki/records.js';
 import { ImplementationSchema } from '../contracts/implementation.js';
+import { assumptionFacts, escalates } from '../supervisor/assumptions.js';
+import { blastRadiusInput, classifyBlastRadius } from '../supervisor/blastRadius.js';
+import type { FiredTrigger } from '../supervisor/blastRadius.js';
+import { checkpointOwner, gatePolicyAt } from '../supervisor/checkpointPolicy.js';
 
 // Mirrors src/core/clock.ts's IsoTimestampSchema brand exactly (same brand literal) without
 // importing clock.ts, which the determinism zone forbids for this file (§1/decision 20's
@@ -47,6 +52,15 @@ export interface BlockedCheckpoint {
   readonly stage: Stage;
   readonly summary: string;
   readonly raisedAt: IsoTimestamp;
+  readonly owner: string;
+  readonly slaSeconds: number | null;
+  readonly defaultDecision: 'accept' | null;
+  /** Non-empty only for `kind === 'blast-radius'` whose `causation_id` resolves to a
+   *  `DiffCaptured`; `null` when it does not resolve, which renders as "triggers unknown"
+   *  and never as an empty (i.e. "nothing fired") list. */
+  readonly triggers: readonly FiredTrigger[] | null;
+  /** Non-empty only for `kind === 'assumption-gate'`. */
+  readonly gatedAssumptionIds: readonly AssumptionId[];
 }
 
 export interface AgentOriginatedEntry {
@@ -69,6 +83,9 @@ export interface AssumptionEntry {
   readonly affects: readonly string[];
   readonly depth: number;
   readonly at: IsoTimestamp;
+  readonly gateCheckpointId: CheckpointId | null;
+  /** `depth >= maxStackDepth` under the in-force config. */
+  readonly escalated: boolean;
 }
 
 export interface OracleFailureEntry {
@@ -116,6 +133,13 @@ export interface ShippedItem {
    *  decision (matches the anchor `humanview.ts` actually writes, decision 3's `<itemId>/<claimId>`
    *  cross-item qualification). */
   readonly decisionChain: readonly { readonly claimId: ClaimId; readonly wikiLink: string }[];
+  readonly park: {
+    readonly reason: ParkReason;
+    readonly detail: string;
+    readonly account: AccountId | null;
+    readonly resetsAt: IsoTimestamp | null;
+    readonly resumable: boolean;
+  } | null;
 }
 
 export interface BatchReport {
@@ -219,31 +243,57 @@ export function buildBatchReport(i: BatchReportInput): BatchReport {
       ? loaded
       : loaded.filter((l) => defaultCompare(l.state.updatedAt, i.since as IsoTimestamp) >= 0);
 
-  // --- blocked irreversible checkpoints (decision 18, position 1; decision 19: renders only
-  // what CheckpointRaised.blocking and kind === 'irreversible' already recorded). ---
+  // --- blocked checkpoints (decision 18, position 1; §8 amendment: every open blocking
+  // checkpoint, not only kind === 'irreversible' — a blocking blast-radius, assumption-gate or
+  // escalation checkpoint is a gate the operator must clear too). ---
   const blockedIrreversible: BlockedCheckpoint[] = [];
   for (const l of qualifying) {
     const summaries = new Map<CheckpointId, string>();
+    const raiseEvents = new Map<CheckpointId, MienguEvent & { type: 'CheckpointRaised' }>();
     for (const e of l.events) {
       if (e.type === 'CheckpointRaised') {
         summaries.set(e.data.checkpoint, e.data.summary);
+        raiseEvents.set(e.data.checkpoint, e);
       }
     }
+    const facts = assumptionFacts(l.events);
     for (const cp of Object.values(l.state.checkpoints)) {
-      if (cp.kind === 'irreversible' && cp.blocking && cp.status === 'open') {
-        blockedIrreversible.push({
-          itemId: l.itemId,
-          checkpointId: cp.id,
-          kind: cp.kind,
-          stage: cp.stage,
-          summary: summaries.get(cp.id) ?? '',
-          raisedAt: cp.raisedAt,
-        });
+      if (!cp.blocking || cp.status !== 'open') {
+        continue;
       }
+      const raiseEvent = raiseEvents.get(cp.id);
+
+      let triggers: readonly FiredTrigger[] | null = null;
+      if (cp.kind === 'blast-radius' && raiseEvent !== undefined) {
+        const causationId = raiseEvent.causation_id;
+        const diffEvent = causationId !== null ? l.eventsById.get(causationId) : undefined;
+        if (diffEvent !== undefined && diffEvent.type === 'DiffCaptured') {
+          const policy = gatePolicyAt(l.events, raiseEvent.seq).blastRadius;
+          triggers = classifyBlastRadius(blastRadiusInput(diffEvent.data), policy).fired;
+        }
+      }
+
+      const gatedAssumptionIds: readonly AssumptionId[] =
+        cp.kind === 'assumption-gate' ? facts.filter((f) => f.gateCheckpointId === cp.id).map((f) => f.id) : [];
+
+      blockedIrreversible.push({
+        itemId: l.itemId,
+        checkpointId: cp.id,
+        kind: cp.kind,
+        stage: cp.stage,
+        summary: summaries.get(cp.id) ?? '',
+        raisedAt: cp.raisedAt,
+        owner: checkpointOwner(l.events, cp.id),
+        slaSeconds: raiseEvent?.data.sla_seconds ?? null,
+        defaultDecision: raiseEvent?.data.default_decision === 'accept' ? 'accept' : null,
+        triggers,
+        gatedAssumptionIds,
+      });
     }
   }
   blockedIrreversible.sort(
     (a, b) =>
+      Number(a.kind !== 'irreversible') - Number(b.kind !== 'irreversible') ||
       defaultCompare(a.raisedAt, b.raisedAt) ||
       defaultCompare(a.itemId, b.itemId) ||
       defaultCompare(a.checkpointId, b.checkpointId),
@@ -287,20 +337,33 @@ export function buildBatchReport(i: BatchReportInput): BatchReport {
   }
   agentOriginated.sort((a, b) => defaultCompare(a.itemId, b.itemId) || defaultCompare(a.claimId, b.claimId));
 
-  // --- unresolved assumptions, deepest first (decision 18, position 3). No Phase 4 producer
-  // links a checkpoint to an assumption id, so "unresolved" is every recorded assumption. ---
+  // --- unresolved assumptions, deepest first (decision 18, position 3). "Unresolved" is now
+  // `AssumptionFact.resolved === false`: an assumption resolved by an accepted assumption-gate
+  // checkpoint leaves this section (§8 amendment). ---
   const unresolvedAssumptions: AssumptionEntry[] = [];
   for (const l of qualifying) {
-    for (const a of l.state.assumptions) {
+    const facts = assumptionFacts(l.events);
+    const recordsById = new Map(l.state.assumptions.map((a) => [a.id, a]));
+    for (const f of facts) {
+      if (f.resolved) {
+        continue;
+      }
+      const record = recordsById.get(f.id);
+      if (record === undefined) {
+        continue;
+      }
+      const maxStackDepth = gatePolicyAt(l.events, f.seq).maxStackDepth;
       unresolvedAssumptions.push({
         itemId: l.itemId,
-        assumptionId: a.id,
-        question: a.question,
-        chosen: a.chosen,
-        alternatives: a.alternatives,
-        affects: a.affects,
-        depth: a.depth,
-        at: a.at,
+        assumptionId: f.id,
+        question: record.question,
+        chosen: record.chosen,
+        alternatives: record.alternatives,
+        affects: record.affects,
+        depth: f.depth,
+        at: record.at,
+        gateCheckpointId: f.gateCheckpointId,
+        escalated: escalates(f.depth, maxStackDepth),
       });
     }
   }
@@ -450,6 +513,16 @@ export function buildBatchReport(i: BatchReportInput): BatchReport {
       tasks,
       finalPatch: l.state.integration.finalPatch,
       decisionChain,
+      park:
+        l.state.park === null
+          ? null
+          : {
+              reason: l.state.park.reason,
+              detail: l.state.park.detail,
+              account: l.state.park.account,
+              resetsAt: l.state.park.resetsAt,
+              resumable: l.state.park.resumable,
+            },
     });
   }
   shipped.sort((a, b) => defaultCompare(a.itemId, b.itemId));
@@ -510,6 +583,21 @@ type ReportStringKey =
   | 'labelFinalPatch'
   | 'labelDecisionChain'
   | 'labelUpdated'
+  | 'labelOwner'
+  | 'labelSla'
+  | 'labelDefault'
+  | 'labelTriggers'
+  | 'labelTriggersUnknown'
+  | 'labelGates'
+  | 'labelEscalated'
+  | 'labelPark'
+  | 'labelResumable'
+  | 'triggerMigrationOrSchema'
+  | 'triggerSensitiveSurface'
+  | 'triggerExternalContract'
+  | 'triggerProtectedSurface'
+  | 'triggerDependencyManifest'
+  | 'triggerDiffSize'
   | 'driftClaimNotFound'
   | 'resolutionClaimQuarantined'
   | 'resolutionObservationQuarantined'
@@ -556,6 +644,21 @@ const REPORT_STRINGS: Record<'fr' | 'en', Record<ReportStringKey, string>> = {
     labelFinalPatch: 'final patch',
     labelDecisionChain: 'decision chain',
     labelUpdated: 'updated',
+    labelOwner: 'owner',
+    labelSla: 'sla',
+    labelDefault: 'default',
+    labelTriggers: 'triggers',
+    labelTriggersUnknown: 'triggers unknown',
+    labelGates: 'gates',
+    labelEscalated: 'escalated',
+    labelPark: 'park',
+    labelResumable: 'resumable',
+    triggerMigrationOrSchema: 'migration or schema',
+    triggerSensitiveSurface: 'sensitive surface',
+    triggerExternalContract: 'external contract',
+    triggerProtectedSurface: 'protected surface',
+    triggerDependencyManifest: 'dependency manifest',
+    triggerDiffSize: 'diff size',
     driftClaimNotFound: 'claim not found',
     resolutionClaimQuarantined: 'claim quarantined',
     resolutionObservationQuarantined: 'observation quarantined',
@@ -599,12 +702,36 @@ const REPORT_STRINGS: Record<'fr' | 'en', Record<ReportStringKey, string>> = {
     labelFinalPatch: 'correctif final',
     labelDecisionChain: 'chaîne de décision',
     labelUpdated: 'mis à jour',
+    labelOwner: 'responsable',
+    labelSla: 'délai',
+    labelDefault: 'défaut',
+    labelTriggers: 'déclencheurs',
+    labelTriggersUnknown: 'déclencheurs inconnus',
+    labelGates: 'porte',
+    labelEscalated: 'escaladé',
+    labelPark: 'suspendu',
+    labelResumable: 'reprenable',
+    triggerMigrationOrSchema: 'migration ou schéma',
+    triggerSensitiveSurface: 'surface sensible',
+    triggerExternalContract: 'contrat externe',
+    triggerProtectedSurface: 'surface protégée',
+    triggerDependencyManifest: 'manifeste de dépendances',
+    triggerDiffSize: 'taille du diff',
     driftClaimNotFound: 'affirmation introuvable',
     resolutionClaimQuarantined: 'affirmation mise en quarantaine',
     resolutionObservationQuarantined: 'observation mise en quarantaine',
     resolutionTie: 'égalité',
     resolutionUnknownClaim: 'affirmation inconnue',
   },
+};
+
+const TRIGGER_LABEL_KEY: Readonly<Record<FiredTrigger['trigger'], ReportStringKey>> = {
+  'migration-or-schema': 'triggerMigrationOrSchema',
+  'sensitive-surface': 'triggerSensitiveSurface',
+  'external-contract': 'triggerExternalContract',
+  'protected-surface': 'triggerProtectedSurface',
+  'dependency-manifest': 'triggerDependencyManifest',
+  'diff-size': 'triggerDiffSize',
 };
 
 function resolutionLabel(resolution: DriftEntry['resolution'], s: Record<ReportStringKey, string>): string {
@@ -639,8 +766,16 @@ export function renderBatchReport(r: BatchReport, locale: 'fr' | 'en'): string {
   if (r.blockedIrreversible.length > 0) {
     parts.push(`## ${s.sectionBlocked}`);
     for (const cp of r.blockedIrreversible) {
+      const slaPart = ` — ${s.labelSla}: ${cp.slaSeconds === null ? s.labelNone : cp.slaSeconds}`;
+      const defaultPart = ` — ${s.labelDefault}: ${cp.defaultDecision === null ? s.labelNone : cp.defaultDecision}`;
+      const triggersPart =
+        cp.kind === 'blast-radius'
+          ? ` — ${s.labelTriggers}: ${cp.triggers === null ? s.labelTriggersUnknown : cp.triggers.map((t) => s[TRIGGER_LABEL_KEY[t.trigger]]).join(', ')}`
+          : '';
+      const gatesPart =
+        cp.kind === 'assumption-gate' ? ` — ${s.labelGates}: ${cp.gatedAssumptionIds.join(', ')}` : '';
       parts.push(
-        `- [${cp.itemId}] ${cp.checkpointId} (${s.labelStage}: ${cp.stage}) — ${cp.summary} — ${s.labelRaised}: ${cp.raisedAt}`,
+        `- [${cp.itemId}] ${cp.checkpointId} (${s.labelStage}: ${cp.stage}) — ${cp.summary} — ${s.labelRaised}: ${cp.raisedAt} — ${s.labelOwner}: ${cp.owner}${slaPart}${defaultPart}${triggersPart}${gatesPart}`,
       );
     }
   }
@@ -660,8 +795,10 @@ export function renderBatchReport(r: BatchReport, locale: 'fr' | 'en'): string {
     for (const a of r.unresolvedAssumptions) {
       const alt = a.alternatives.length > 0 ? ` (${s.labelAlternatives}: ${a.alternatives.join(', ')})` : '';
       const aff = a.affects.length > 0 ? ` (${s.labelAffects}: ${a.affects.join(', ')})` : '';
+      const checkpointPart = ` — ${s.labelCheckpoint}: ${a.gateCheckpointId === null ? s.labelNone : a.gateCheckpointId}`;
+      const escalatedPart = a.escalated ? ` — ${s.labelEscalated}` : '';
       parts.push(
-        `- [${a.itemId}] ${a.assumptionId} (${s.labelDepth}: ${a.depth}) ${a.question} → ${a.chosen}${alt}${aff}`,
+        `- [${a.itemId}] ${a.assumptionId} (${s.labelDepth}: ${a.depth}) ${a.question} → ${a.chosen}${alt}${aff}${checkpointPart}${escalatedPart}`,
       );
     }
   }
@@ -706,6 +843,13 @@ export function renderBatchReport(r: BatchReport, locale: 'fr' | 'en'): string {
       }
       if (item.decisionChain.length > 0) {
         parts.push(`${s.labelDecisionChain}: ${item.decisionChain.map((d) => d.wikiLink).join(', ')}`);
+      }
+      if (item.park !== null) {
+        const accountPart = item.park.account !== null ? ` (${item.park.account})` : '';
+        const resetsPart = item.park.resetsAt !== null ? `, ${item.park.resetsAt}` : '';
+        parts.push(
+          `${s.labelPark}: ${item.park.reason}${accountPart}${resetsPart} — ${s.labelResumable}: ${item.park.resumable ? s.labelYes : s.labelNo}`,
+        );
       }
     }
   }

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { systemClock, fixedClock, IsoTimestampSchema } from '../../src/core/clock.js';
+import { systemClock, fixedClock, IsoTimestampSchema, epochSeconds } from '../../src/core/clock.js';
 import type { IsoTimestamp } from '../../src/core/clock.js';
+import { StoreError } from '../../src/errors.js';
 
 describe('systemClock', () => {
   it('now() returns a UTC ISO timestamp with millisecond precision', () => {
@@ -56,5 +57,23 @@ describe('fixedClock', () => {
     expect(clock.monotonicMs()).toBe(0);
     expect(clock.monotonicMs()).toBe(100);
     expect(clock.monotonicMs()).toBe(200);
+  });
+});
+
+describe('epochSeconds', () => {
+  it('returns 0 for the epoch', () => {
+    expect(epochSeconds('1970-01-01T00:00:00.000Z' as IsoTimestamp)).toBe(0);
+  });
+
+  it('handles a value with milliseconds', () => {
+    expect(epochSeconds('2024-01-01T00:00:00.500Z' as IsoTimestamp)).toBe(1704067200);
+  });
+
+  it('floors rather than rounds a fractional second', () => {
+    expect(epochSeconds('2024-01-01T00:00:00.999Z' as IsoTimestamp)).toBe(1704067200);
+  });
+
+  it('throws StoreError on an unparseable value', () => {
+    expect(() => epochSeconds('not-a-timestamp' as IsoTimestamp)).toThrow(StoreError);
   });
 });

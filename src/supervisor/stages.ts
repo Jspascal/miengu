@@ -8,7 +8,7 @@ import type { FrozenTestsState } from '../state/workitem.js';
 import type { Executor, ExecutorResult, ExecutorStatus, RawRunSource } from '../executors/executor.js';
 import { AgentError } from '../errors.js';
 import { ROLE_MODULES, runAgentStage } from '../agents/agent.js';
-import type { AppendFn, PackBuildInput } from '../agents/agent.js';
+import type { AppendFn, GateContext, PackBuildInput } from '../agents/agent.js';
 import type { CheckContext } from '../agents/checks.js';
 
 export interface StageRunContext {
@@ -38,6 +38,7 @@ export interface StageRunContext {
   readonly schemasDir: string;
   readonly messagesDir: string;
   readonly append: AppendFn;
+  readonly gate: GateContext;
 }
 
 /**
@@ -138,6 +139,7 @@ export async function runRoleStage(stage: Stage, ctx: StageRunContext): Promise<
     schemasDir: ctx.schemasDir,
     messagesDir: ctx.messagesDir,
     append: ctx.append,
+    gate: ctx.gate,
   });
 
   switch (outcome.kind) {

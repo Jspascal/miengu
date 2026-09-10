@@ -3,12 +3,50 @@ import { analystModule, buildCandidates, postStep } from '../../src/agents/analy
 import { ROLE_PACK_POLICY } from '../../src/wiki/contextpack.js';
 import { RequirementSetSchema } from '../../src/contracts/requirementSet.js';
 import type { RequirementSet } from '../../src/contracts/index.js';
+import type { GateContext } from '../../src/agents/agent.js';
 import type { PackBuildInput } from '../../src/agents/agent.js';
 import type { TieredBody } from '../../src/wiki/packmaterials.js';
-import { SlugSchema, WorkItemIdSchema } from '../../src/core/ids.js';
+import { AssumptionIdSchema, SlugSchema, WorkItemIdSchema } from '../../src/core/ids.js';
+import type { GatePolicy } from '../../src/supervisor/checkpointPolicy.js';
+import type { AssumptionFact } from '../../src/supervisor/assumptions.js';
 
 const itemId = WorkItemIdSchema.parse('wi-example-abc123');
 const slug = SlugSchema.parse('example');
+
+const DEFAULT_POLICY: GatePolicy = {
+  owner: 'operator',
+  reversible: { slaSeconds: 86400, default: 'accept' },
+  irreversible: { slaSeconds: null, default: null },
+  blastRadius: {
+    migrationOrSchemaPaths: [],
+    sensitivePaths: [],
+    externalContractPaths: [],
+    protectedPaths: [],
+    dependencyManifestPaths: [],
+    maxDiffLines: 400,
+    maxFilesTouched: 20,
+    severity: {
+      'migration-or-schema': 'blocking',
+      'sensitive-surface': 'blocking',
+      'external-contract': 'blocking',
+      'protected-surface': 'blocking',
+      'dependency-manifest': 'blocking',
+      'diff-size': 'advisory',
+    },
+  },
+  maxStackDepth: 2,
+};
+
+function gate(overrides: Partial<GateContext> = {}): GateContext {
+  return {
+    nextCheckpointSerial: 1,
+    nextAssumptionSerial: 1,
+    openAssumptions: [],
+    checkpoints: {},
+    policy: DEFAULT_POLICY,
+    ...overrides,
+  };
+}
 
 function tieredBody(body: string): TieredBody {
   return { body, tier: 'T2', sourceEventId: null };
@@ -123,6 +161,7 @@ describe('analyst.postStep', () => {
       frozenTestsDir: '/tmp/frozen-tests',
       frozenTests: null,
       appendDerived: async () => ({ ts: '2024-01-01T00:00:00.000Z' as never }),
+      gate: gate(),
     });
 
     expect(result.kind).toBe('ok');
@@ -143,8 +182,91 @@ describe('analyst.postStep', () => {
       frozenTestsDir: '/tmp/frozen-tests',
       frozenTests: null,
       appendDerived: async () => ({ ts: '2024-01-01T00:00:00.000Z' as never }),
+      gate: gate(),
     });
     expect(result.kind).toBe('ok');
+  });
+
+  it('mints ids continuing from gate.nextAssumptionSerial, never restarting at 1 on a re-run', async () => {
+    const result = await postStep({
+      itemId,
+      slug,
+      artifact: REQUIREMENT_SET_WITH_AMBIGUITIES,
+      checkContext: { requirementSet: null, architecturePlan: null, taskGraph: null, maxPathsPerTask: 8, testDirs: [] },
+      ids: undefined as never,
+      workdir: '/tmp',
+      frozenTestsDir: '/tmp/frozen-tests',
+      frozenTests: null,
+      appendDerived: async () => ({ ts: '2024-01-01T00:00:00.000Z' as never }),
+      gate: gate({ nextAssumptionSerial: 5 }),
+    });
+    const ids = result.derived
+      .filter((d) => d.type === 'AssumptionRecorded')
+      .map((d) => (d.data as { id: string }).id);
+    expect(ids).toEqual([`assumption-${slug}-5`, `assumption-${slug}-6`]);
+  });
+
+  it('records a real chain depth, resting a later ambiguity on an earlier one from the same batch', async () => {
+    const chained = RequirementSetSchema.parse({
+      requirements: REQUIREMENT_SET_WITH_AMBIGUITIES.requirements,
+      ambiguities: [
+        { question: 'q1', affects: ['REQ-example-1'], options: ['a', 'b'], recommended: 'b' },
+        { question: 'q2', affects: ['REQ-example-1'], options: ['x', 'y'], recommended: 'x' },
+      ],
+      out_of_scope: [],
+    });
+    const result = await postStep({
+      itemId,
+      slug,
+      artifact: chained,
+      checkContext: { requirementSet: null, architecturePlan: null, taskGraph: null, maxPathsPerTask: 8, testDirs: [] },
+      ids: undefined as never,
+      workdir: '/tmp',
+      frozenTestsDir: '/tmp/frozen-tests',
+      frozenTests: null,
+      appendDerived: async () => ({ ts: '2024-01-01T00:00:00.000Z' as never }),
+      gate: gate(),
+    });
+    const depths = result.derived
+      .filter((d) => d.type === 'AssumptionRecorded')
+      .map((d) => (d.data as { depth: number }).depth);
+    expect(depths).toEqual([0, 1]);
+  });
+
+  it('an assumption whose depth reaches the cap raises one blocking escalation checkpoint and still records the assumption', async () => {
+    const existingOpen: AssumptionFact = {
+      id: AssumptionIdSchema.parse(`assumption-${slug}-1`),
+      affects: ['REQ-example-1'],
+      depth: 1,
+      resolved: false,
+      seq: 1,
+      gateCheckpointId: null,
+    };
+    const oneAmbiguity = RequirementSetSchema.parse({
+      requirements: REQUIREMENT_SET_WITH_AMBIGUITIES.requirements,
+      ambiguities: [
+        { question: 'q1', affects: ['REQ-example-1'], options: ['a', 'b'], recommended: 'b' },
+      ],
+      out_of_scope: [],
+    });
+    const result = await postStep({
+      itemId,
+      slug,
+      artifact: oneAmbiguity,
+      checkContext: { requirementSet: null, architecturePlan: null, taskGraph: null, maxPathsPerTask: 8, testDirs: [] },
+      ids: undefined as never,
+      workdir: '/tmp',
+      frozenTestsDir: '/tmp/frozen-tests',
+      frozenTests: null,
+      appendDerived: async () => ({ ts: '2024-01-01T00:00:00.000Z' as never }),
+      gate: gate({ nextAssumptionSerial: 2, nextCheckpointSerial: 1, openAssumptions: [existingOpen] }),
+    });
+    const assumptionEvents = result.derived.filter((d) => d.type === 'AssumptionRecorded');
+    expect(assumptionEvents).toHaveLength(1);
+    expect((assumptionEvents[0]?.data as { depth: number }).depth).toBe(2);
+    const checkpoints = result.derived.filter((d) => d.type === 'CheckpointRaised');
+    expect(checkpoints).toHaveLength(1);
+    expect(checkpoints[0]?.data).toMatchObject({ kind: 'escalation', blocking: true, sla_seconds: null, default_decision: null });
   });
 });
 

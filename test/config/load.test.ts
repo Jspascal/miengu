@@ -78,7 +78,7 @@ describe('loadConfig', () => {
       await writeFile(join(root, 'miengu.config.yaml'), CONFIG_TEMPLATE, 'utf8');
       const loaded = await loadConfig(undefined, root);
       expect(loaded.configHash).toBe(
-        '3d3517bc5ced0ad883bd87588711ab0f529ebc2fa2bd9b9907af5b19c65edb24',
+        '58b80882cce2add176b11e27433faec1c21d5f9e88478d16fbb06894ac362e60',
       );
     } finally {
       await rm(root, { recursive: true, force: true });

@@ -114,6 +114,45 @@ function assumptionRecorded(
   return eb.mkEvent('AssumptionRecorded', { id, question, chosen, alternatives, affects, depth });
 }
 
+function runStarted(eb: EventBuilder, config: unknown): MienguEvent {
+  return eb.mkEvent('RunStarted', {
+    miengu_version: '0.1.0',
+    node_version: 'v20.0.0',
+    config_hash: 'deadbeef',
+    config,
+  });
+}
+
+function diffCaptured(
+  eb: EventBuilder,
+  filesTouched: string[],
+  untracked: string[],
+  insertions: number,
+  deletions: number,
+): MienguEvent {
+  return eb.mkEvent('DiffCaptured', {
+    workdir: '/tmp/workdir',
+    diff_sha256: 'a'.repeat(64),
+    diff_ref: null,
+    files_touched: filesTouched,
+    untracked,
+    insertions,
+    deletions,
+    committed_during_run: false,
+  });
+}
+
+function workItemParked(
+  eb: EventBuilder,
+  reason: 'budget-exhausted' | 'provider-quota' | 'attempts-exhausted' | 'awaiting-human' | 'operator-abort' | 'executor-unavailable',
+  detail: string,
+  resumable: boolean,
+  account: string | null,
+  resetsAt: string | null,
+): MienguEvent {
+  return eb.mkEvent('WorkItemParked', { reason, detail, resumable, account, resets_at: resetsAt });
+}
+
 function driftDetected(
   eb: EventBuilder,
   claim: string,
@@ -386,22 +425,23 @@ describe('§8 section order', () => {
 });
 
 describe('blockedIrreversible', () => {
-  it('reads kind === irreversible && blocking && status === open only', () => {
+  it('reads every open checkpoint with blocking === true, regardless of kind', () => {
     const itemId = 'wi-blocked-abc123';
     const eb = makeItemBuilder(itemId);
     const events: MienguEvent[] = [workItemCreated(eb, 'Blocked item', 'blocked')];
     events.push(checkpointRaised(eb, 'cp-blocked-1', 'irreversible', 'integration', 'deploy summary', true));
     events.push(checkpointRaised(eb, 'cp-blocked-2', 'irreversible', 'integration', 'reversible one', false));
-    events.push(checkpointRaised(eb, 'cp-blocked-3', 'agent-originated', 'architecture', 'not irreversible', true));
+    events.push(checkpointRaised(eb, 'cp-blocked-3', 'agent-originated', 'architecture', 'also blocking', true));
     events.push(checkpointRaised(eb, 'cp-blocked-4', 'irreversible', 'integration', 'already accepted', true));
     events.push(checkpointDecided(eb, 'cp-blocked-4', 'accept'));
     const report = buildBatchReport(baseInput([itemInput(itemId, events)]));
-    expect(report.blockedIrreversible).toHaveLength(1);
-    expect(report.blockedIrreversible[0]?.checkpointId).toBe('cp-blocked-1');
+    // §8 amendment: every open blocking checkpoint, not only kind === 'irreversible'.
+    expect(report.blockedIrreversible).toHaveLength(2);
+    expect(report.blockedIrreversible.map((b) => b.checkpointId)).toEqual(['cp-blocked-1', 'cp-blocked-3']);
     expect(report.blockedIrreversible[0]?.summary).toBe('deploy summary');
   });
 
-  it('sorts by (raisedAt, itemId, checkpointId)', () => {
+  it('sorts irreversible first, then by (raisedAt, itemId, checkpointId)', () => {
     const itemId = 'wi-sorta-abc123';
     const eb = makeItemBuilder(itemId);
     const events: MienguEvent[] = [workItemCreated(eb, 'A', 'sorta')];
@@ -411,6 +451,31 @@ describe('blockedIrreversible', () => {
     const ids = report.blockedIrreversible.map((b) => b.checkpointId);
     // Raised in increasing ts order, so the earlier-raised checkpoint (cp-sorta-2) sorts first.
     expect(ids).toEqual(['cp-sorta-2', 'cp-sorta-1']);
+  });
+
+  it('places every irreversible checkpoint before a blocking non-irreversible one, regardless of raisedAt', () => {
+    const itemId = 'wi-sortkind-abc123';
+    const eb = makeItemBuilder(itemId);
+    const events: MienguEvent[] = [workItemCreated(eb, 'A', 'sortkind')];
+    events.push(checkpointRaised(eb, 'cp-sortkind-1', 'assumption-gate', 'architecture', 'gate', true));
+    events.push(checkpointRaised(eb, 'cp-sortkind-2', 'irreversible', 'integration', 'later irreversible', true));
+    const report = buildBatchReport(baseInput([itemInput(itemId, events)]));
+    expect(report.blockedIrreversible.map((b) => b.checkpointId)).toEqual(['cp-sortkind-2', 'cp-sortkind-1']);
+  });
+
+  it('carries owner, sla, default, triggers and gatedAssumptionIds', () => {
+    const itemId = 'wi-fields-abc123';
+    const eb = makeItemBuilder(itemId);
+    const events: MienguEvent[] = [workItemCreated(eb, 'Fields', 'fields')];
+    events.push(checkpointRaised(eb, 'cp-fields-1', 'irreversible', 'integration', 'irreversible summary', true));
+    const report = buildBatchReport(baseInput([itemInput(itemId, events)]));
+    expect(report.blockedIrreversible).toHaveLength(1);
+    const entry = report.blockedIrreversible[0];
+    expect(entry?.owner).toBe('operator');
+    expect(entry?.slaSeconds).toBeNull();
+    expect(entry?.defaultDecision).toBeNull();
+    expect(entry?.triggers).toBeNull();
+    expect(entry?.gatedAssumptionIds).toEqual([]);
   });
 });
 
@@ -743,5 +808,140 @@ describe('AutoApproved never renders as a human decision', () => {
     const text = renderBatchReport(report, 'en');
     expect(text).not.toMatch(/human decision/i);
     expect(text).not.toContain('AutoApproved');
+  });
+});
+
+describe('Phase 5: blast-radius checkpoints in blockedIrreversible', () => {
+  it('a blast-radius checkpoint sorts after an irreversible one and reproduces the classifier verdict', () => {
+    const itemId = 'wi-blast-abc123';
+    const eb = makeItemBuilder(itemId);
+    const events: MienguEvent[] = [workItemCreated(eb, 'Blast', 'blast')];
+    events.push(
+      runStarted(eb, {
+        checkpoints: {
+          defaultOwner: 'ops-team',
+          blastRadius: { migrationOrSchemaPaths: ['**/migrations/**'] },
+        },
+      }),
+    );
+    const diff = diffCaptured(eb, ['db/migrations/001.sql'], [], 10, 0);
+    events.push(diff);
+    events.push(checkpointRaised(eb, 'cp-blast-1', 'irreversible', 'architecture', 'irreversible decision', true));
+    events.push(eb.mkEvent('CheckpointRaised', {
+      checkpoint: 'cp-blast-2',
+      kind: 'blast-radius',
+      stage: 'implementation',
+      summary: 'blast radius gate',
+      blocking: true,
+      sla_seconds: null,
+      default_decision: null,
+    }, diff.event_id));
+    const report = buildBatchReport(baseInput([itemInput(itemId, events)]));
+    expect(report.blockedIrreversible.map((b) => b.checkpointId)).toEqual(['cp-blast-1', 'cp-blast-2']);
+    const blastEntry = report.blockedIrreversible[1];
+    expect(blastEntry?.owner).toBe('ops-team');
+    expect(blastEntry?.triggers).toEqual([
+      { trigger: 'migration-or-schema', severity: 'blocking', paths: ['db/migrations/001.sql'] },
+    ]);
+  });
+
+  it('triggers is null, never an empty list, when causation_id does not resolve to a DiffCaptured', () => {
+    const itemId = 'wi-blastunk-abc123';
+    const eb = makeItemBuilder(itemId);
+    const events: MienguEvent[] = [workItemCreated(eb, 'Blast unknown', 'blastunk')];
+    events.push(eb.mkEvent('CheckpointRaised', {
+      checkpoint: 'cp-blastunk-1',
+      kind: 'blast-radius',
+      stage: 'implementation',
+      summary: 'blast radius gate',
+      blocking: true,
+      sla_seconds: null,
+      default_decision: null,
+    }, null));
+    const report = buildBatchReport(baseInput([itemInput(itemId, events)]));
+    expect(report.blockedIrreversible).toHaveLength(1);
+    expect(report.blockedIrreversible[0]?.triggers).toBeNull();
+  });
+});
+
+describe('Phase 5: unresolvedAssumptions resolution and escalation', () => {
+  it('an assumption resolved by an accepted assumption-gate checkpoint leaves unresolvedAssumptions', () => {
+    const itemId = 'wi-resolved-abc123';
+    const eb = makeItemBuilder(itemId);
+    const events: MienguEvent[] = [workItemCreated(eb, 'Resolved', 'resolved')];
+    events.push(assumptionRecorded(eb, 'assumption-resolved-1', 'q1', 'c1', [], [], 0));
+    events.push(checkpointRaised(eb, 'cp-resolved-1', 'assumption-gate', 'architecture', 'gate', true));
+    events.push(checkpointDecided(eb, 'cp-resolved-1', 'accept'));
+    const report = buildBatchReport(baseInput([itemInput(itemId, events)]));
+    expect(report.unresolvedAssumptions).toHaveLength(0);
+  });
+
+  it('a rejected gate does not resolve the assumption it gates', () => {
+    const itemId = 'wi-rejected-abc123';
+    const eb = makeItemBuilder(itemId);
+    const events: MienguEvent[] = [workItemCreated(eb, 'Rejected', 'rejected')];
+    events.push(assumptionRecorded(eb, 'assumption-rejected-1', 'q1', 'c1', [], [], 0));
+    events.push(checkpointRaised(eb, 'cp-rejected-1', 'assumption-gate', 'architecture', 'gate', true));
+    events.push(checkpointDecided(eb, 'cp-rejected-1', 'reject'));
+    const report = buildBatchReport(baseInput([itemInput(itemId, events)]));
+    expect(report.unresolvedAssumptions).toHaveLength(1);
+    expect(report.unresolvedAssumptions[0]?.gateCheckpointId).toBe('cp-rejected-1');
+  });
+
+  it('escalated is true exactly at maxStackDepth and false below it', () => {
+    const itemId = 'wi-escalate-abc123';
+    const eb = makeItemBuilder(itemId);
+    const events: MienguEvent[] = [workItemCreated(eb, 'Escalate', 'escalate')];
+    events.push(runStarted(eb, { assumptions: { maxStackDepth: 2 } }));
+    events.push(assumptionRecorded(eb, 'assumption-escalate-1', 'q1', 'c1', [], [], 1));
+    events.push(assumptionRecorded(eb, 'assumption-escalate-2', 'q2', 'c2', [], [], 2));
+    const report = buildBatchReport(baseInput([itemInput(itemId, events)]));
+    const one = report.unresolvedAssumptions.find((a) => a.assumptionId === 'assumption-escalate-1');
+    const two = report.unresolvedAssumptions.find((a) => a.assumptionId === 'assumption-escalate-2');
+    expect(one?.escalated).toBe(false);
+    expect(two?.escalated).toBe(true);
+  });
+});
+
+describe('Phase 5: ShippedItem.park', () => {
+  it('a quota park is carried on the shipped entry', () => {
+    const itemId = 'wi-shippark-abc123';
+    const eb = makeItemBuilder(itemId);
+    const events: MienguEvent[] = [workItemCreated(eb, 'Shipped park', 'shippark')];
+    events.push(workItemParked(eb, 'provider-quota', 'waiting on window', true, 'stub-account', '2024-06-01T00:00:00.000Z'));
+    const report = buildBatchReport(baseInput([itemInput(itemId, events)]));
+    expect(report.shipped).toHaveLength(1);
+    expect(report.shipped[0]?.park).toEqual({
+      reason: 'provider-quota',
+      detail: 'waiting on window',
+      account: 'stub-account',
+      resetsAt: '2024-06-01T00:00:00.000Z',
+      resumable: true,
+    });
+  });
+
+  it('park is null for an item that never parked', () => {
+    const item = minimalItem('wi-nopark-abc123', 'No park', 'nopark');
+    const report = buildBatchReport(baseInput([item]));
+    expect(report.shipped).toHaveLength(1);
+    expect(report.shipped[0]?.park).toBeNull();
+  });
+});
+
+describe('Phase 5: report shape is re-asserted', () => {
+  it('the section order is unchanged and no generatedAt field exists', () => {
+    const item = buildShippedItem('wi-reassert-abc123', 'reassert', 'Reassert item').item;
+    const report = buildBatchReport(baseInput([item]));
+    expect(Object.keys(report)).not.toContain('generatedAt');
+    expect(Object.keys(report)).toEqual([
+      'generatedFrom',
+      'blockedIrreversible',
+      'agentOriginated',
+      'unresolvedAssumptions',
+      'oracleFailures',
+      'drift',
+      'shipped',
+      'corrupt',
+    ]);
   });
 });

@@ -3,20 +3,22 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { canonicalJson } from '../../src/core/canonical.js';
 import { IsoTimestampSchema } from '../../src/core/clock.js';
-import { STAGES } from '../../src/core/events.js';
-import type { AccountId, EscalationLevel, FailureAttemptBucket, Stage } from '../../src/core/events.js';
+import { CHECKPOINT_KINDS, STAGES } from '../../src/core/events.js';
+import type { AccountId, CheckpointKind, EscalationLevel, FailureAttemptBucket, Stage } from '../../src/core/events.js';
+import { sha256Hex } from '../../src/core/hash.js';
 import {
   AccountIdSchema,
   CheckpointIdSchema,
   EventIdSchema,
   SlugSchema,
   WorkItemIdSchema,
+  formatCheckpointId,
 } from '../../src/core/ids.js';
 import { limitForStage, nextStage } from '../../src/supervisor/nextStage.js';
 import type { StageDecision, StagePolicy } from '../../src/supervisor/nextStage.js';
 import { EMPTY_LEDGER } from '../../src/supervisor/budget.js';
 import { PROJECTION_VERSION, emptyAttempts, emptyQuotaAborts } from '../../src/state/workitem.js';
-import type { WorkItemState } from '../../src/state/workitem.js';
+import type { CheckpointStateRecord, WorkItemState } from '../../src/state/workitem.js';
 import { bucketLimit, escalationRank } from '../../src/supervisor/escalation.js';
 
 const GOLDEN_PATH = fileURLToPath(new URL('../golden/nextStage.table.json', import.meta.url));
@@ -25,6 +27,9 @@ const PHASE1_NONPARK_PATH = fileURLToPath(
 );
 const PHASE2_GOLDEN_PATH = fileURLToPath(
   new URL('../golden/nextStage.phase2.table.json', import.meta.url),
+);
+const PHASE5_GOLDEN_PATH = fileURLToPath(
+  new URL('../golden/nextStage.phase5.table.json', import.meta.url),
 );
 
 const TIMESTAMP = IsoTimestampSchema.parse('2024-01-01T00:00:00.000Z');
@@ -626,5 +631,252 @@ describe('nextStage: generated Phase 3 causal routing table', () => {
       },
     };
     expect(nextStage(corrected, POLICY)).toMatchObject({ kind: 'run', action: 'task-oracle', taskId });
+  });
+});
+
+// --- Phase 5 dimensions: checkpoint routing (WORK_ORDER_PHASE5.md item 18) ---
+// Group D supplies no routing change (decision "Group D — routing (proof of non-change)"):
+// this table exists to pin that guard 6 and guard 7 keep behaving exactly as before across the
+// checkpoint shapes Phase 5's producers can now create. A separate golden file and a separate
+// generator; the existing three tables and their generators above are untouched.
+
+const PHASE5_CHECKPOINT_SETS = [
+  'none',
+  'one-open-blocking',
+  'two-open-blocking',
+  'one-open-non-blocking',
+  'one-open-blocking-plus-accepted',
+  'one-rejected-blocking',
+  'one-auto-approved-blocking',
+] as const;
+type Phase5CheckpointSet = (typeof PHASE5_CHECKPOINT_SETS)[number];
+
+const PHASE5_STAGES = ['architecture', 'implementation'] as const;
+type Phase5Stage = (typeof PHASE5_STAGES)[number];
+
+interface Phase5Row {
+  readonly checkpointSet: Phase5CheckpointSet;
+  readonly kind: CheckpointKind;
+  readonly stage: Phase5Stage;
+}
+
+function phase5CheckpointRecord(
+  id: CheckpointStateRecord['id'],
+  kind: CheckpointKind,
+  stage: Stage,
+  blocking: boolean,
+  status: CheckpointStateRecord['status'],
+): CheckpointStateRecord {
+  return {
+    id,
+    kind,
+    stage,
+    blocking,
+    status,
+    raisedAt: TIMESTAMP,
+    resolvedAt: status === 'open' ? null : TIMESTAMP,
+    resolvedBy: status === 'open' ? null : status === 'auto-approved' ? 'auto' : 'human',
+  };
+}
+
+/**
+ * `two-open-blocking` uses serials 9 and 10 specifically to exercise decision 17's lexicographic
+ * comparison (`cp-example-10` sorts before `cp-example-9`). Every other set uses serials 1 (and
+ * 2, for the accepted companion) — the serial value is otherwise immaterial to guard 6.
+ */
+function phase5CheckpointsFor(
+  set: Phase5CheckpointSet,
+  kind: CheckpointKind,
+  stage: Stage,
+): Readonly<Record<string, CheckpointStateRecord>> {
+  switch (set) {
+    case 'none':
+      return {};
+    case 'one-open-blocking': {
+      const id = formatCheckpointId(SLUG, 1);
+      return { [id]: phase5CheckpointRecord(id, kind, stage, true, 'open') };
+    }
+    case 'two-open-blocking': {
+      const id9 = formatCheckpointId(SLUG, 9);
+      const id10 = formatCheckpointId(SLUG, 10);
+      return {
+        [id9]: phase5CheckpointRecord(id9, kind, stage, true, 'open'),
+        [id10]: phase5CheckpointRecord(id10, kind, stage, true, 'open'),
+      };
+    }
+    case 'one-open-non-blocking': {
+      const id = formatCheckpointId(SLUG, 1);
+      return { [id]: phase5CheckpointRecord(id, kind, stage, false, 'open') };
+    }
+    case 'one-open-blocking-plus-accepted': {
+      const openId = formatCheckpointId(SLUG, 1);
+      const acceptedId = formatCheckpointId(SLUG, 2);
+      return {
+        [openId]: phase5CheckpointRecord(openId, kind, stage, true, 'open'),
+        [acceptedId]: phase5CheckpointRecord(acceptedId, kind, stage, true, 'accepted'),
+      };
+    }
+    case 'one-rejected-blocking': {
+      const id = formatCheckpointId(SLUG, 1);
+      return { [id]: phase5CheckpointRecord(id, kind, stage, true, 'rejected') };
+    }
+    case 'one-auto-approved-blocking': {
+      const id = formatCheckpointId(SLUG, 1);
+      return { [id]: phase5CheckpointRecord(id, kind, stage, true, 'auto-approved') };
+    }
+  }
+}
+
+/**
+ * Programmatically generates the 70-row cross product
+ * `checkpointSet(7) x kind ∈ CHECKPOINT_KINDS(5) x stage ∈ {architecture, implementation}(2)`.
+ * Never hand-written, never randomised.
+ */
+function generatePhase5Rows(): Phase5Row[] {
+  const rows: Phase5Row[] = [];
+  for (const checkpointSet of PHASE5_CHECKPOINT_SETS) {
+    for (const kind of CHECKPOINT_KINDS) {
+      for (const stage of PHASE5_STAGES) {
+        rows.push({ checkpointSet, kind, stage });
+      }
+    }
+  }
+  return rows;
+}
+
+function buildPhase5State(row: Phase5Row): WorkItemState {
+  const base = buildState({
+    stage: row.stage,
+    status: 'active',
+    budgetExhausted: 'none',
+    attempts: 0,
+    openBlockingCheckpoint: false,
+  });
+  return {
+    ...base,
+    checkpoints: phase5CheckpointsFor(row.checkpointSet, row.kind, row.stage),
+  };
+}
+
+function phase5DecisionFor(row: Phase5Row): StageDecision {
+  return nextStage(buildPhase5State(row), POLICY);
+}
+
+function serializePhase5Row(row: Phase5Row): string {
+  return canonicalJson({ row, decision: phase5DecisionFor(row) });
+}
+
+describe('nextStage: 70-row Phase 5 checkpoint-routing table', () => {
+  const rows = generatePhase5Rows();
+  const generated = rows.map(serializePhase5Row);
+  const golden = JSON.parse(readFileSync(PHASE5_GOLDEN_PATH, 'utf8')) as string[];
+
+  it('generates exactly the 70-row cross product', () => {
+    expect(rows).toHaveLength(70);
+  });
+
+  it('never throws, and every decision is one of the four StageDecision kinds', () => {
+    for (const row of rows) {
+      const state = buildPhase5State(row);
+      let decision: StageDecision | undefined;
+      expect(() => {
+        decision = nextStage(state, POLICY);
+      }).not.toThrow();
+      expect(['run', 'checkpoint', 'park', 'done']).toContain(decision?.kind);
+    }
+  });
+
+  it('matches the committed Phase 5 golden table (canonicalJson per row)', () => {
+    expect(generated).toEqual(golden);
+  });
+
+  it('guard 6 is kind-agnostic: every CHECKPOINT_KINDS value blocks identically when open and blocking', () => {
+    for (const kind of CHECKPOINT_KINDS) {
+      for (const stage of PHASE5_STAGES) {
+        const decision = phase5DecisionFor({ checkpointSet: 'one-open-blocking', kind, stage });
+        expect(decision).toMatchObject({ kind: 'checkpoint', checkpoint: formatCheckpointId(SLUG, 1) });
+      }
+    }
+  });
+
+  it('a non-blocking open checkpoint never blocks, for every kind', () => {
+    for (const kind of CHECKPOINT_KINDS) {
+      for (const stage of PHASE5_STAGES) {
+        const decision = phase5DecisionFor({ checkpointSet: 'one-open-non-blocking', kind, stage });
+        expect(decision.kind).not.toBe('checkpoint');
+      }
+    }
+  });
+
+  it('an accepted checkpoint never blocks; only the still-open one is named', () => {
+    for (const kind of CHECKPOINT_KINDS) {
+      for (const stage of PHASE5_STAGES) {
+        const decision = phase5DecisionFor({ checkpointSet: 'one-open-blocking-plus-accepted', kind, stage });
+        expect(decision).toMatchObject({ kind: 'checkpoint', checkpoint: formatCheckpointId(SLUG, 1) });
+      }
+    }
+  });
+
+  it('an auto-approved checkpoint never blocks, however "blocking" its record still reads, for every kind', () => {
+    for (const kind of CHECKPOINT_KINDS) {
+      for (const stage of PHASE5_STAGES) {
+        const decision = phase5DecisionFor({ checkpointSet: 'one-auto-approved-blocking', kind, stage });
+        expect(decision.kind).not.toBe('checkpoint');
+      }
+    }
+  });
+
+  // WORK_ORDER_PHASE5.md binding decision 15: a rejected blocking checkpoint does not clear a
+  // park, so a naively-resumed item would re-enter the very stage the operator refused. Guard 6
+  // only ever looks at `status === 'open'`, and a rejected checkpoint is not open, so it never
+  // blocks *here* -- the fix lives one layer up, in the drain's `blocking-checkpoint-rejected`
+  // backlog blocker (src/supervisor/backlog.ts), which refuses to resume such an item at all.
+  it('a rejected checkpoint never blocks at the routing layer (decision 15; the drain, not nextStage, keeps it parked)', () => {
+    for (const kind of CHECKPOINT_KINDS) {
+      for (const stage of PHASE5_STAGES) {
+        const decision = phase5DecisionFor({ checkpointSet: 'one-rejected-blocking', kind, stage });
+        expect(decision.kind).not.toBe('checkpoint');
+      }
+    }
+  });
+
+  // WORK_ORDER_PHASE5.md binding decision 17: checkpoint ids compare as strings, so once an
+  // item passes nine checkpoints the "lowest id" guard 6 selects is lexicographic, not
+  // numeric -- `cp-example-10` sorts before `cp-example-9`. This is cosmetic (every blocking
+  // checkpoint must be resolved regardless of which one is named) and is pinned here, in this
+  // golden table, precisely so it cannot be "fixed" silently later without moving this file.
+  it('serial 9 vs 10: guard 6 names the lexicographically lowest id (decision 17)', () => {
+    for (const kind of CHECKPOINT_KINDS) {
+      for (const stage of PHASE5_STAGES) {
+        const decision = phase5DecisionFor({ checkpointSet: 'two-open-blocking', kind, stage });
+        expect(decision).toMatchObject({ kind: 'checkpoint', checkpoint: formatCheckpointId(SLUG, 10) });
+      }
+    }
+  });
+});
+
+// The Phase 1, Phase 2 and Phase 1-nonpark golden files are frozen (binding decision 3: no
+// `WorkItemState` field moves, so no existing table moves). These hashes were captured from
+// the files as landed by Groups A-C and pin them at the byte level, catching a reformat or a
+// silent regeneration that the row-by-row `toEqual` checks above would not: those checks parse
+// each file into an array first, so a change that reformats the file without changing any row's
+// value would still pass them.
+describe('nextStage: the three existing golden tables are byte-identical to their committed contents', () => {
+  it('nextStage.table.json', () => {
+    expect(sha256Hex(readFileSync(GOLDEN_PATH))).toBe(
+      '3d9ef41444183710809921862b11ea74faf08bcd7a5164f576298b32310c01d9',
+    );
+  });
+
+  it('nextStage.phase2.table.json', () => {
+    expect(sha256Hex(readFileSync(PHASE2_GOLDEN_PATH))).toBe(
+      '6c960bb92c0856121e437762a7f98380a51a67d088c5435d5ca9de131de21ea8',
+    );
+  });
+
+  it('nextStage.table.phase1-nonpark.json', () => {
+    expect(sha256Hex(readFileSync(PHASE1_NONPARK_PATH))).toBe(
+      '3ae01537ede845a69085134b9234e6da3b16321fe8f403bad385522e7d1ce19b',
+    );
   });
 });

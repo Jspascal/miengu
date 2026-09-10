@@ -6,8 +6,8 @@ import { runCommand } from './commands/run.js';
 import { statusCommand } from './commands/status.js';
 import { replayCommand } from './commands/replay.js';
 import { reportCommand } from './commands/report.js';
+import { decideCommand } from './commands/decide.js';
 import { wikiRenderCommand } from './commands/wikiRender.js';
-import { notImplemented } from './commands/notImplemented.js';
 import { EXIT, exitCodeFor } from './exit.js';
 
 const program = new Command();
@@ -41,16 +41,18 @@ program
   .argument('<prd-file>', 'path to the PRD file')
   .option('--config <path>', 'path to miengu.config.yaml')
   .option('--retain-workspace', 'do not remove the worktree on exit')
+  .option('--no-backlog', 'run only the new item; skip the backlog scan entirely')
   .option('--json', 'print machine-readable output')
   .action(
     async (
       prdFile: string,
-      opts: { config?: string; retainWorkspace?: boolean; json?: boolean },
+      opts: { config?: string; retainWorkspace?: boolean; backlog?: boolean; json?: boolean },
     ) => {
       process.exitCode = await runCommand({
         prdFile,
         configPath: opts.config,
         retainWorkspace: opts.retainWorkspace,
+        noBacklog: opts.backlog === false,
         json: opts.json,
       });
     },
@@ -96,9 +98,25 @@ program
   .argument('<checkpoint>', 'checkpoint id')
   .argument('<decision>', 'accept|reject')
   .option('--reason <text>', 'reason for the decision')
-  .action(() => {
-    notImplemented('miengu decide', 5);
-  });
+  .option('--item <id>', 'disambiguate a checkpoint id that exists in more than one item')
+  .option('--config <path>', 'path to miengu.config.yaml')
+  .option('--json', 'print machine-readable output')
+  .action(
+    async (
+      checkpoint: string,
+      decision: string,
+      opts: { reason?: string; item?: string; config?: string; json?: boolean },
+    ) => {
+      process.exitCode = await decideCommand({
+        checkpoint,
+        decision,
+        reason: opts.reason,
+        item: opts.item,
+        configPath: opts.config,
+        json: opts.json,
+      });
+    },
+  );
 
 const wikiCommand = program.command('wiki').description('operate on the human-readable wiki view');
 

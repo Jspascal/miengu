@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { TARGET_MODES, EXECUTOR_TYPES } from '../core/events.js';
-import { AccountIdSchema, ExecutorInstanceIdSchema } from '../core/ids.js';
+import { AccountIdSchema, ExecutorInstanceIdSchema, RE_SLUG } from '../core/ids.js';
 
 export const CONFIG_FILENAME = 'miengu.config.yaml';
 
@@ -120,6 +120,73 @@ export const LogConfigSchema = z
   })
   .strict();
 
+export const BLAST_RADIUS_TRIGGERS = [
+  'migration-or-schema',
+  'sensitive-surface',
+  'external-contract',
+  'protected-surface',
+  'dependency-manifest',
+  'diff-size',
+] as const;
+export type BlastRadiusTrigger = (typeof BLAST_RADIUS_TRIGGERS)[number];
+
+export const TRIGGER_SEVERITIES = ['blocking', 'advisory', 'off'] as const;
+export type TriggerSeverity = (typeof TRIGGER_SEVERITIES)[number];
+
+export const TriggerSeveritySchema = z
+  .object({
+    'migration-or-schema': z.enum(TRIGGER_SEVERITIES).default('blocking'),
+    'sensitive-surface':   z.enum(TRIGGER_SEVERITIES).default('blocking'),
+    'external-contract':   z.enum(TRIGGER_SEVERITIES).default('blocking'),
+    'protected-surface':   z.enum(TRIGGER_SEVERITIES).default('blocking'),
+    'dependency-manifest': z.enum(TRIGGER_SEVERITIES).default('blocking'),
+    'diff-size':           z.enum(TRIGGER_SEVERITIES).default('advisory'),
+  })
+  .strict();
+
+export const BlastRadiusConfigSchema = z
+  .object({
+    migrationOrSchemaPaths:  z.array(z.string().min(1)).default([]),
+    sensitivePaths:          z.array(z.string().min(1)).default([]),
+    externalContractPaths:   z.array(z.string().min(1)).default([]),
+    protectedPaths:          z.array(z.string().min(1)).default([]),
+    dependencyManifestPaths: z.array(z.string().min(1)).default([]),
+    maxDiffLines:            z.number().int().positive().default(400),
+    maxFilesTouched:         z.number().int().positive().default(20),
+    severity:                TriggerSeveritySchema.default({}),
+  })
+  .strict();
+
+/** `default` is `'accept' | null` and never `'reject'` — binding decision 7. */
+function checkpointClassSchema(slaSeconds: number | null, decision: 'accept' | null) {
+  return z
+    .object({
+      slaSeconds: z.number().int().positive().nullable().default(slaSeconds),
+      default: z.literal('accept').nullable().default(decision),
+    })
+    .strict();
+}
+
+export const ReversibleCheckpointSchema = checkpointClassSchema(86400, 'accept');
+export const IrreversibleCheckpointSchema = checkpointClassSchema(null, null);
+
+export const CheckpointsConfigSchema = z
+  .object({
+    /** An operator-declared label, lowercase-hyphen, <= 48 chars — the same shape as an
+     *  AccountId. miengu has no identity model and does not invent one. */
+    defaultOwner: z.string().regex(RE_SLUG).max(48).default('operator'),
+    reversible:   ReversibleCheckpointSchema.default({}),
+    irreversible: IrreversibleCheckpointSchema.default({}),
+    blastRadius:  BlastRadiusConfigSchema.default({}),
+  })
+  .strict();
+
+export const AssumptionsConfigSchema = z
+  .object({
+    maxStackDepth: z.number().int().positive().default(2),
+  })
+  .strict();
+
 export const MienguConfigSchema = z
   .object({
     target: TargetConfigSchema,
@@ -131,6 +198,8 @@ export const MienguConfigSchema = z
     budget: BudgetConfigSchema.default({}),
     limits: LimitsConfigSchema.default({}),
     planner: PlannerConfigSchema.default({}),
+    assumptions: AssumptionsConfigSchema.default({}),
+    checkpoints: CheckpointsConfigSchema.default({}),
     wiki: WikiConfigSchema.default({}),
     locale: z.enum(['fr', 'en']).default('fr'),
     store: StoreConfigSchema.default({}),

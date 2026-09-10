@@ -297,7 +297,15 @@ export function nextStage(state: WorkItemState, policy: StagePolicy): StageDecis
     return { kind: 'done', outcome: 'completed' };
   }
 
-  // 6. any blocking checkpoint with status === 'open' -> checkpoint(stage, id) (lowest id)
+  // 6. any blocking checkpoint with status === 'open' -> checkpoint(stage, id) (lowest id).
+  // WORK_ORDER_PHASE5.md binding decision 17: ids compare as strings, so once an item passes
+  // nine checkpoints the "lowest id" is lexicographic, not numeric — `cp-x-10` sorts before
+  // `cp-x-9`. This is cosmetic: the guard only chooses which blocking checkpoint to name in
+  // the park decision, and every blocking checkpoint must be resolved, regardless of which one
+  // is named, before the item can advance. Left as-is and pinned by
+  // `test/golden/nextStage.phase5.table.json` so it is not "fixed" silently later. Also kind-
+  // agnostic: an `assumption-gate` or `escalation` checkpoint blocks exactly as `irreversible`
+  // does, because `blocking` — not `kind` — is what this guard reads.
   let lowestOpenBlocking: CheckpointId | null = null;
   for (const record of Object.values(state.checkpoints)) {
     if (!record.blocking || record.status !== 'open') {
@@ -322,6 +330,10 @@ export function nextStage(state: WorkItemState, policy: StagePolicy): StageDecis
   //    provider window. Reporting it as 'provider-quota' told the operator to wait for a
   //    window that was never the problem, and inverted §17.3's park-and-resume vs. escalate
   //    distinction — a spend cap does not clear on its own.
+  // WORK_ORDER_PHASE5.md binding decision 14: the drain's run-scoped `blockedAccounts` gate is
+  // re-checked immediately before each backlog entry runs, keyed by this same
+  // `policy.stageAccounts[state.stage]` value, so the two can never disagree about which
+  // account a stage needs.
   const account = policy.stageAccounts[state.stage];
   if (account !== null) {
     const accountExhaustion = state.budget.accounts[account]?.exhausted ?? null;

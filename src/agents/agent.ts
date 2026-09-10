@@ -27,7 +27,9 @@ import { loadTemplate, renderPrompt } from './prompts/render.js';
 import type { PromptVars } from './prompts/render.js';
 import type { CheckContext } from './checks.js';
 import type { Executor, ExecutorResult, RawRunSource } from '../executors/executor.js';
-import type { FrozenTestsState } from '../state/workitem.js';
+import type { CheckpointStateRecord, FrozenTestsState } from '../state/workitem.js';
+import type { AssumptionFact } from '../supervisor/assumptions.js';
+import type { GatePolicy } from '../supervisor/checkpointPolicy.js';
 import { analystModule } from './analyst.js';
 import { architectModule } from './architect.js';
 import { plannerModule } from './planner.js';
@@ -111,6 +113,19 @@ export function renderEscalationContext(
   return JSON.stringify({ ...base, task_ids: context.taskIds, current_task_reviewer_findings: context.currentTaskReviewerFindings }, null, 2);
 }
 
+/**
+ * The minimum a `postStep` needs to mint ids that cannot collide and to apply the declared
+ * gate policy. Deliberately NOT `WorkItemState`: a role module has no business reading the
+ * routing state machine, and the narrow shape is what keeps that true.
+ */
+export interface GateContext {
+  readonly nextCheckpointSerial: number;
+  readonly nextAssumptionSerial: number;
+  readonly openAssumptions: readonly AssumptionFact[];
+  readonly checkpoints: Readonly<Record<string, CheckpointStateRecord>>;
+  readonly policy: GatePolicy;
+}
+
 export interface PackBuildInput {
   readonly itemId: WorkItemId;
   readonly checkContext: CheckContext;
@@ -138,6 +153,7 @@ export interface PostStepInput {
    * plain, unappended drafts in `PostStepResult.derived` instead of calling this.
    */
   readonly appendDerived: AppendFn;
+  readonly gate: GateContext;
 }
 
 export type PostStepResult =
@@ -225,6 +241,7 @@ export interface RunAgentStageInput {
   readonly schemasDir: string;
   readonly messagesDir: string;
   readonly append: AppendFn;
+  readonly gate: GateContext;
 }
 
 const NATIVE_CONTRACT_TEXT =
@@ -521,6 +538,7 @@ export async function runAgentStage(i: RunAgentStageInput): Promise<AgentOutcome
       frozenTestsDir: i.frozenTestsDir,
       frozenTests: i.frozenTests,
       appendDerived: i.append,
+      gate: i.gate,
     });
 
     if (postStepResult.kind === 'failed') {

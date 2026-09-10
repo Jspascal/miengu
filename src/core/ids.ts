@@ -103,6 +103,10 @@ export function formatTaskId(slug: Slug, n: number): TaskId {
 export function formatClaimId(slug: Slug, n: number): ClaimId {
   return formatSerial('claim-', RE_CLAIM_ID, slug, n) as ClaimId;
 }
+/** `n` must come from `nextAssumptionSerial` (`src/supervisor/checkpointPolicy.ts`), never
+ *  from a local counter: WORK_ORDER_PHASE5.md binding decision 4 mandates one state-derived
+ *  minting rule, `max(existing serials) + 1`, so a re-run can never mint a serial that
+ *  collides with — and silently overwrites — an already-recorded assumption. */
 export function formatAssumptionId(slug: Slug, n: number): AssumptionId {
   return formatSerial('assumption-', RE_ASSUMPTION_ID, slug, n) as AssumptionId;
 }
@@ -121,6 +125,10 @@ export function formatTestId(slug: Slug, n: number): TestId {
 export function formatSuiteId(slug: Slug, n: number): SuiteId {
   return formatSerial('suite-', RE_SUITE_ID, slug, n) as SuiteId;
 }
+/** `n` must come from `nextCheckpointSerial` (`src/supervisor/checkpointPolicy.ts`), never
+ *  from a local counter: WORK_ORDER_PHASE5.md binding decision 4 mandates one state-derived
+ *  minting rule, `max(existing serials) + 1`, so a re-run can never mint a serial that
+ *  collides with — and silently overwrites — an already-decided checkpoint. */
 export function formatCheckpointId(slug: Slug, n: number): CheckpointId {
   return formatSerial('cp-', RE_CHECKPOINT_ID, slug, n) as CheckpointId;
 }

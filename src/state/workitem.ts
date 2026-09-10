@@ -81,7 +81,13 @@ import type {
   ReqId,
 } from '../core/ids.js';
 
-export const PROJECTION_VERSION = 3;
+// Bumped from 3 to 4 because a defect fix changed the WorkspaceDiscarded fold's derivation
+// (it now nulls `state.workspace` outright instead of keeping it non-null with
+// `discarded: true`), not the projection's shape. Snapshots written under the old fold must
+// be discarded and rebuilt from events, or `latestValid` (src/core/snapshot.ts) would accept
+// a stale-derivation snapshot as a valid base. The event log is untouched: EVENT_SCHEMA_VERSION
+// stays 3.
+export const PROJECTION_VERSION = 4;
 
 export const STAGE_ORDER: readonly Stage[] = STAGES;
 
@@ -165,6 +171,12 @@ export interface StageFailureRecord {
   eventId: EventId;
 }
 
+/** WORK_ORDER_PHASE5.md binding decision 3: `sla_seconds`, `default_decision`, the owner and
+ *  gate membership are deliberately NOT projected here. Each is derivable from durable events
+ *  (`CheckpointRaised.sla_seconds` / `.default_decision`, the in-force `RunStarted.data.config`,
+ *  and a fold over `CheckpointRaised{assumption-gate}` / `CheckpointDecided`) — projecting any
+ *  of them would cost a `PROJECTION_VERSION` bump, invalidate every existing snapshot, and move
+ *  the `nextStage` golden tables for facts the log already holds. */
 export interface CheckpointStateRecord {
   id: CheckpointId;
   kind: CheckpointKind;
@@ -176,6 +188,12 @@ export interface CheckpointStateRecord {
   resolvedBy: 'human' | 'auto' | null;
 }
 
+/** WORK_ORDER_PHASE5.md binding decision 3: resolution status and gate membership are
+ *  deliberately NOT projected here. Whether an assumption is resolved, and which
+ *  `assumption-gate` checkpoint (if any) gates it, is derivable by folding
+ *  `CheckpointRaised{assumption-gate}` and `CheckpointDecided{accept}` over the log
+ *  (`src/supervisor/assumptions.ts`); projecting either fact would cost a `PROJECTION_VERSION`
+ *  bump for information the log already holds. */
 export interface AssumptionRecord {
   id: AssumptionId;
   question: string;
@@ -388,7 +406,6 @@ export interface WorkItemState {
     workdir: string;
     baseRef: string;
     baseCommit: string;
-    discarded: boolean;
   } | null;
   readonly lastExecutor: {
     executorId: ExecutorInstanceId;
@@ -600,7 +617,6 @@ const WorkspaceStateSchema = z
     workdir: z.string(),
     baseRef: z.string(),
     baseCommit: z.string(),
-    discarded: z.boolean(),
   })
   .strict()
   .nullable();

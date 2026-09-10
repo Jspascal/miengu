@@ -264,14 +264,13 @@ export function applyEvent(state: WorkItemState | null, event: MienguEvent): Wor
           workdir: event.data.workdir,
           baseRef: event.data.base_ref,
           baseCommit: event.data.base_commit,
-          discarded: false,
         },
       };
     }
     case 'WorkspaceDiscarded': {
       return {
         ...base,
-        workspace: base.workspace === null ? null : { ...base.workspace, discarded: true },
+        workspace: null,
       };
     }
     case 'WorktreeLockAcquired': {
@@ -371,6 +370,12 @@ export function applyEvent(state: WorkItemState | null, event: MienguEvent): Wor
       };
     }
     case 'CheckpointRaised': {
+      // This map is keyed by checkpoint id, so a colliding id silently overwrites a live
+      // record and resets it to `open` — WORK_ORDER_PHASE5.md binding decision 4's motivating
+      // bug. The projector folds what happened; it does not dedupe, reject or rewrite a
+      // colliding id. Preventing the collision is the producer's job: every producer mints ids
+      // via `nextCheckpointSerial`/`nextAssumptionSerial` (`src/supervisor/checkpointPolicy.ts`),
+      // the single state-derived rule that makes a collision unreachable.
       const record: CheckpointStateRecord = {
         id: event.data.checkpoint,
         kind: event.data.kind,

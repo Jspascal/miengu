@@ -21,6 +21,17 @@ import {
 // has zero commits and no production runs; EventLog.open already hard-refuses any line whose
 // schema_version !== EVENT_SCHEMA_VERSION with LogCorruptError, and that refusal is the
 // migration story.
+//
+// Phase 5 (WORK_ORDER_PHASE5.md binding decision 1) stays at 3. A checkpoint's owner and a
+// blast-radius checkpoint's fired triggers are both needed by §8, and neither needs a field:
+// the owner is an operator declaration already durable in `RunStarted.data.config`
+// (`checkpoints.defaultOwner`), resolved by `checkpointOwner` against the in-force config at
+// the raise seq; the trigger set is a pure function of `DiffCaptured.files_touched` /
+// `.untracked` / `.insertions` / `.deletions` and that same in-force config, reproduced exactly
+// by re-running `classifyBlastRadius` over the log. Recording either would append a derived
+// fact to the source of truth. Bumping to 4 would also force `EventLog.open`'s
+// older-envelope refusal onto every existing v3 log, making every currently parked item
+// unresumable — the opposite of this phase's purpose.
 export const EVENT_SCHEMA_VERSION = 3;
 
 export const ACTOR_KINDS = ['supervisor', 'executor', 'human', 'oracle', 'system'] as const;

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { MienguConfigSchema } from '../../src/config/schema.js';
+import { MienguConfigSchema, CheckpointsConfigSchema } from '../../src/config/schema.js';
 
 function validConfig(): Record<string, unknown> {
   return {
@@ -117,6 +117,29 @@ describe('MienguConfigSchema', () => {
       budget: { maxWallSecondsPerInvocation: 1800, maxUsdPerRun: null },
       limits: { kOracle: 3, kTest: 3, kReview: 2, maxAttemptsPerStage: 3 },
       planner: { maxPathsPerTask: 8 },
+      assumptions: { maxStackDepth: 2 },
+      checkpoints: {
+        defaultOwner: 'operator',
+        reversible: { slaSeconds: 86400, default: 'accept' },
+        irreversible: { slaSeconds: null, default: null },
+        blastRadius: {
+          migrationOrSchemaPaths: [],
+          sensitivePaths: [],
+          externalContractPaths: [],
+          protectedPaths: [],
+          dependencyManifestPaths: [],
+          maxDiffLines: 400,
+          maxFilesTouched: 20,
+          severity: {
+            'migration-or-schema': 'blocking',
+            'sensitive-surface': 'blocking',
+            'external-contract': 'blocking',
+            'protected-surface': 'blocking',
+            'dependency-manifest': 'blocking',
+            'diff-size': 'advisory',
+          },
+        },
+      },
       wiki: { language: 'en' },
       locale: 'fr',
       store: { dir: '.miengu', snapshotEvery: 200 },
@@ -158,6 +181,11 @@ describe('MienguConfigSchema', () => {
     ['budget', { ...validConfig(), budget: { bogus: true } }],
     ['limits', { ...validConfig(), limits: { bogus: true } }],
     ['planner', { ...validConfig(), planner: { bogus: true } }],
+    ['assumptions', { ...validConfig(), assumptions: { bogus: true } }],
+    ['checkpoints', { ...validConfig(), checkpoints: { bogus: true } }],
+    ['checkpoints.reversible', { ...validConfig(), checkpoints: { reversible: { bogus: true } } }],
+    ['checkpoints.blastRadius', { ...validConfig(), checkpoints: { blastRadius: { bogus: true } } }],
+    ['checkpoints.blastRadius.severity', { ...validConfig(), checkpoints: { blastRadius: { severity: { bogus: true } } } }],
     ['wiki', { ...validConfig(), wiki: { bogus: true } }],
     ['store', { ...validConfig(), store: { bogus: true } }],
     ['log', { ...validConfig(), log: { bogus: true } }],
@@ -238,5 +266,44 @@ describe('MienguConfigSchema', () => {
     expect(
       MienguConfigSchema.safeParse({ ...validConfig(), limits: { kReview: -1 } }).success,
     ).toBe(false);
+  });
+
+  it('defaults checkpoints and assumptions when omitted entirely (binding decision 6)', () => {
+    const parsed = MienguConfigSchema.parse(validConfig());
+    expect(parsed.assumptions).toEqual({ maxStackDepth: 2 });
+    expect(parsed.checkpoints.defaultOwner).toBe('operator');
+    expect(parsed.checkpoints.reversible).toEqual({ slaSeconds: 86400, default: 'accept' });
+    expect(parsed.checkpoints.irreversible).toEqual({ slaSeconds: null, default: null });
+    expect(parsed.checkpoints.blastRadius.migrationOrSchemaPaths).toEqual([]);
+    expect(parsed.checkpoints.blastRadius.sensitivePaths).toEqual([]);
+    expect(parsed.checkpoints.blastRadius.externalContractPaths).toEqual([]);
+    expect(parsed.checkpoints.blastRadius.protectedPaths).toEqual([]);
+    expect(parsed.checkpoints.blastRadius.dependencyManifestPaths).toEqual([]);
+    expect(parsed.checkpoints.blastRadius.maxDiffLines).toBe(400);
+    expect(parsed.checkpoints.blastRadius.maxFilesTouched).toBe(20);
+    expect(parsed.checkpoints.blastRadius.severity).toEqual({
+      'migration-or-schema': 'blocking',
+      'sensitive-surface': 'blocking',
+      'external-contract': 'blocking',
+      'protected-surface': 'blocking',
+      'dependency-manifest': 'blocking',
+      'diff-size': 'advisory',
+    });
+  });
+});
+
+describe('CheckpointsConfigSchema', () => {
+  it('binding decision 7: default: reject is refused at parse, naming neither accept nor null', () => {
+    const result = CheckpointsConfigSchema.safeParse({
+      reversible: { slaSeconds: 86400, default: 'reject' },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('binding decision 7: irreversible.default: reject is refused at parse', () => {
+    const result = CheckpointsConfigSchema.safeParse({
+      irreversible: { slaSeconds: null, default: 'reject' },
+    });
+    expect(result.success).toBe(false);
   });
 });
