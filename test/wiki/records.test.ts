@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { canonicalJson } from '../../src/core/canonical.js';
-import { DEFAULT_TIER, MienguEventSchema } from '../../src/core/events.js';
+import { DEFAULT_TIER, MienguEventSchema, StoredEventSchema } from '../../src/core/events.js';
 import type { EventType, MienguEvent } from '../../src/core/events.js';
 import type { ClaimId, EventId } from '../../src/core/ids.js';
 import {
@@ -9,6 +9,7 @@ import {
   claimComponents,
   CLAIM_KINDS,
   deriveClaims,
+  deriveStoreClaimSets,
 } from '../../src/wiki/records.js';
 import type { Claim, ClaimKind } from '../../src/wiki/records.js';
 
@@ -26,11 +27,21 @@ function tsAt(n: number): string {
 }
 
 function mkEvent(seq: number, type: EventType, data: unknown, ts?: string): MienguEvent {
+  return mkItemEvent(ITEM_ID, seq, type, data, ts);
+}
+
+function mkItemEvent(
+  itemId: string,
+  seq: number,
+  type: EventType,
+  data: unknown,
+  ts?: string,
+): MienguEvent {
   return MienguEventSchema.parse({
-    schema_version: 3,
+    schema_version: 4,
     event_id: hexId('evt', seq),
     seq,
-    item_id: ITEM_ID,
+    item_id: itemId,
     run_id: RUN_ID,
     ts: ts ?? tsAt(seq),
     tier: DEFAULT_TIER[type],
@@ -98,8 +109,10 @@ function architecturePlanBody(overrides?: {
   decisions?: unknown[];
   components?: unknown[];
   interfaces?: unknown[];
+  falsifications?: unknown[];
 }): unknown {
   return {
+    falsifications: overrides?.falsifications ?? [],
     decisions: overrides?.decisions ?? [
       {
         decision_id: 'decision-example-1',
@@ -233,6 +246,7 @@ function driftDetected(
   overrides?: { expected?: string; observed?: string },
 ): MienguEvent {
   return mkEvent(seq, 'DriftDetected', {
+    claim_item: ITEM_ID,
     claim,
     expected: overrides?.expected ?? 'expected value',
     observed: overrides?.observed ?? 'observed value',
@@ -824,6 +838,122 @@ describe('deriveClaims: contradiction (decision 5)', () => {
         at: tsAt(2),
       },
     ]);
+  });
+});
+
+describe('deriveStoreClaimSets: qualified drift', () => {
+  const OTHER_ITEM_ID = 'wi-other-bbbbbb';
+
+  function otherCreated(slug = 'other'): MienguEvent {
+    return mkItemEvent(OTHER_ITEM_ID, 1, 'WorkItemCreated', {
+      title: 'Other item',
+      slug,
+      source: { kind: 'prd-file', path: 'prd.md', sha256: 'a'.repeat(64), bytes: 10 },
+      config_hash: 'deadbeef',
+    });
+  }
+
+  function otherDecision(seq: number): MienguEvent {
+    return mkItemEvent(OTHER_ITEM_ID, seq, 'StageCompleted', {
+      stage: 'architecture',
+      attempt: 1,
+      artifact: { kind: 'architecture-plan', sha256: 'b'.repeat(64), body: architecturePlanBody({ components: [], interfaces: [] }) },
+    });
+  }
+
+  function foreignDrift(seq: number, claim: string): MienguEvent {
+    return mkItemEvent(OTHER_ITEM_ID, seq, 'DriftDetected', {
+      claim_item: ITEM_ID,
+      claim,
+      expected: 'expected value',
+      observed: 'observed value',
+      area: null,
+    });
+  }
+
+  it('qualifies equal-slug claim ids by owner item and keeps observer-local derivation unchanged', () => {
+    const ownerEvents = [created(), stageCompleted(2, 'architecture', {
+      kind: 'architecture-plan', body: architecturePlanBody({ components: [], interfaces: [] }),
+    })];
+    const ownerClaimId = deriveClaims(ownerEvents).claims[0]?.id;
+    expect(ownerClaimId).toBeDefined();
+    const observerEvents = [otherCreated(SLUG), otherDecision(2), foreignDrift(3, ownerClaimId as string)];
+
+    expect(deriveClaims(observerEvents).claims[0]?.status).toBe('active');
+    const sets = deriveStoreClaimSets([{ events: observerEvents }, { events: ownerEvents }]);
+    expect(sets.get(ITEM_ID)?.byId[ownerClaimId as ClaimId]?.status).toBe('quarantined');
+    expect(sets.get(OTHER_ITEM_ID)?.byId[ownerClaimId as ClaimId]?.status).toBe('active');
+  });
+
+  it('retains a qualified unknown claim as contested by the observer', () => {
+    const observerEvents = [otherCreated(), foreignDrift(2, 'claim-example-999')];
+    const sets = deriveStoreClaimSets([{ events: observerEvents }, { events: [created()] }]);
+    expect(sets.get(OTHER_ITEM_ID)?.contested[0]).toMatchObject({
+      claimId: 'claim-example-999',
+      outcome: 'unknown-claim',
+    });
+  });
+
+  it('uses the existing provenance outcomes for foreign observations', () => {
+    const ownerEvents = [
+      created(),
+      runStarted(2, VALID_CONFIG),
+      diffCaptured(3, ['src/x.ts']),
+      stageCompleted(4, 'architecture', {
+        kind: 'architecture-plan', body: architecturePlanBody({ components: [], interfaces: [] }),
+      }),
+    ];
+    const owner = deriveClaims(ownerEvents);
+    const stackFact = owner.claims.find((claim) => claim.kind === 'stack-fact')?.id;
+    const file = owner.claims.find((claim) => claim.kind === 'file')?.id;
+    const decision = owner.claims.find((claim) => claim.kind === 'decision')?.id;
+    const observerEvents = [
+      otherCreated(),
+      foreignDrift(2, stackFact as string),
+      foreignDrift(3, file as string),
+      foreignDrift(4, decision as string),
+    ];
+    const resolved = deriveStoreClaimSets([{ events: ownerEvents }, { events: observerEvents }])
+      .get(ITEM_ID);
+    expect(resolved?.byId[stackFact as ClaimId]?.status).toBe('active');
+    expect(resolved?.byId[file as ClaimId]?.status).toBe('active');
+    expect(resolved?.byId[decision as ClaimId]?.status).toBe('quarantined');
+    expect(resolved?.contested.map((drift) => drift.outcome)).toEqual([
+      'observation-quarantined',
+      'tie',
+    ]);
+  });
+
+  it('upcasts v3 local drift and preserves its local resolution', () => {
+    const events = [created(), stageCompleted(2, 'architecture', {
+      kind: 'architecture-plan', body: architecturePlanBody({ components: [], interfaces: [] }),
+    })];
+    const claimId = deriveClaims(events).claims[0]?.id;
+    const legacy = StoredEventSchema.parse({
+      schema_version: 3,
+      event_id: hexId('evt', 3), seq: 3, item_id: ITEM_ID, run_id: RUN_ID, ts: tsAt(3),
+      tier: 'T1', actor: { kind: 'system', id: null }, causation_id: null,
+      type: 'DriftDetected',
+      data: { claim: claimId, expected: 'expected value', observed: 'observed value', area: null },
+    });
+    expect(legacy.data.claim_item).toBe(ITEM_ID);
+    expect(deriveClaims([...events, legacy]).byId[claimId as ClaimId]?.status).toBe('quarantined');
+  });
+});
+
+describe('deriveClaims: Phase 6 non-claim events preserve serial identities', () => {
+  it('does not renumber pre-Phase-6 claims', () => {
+    const base = [created(), stageCompleted(2, 'architecture', {
+      kind: 'architecture-plan', body: architecturePlanBody({ components: [], interfaces: [] }),
+    })];
+    const evidence = mkEvent(3, 'BrownfieldEvidenceRecorded', {
+      ladder_tier: 'mechanical-skeleton', collector_version: 1, target_repo_sha256: 'c'.repeat(64),
+      scope: { target_commit: 'abc', roots: [], paths: [], dependency_depth: 0, max_files: 1, truncated: false, sha256: 'd'.repeat(64) },
+      coverage: 'complete', facts: [], omissions: [],
+      evidence: { sha256: 'e'.repeat(64), path: 'brownfield/evidence.json', bytes: 2 },
+    });
+    expect(deriveClaims([...base, evidence]).claims.map((claim) => claim.id))
+      .toEqual(deriveClaims(base).claims.map((claim) => claim.id));
   });
 });
 

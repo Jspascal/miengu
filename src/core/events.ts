@@ -17,22 +17,10 @@ import {
   ExecutorInstanceIdSchema,
 } from './ids.js';
 
-// EVENT_SCHEMA_VERSION 2: clean break, no v1 reader exists (binding decision 7). The repo
-// has zero commits and no production runs; EventLog.open already hard-refuses any line whose
-// schema_version !== EVENT_SCHEMA_VERSION with LogCorruptError, and that refusal is the
-// migration story.
-//
-// Phase 5 (WORK_ORDER_PHASE5.md binding decision 1) stays at 3. A checkpoint's owner and a
-// blast-radius checkpoint's fired triggers are both needed by §8, and neither needs a field:
-// the owner is an operator declaration already durable in `RunStarted.data.config`
-// (`checkpoints.defaultOwner`), resolved by `checkpointOwner` against the in-force config at
-// the raise seq; the trigger set is a pure function of `DiffCaptured.files_touched` /
-// `.untracked` / `.insertions` / `.deletions` and that same in-force config, reproduced exactly
-// by re-running `classifyBlastRadius` over the log. Recording either would append a derived
-// fact to the source of truth. Bumping to 4 would also force `EventLog.open`'s
-// older-envelope refusal onto every existing v3 log, making every currently parked item
-// unresumable — the opposite of this phase's purpose.
-export const EVENT_SCHEMA_VERSION = 3;
+// V4 is the sole writable event envelope. V2 is replay-only and the complete Phase 5 v3
+// vocabulary remains an input-only format so parked logs can receive v4 appends without a
+// rewrite. StoredEventSchema performs the in-memory upcast to this single domain version.
+export const EVENT_SCHEMA_VERSION = 4;
 
 export const ACTOR_KINDS = ['supervisor', 'executor', 'human', 'oracle', 'system'] as const;
 export type ActorKind = (typeof ACTOR_KINDS)[number];
@@ -118,6 +106,9 @@ export const EVENT_TYPES = [
   'TestsTampered',
   'ItemArtifactRecorded',
   'DriftDetected',
+  'BrownfieldEvidenceRecorded',
+  'BrownfieldPredicateProposed',
+  'BrownfieldPredicateEvaluated',
   // H — task execution, causal escalation, and integration
   'TaskGraphActivated',
   'TaskStarted',
@@ -589,6 +580,7 @@ export const ItemArtifactRecordedData = z
 
 export const DriftDetectedData = z
   .object({
+    claim_item: WorkItemIdSchema,
     claim: ClaimIdSchema,
     expected: z.string(),
     observed: z.string(),
@@ -596,19 +588,98 @@ export const DriftDetectedData = z
   })
   .strict();
 
-export const AffectedScopeSchema = z.object({
-  req_ids: z.array(ReqIdSchema),
-  component_ids: z.array(ComponentIdSchema),
-  task_ids: z.array(TaskIdSchema),
-}).strict();
-export type AffectedScope = z.infer<typeof AffectedScopeSchema>;
-
 export const EvidenceRefSchema = z.object({
   sha256: z.string(),
   path: z.string(),
   bytes: z.number().int().nonnegative(),
 }).strict();
 export type EvidenceRef = z.infer<typeof EvidenceRefSchema>;
+
+export const BROWNFIELD_LADDER_TIERS = [
+  'mechanical-skeleton',
+  'git-archaeology',
+  'tests-as-spec',
+] as const;
+
+export const BrownfieldScopeSchema = z.object({
+  target_commit: z.string().min(1),
+  roots: z.array(z.string()),
+  paths: z.array(z.string()),
+  dependency_depth: z.number().int().nonnegative(),
+  max_files: z.number().int().positive(),
+  truncated: z.boolean(),
+  sha256: z.string().regex(/^[0-9a-f]{64}$/),
+}).strict();
+
+export const BrownfieldFactSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('file'), path: z.string(), sha256: z.string().regex(/^[0-9a-f]{64}$/), bytes: z.number().int().nonnegative() }).strict(),
+  z.object({ kind: z.literal('manifest'), path: z.string(), ecosystem: z.string() }).strict(),
+  z.object({ kind: z.literal('dependency-edge'), from: z.string(), to: z.string() }).strict(),
+  z.object({ kind: z.literal('entrypoint'), path: z.string(), source: z.string() }).strict(),
+  z.object({ kind: z.literal('framework'), name: z.string(), manifest_path: z.string() }).strict(),
+  z.object({ kind: z.literal('test-command'), name: z.string(), command: z.string(), manifest_path: z.string() }).strict(),
+  z.object({ kind: z.literal('git-vocabulary'), token: z.string(), count: z.number().int().nonnegative() }).strict(),
+  z.object({ kind: z.literal('git-churn'), path: z.string(), commits: z.number().int().nonnegative(), changed_lines: z.number().int().nonnegative() }).strict(),
+  z.object({ kind: z.literal('git-cochange'), left: z.string(), right: z.string(), commits: z.number().int().nonnegative() }).strict(),
+  z.object({ kind: z.literal('test-spec'), path: z.string(), test_id: z.string(), source_sha256: z.string().regex(/^[0-9a-f]{64}$/), bytes: z.number().int().nonnegative(), excerpt: z.string() }).strict(),
+]);
+
+export const BROWNFIELD_OMISSION_CODES = [
+  'scope-truncated', 'path-missing', 'path-invalid', 'path-unreadable', 'binary-file',
+  'file-too-large', 'unsupported-manifest', 'unsupported-test-syntax', 'not-git',
+  'shallow-history', 'git-object-missing', 'commit-too-wide', 'command-failed',
+  'timed-out', 'aborted', 'sandbox-unavailable', 'output-truncated',
+] as const;
+export const BrownfieldOmissionSchema = z.object({
+  subject: z.string().nullable(),
+  code: z.enum(BROWNFIELD_OMISSION_CODES),
+}).strict();
+
+export const BrownfieldEvidenceRecordedData = z.object({
+  ladder_tier: z.enum(BROWNFIELD_LADDER_TIERS),
+  collector_version: z.number().int().positive(),
+  target_repo_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  scope: BrownfieldScopeSchema,
+  coverage: z.enum(['complete', 'partial']),
+  facts: z.array(BrownfieldFactSchema),
+  omissions: z.array(BrownfieldOmissionSchema),
+  evidence: EvidenceRefSchema,
+}).strict();
+
+export const BrownfieldPredicateSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('path-exists'), path: z.string(), expected: z.boolean() }).strict(),
+  z.object({ kind: z.literal('json-pointer-equals'), path: z.string(), pointer: z.string(), expected: z.union([z.string(), z.number(), z.boolean(), z.null()]) }).strict(),
+  z.object({ kind: z.literal('text-includes'), path: z.string(), needle: z.string().min(1).max(512), expected: z.boolean() }).strict(),
+  z.object({ kind: z.literal('dependency-edge-exists'), from: z.string(), to: z.string(), expected: z.boolean() }).strict(),
+  z.object({ kind: z.literal('declared-command-exits'), command: z.string(), expected_exit_codes: z.array(z.number().int()).min(1) }).strict(),
+]);
+
+export const BrownfieldPredicateProposedData = z.object({
+  target_commit: z.string().min(1),
+  scope_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  subject: z.object({ claim_item: WorkItemIdSchema, claim: ClaimIdSchema }).strict().nullable(),
+  assertion: z.string().min(1),
+  area: z.string().nullable(),
+  predicate: BrownfieldPredicateSchema,
+}).strict();
+
+export const BrownfieldPredicateEvaluatedData = z.object({
+  proposal_event_id: EventIdSchema,
+  target_commit: z.string().min(1),
+  outcome: z.enum(['confirmed', 'refuted', 'inconclusive']),
+  reason: z.enum(['predicate-true', 'predicate-false', 'invalid-target', 'unavailable', 'unsafe', 'timed-out', 'aborted', 'spawn-error', 'nonzero-exit', 'output-truncated']),
+  expected: z.string(),
+  observed: z.string(),
+  duration_ms: z.number().int().nonnegative(),
+  evidence: EvidenceRefSchema,
+}).strict();
+
+export const AffectedScopeSchema = z.object({
+  req_ids: z.array(ReqIdSchema),
+  component_ids: z.array(ComponentIdSchema),
+  task_ids: z.array(TaskIdSchema),
+}).strict();
+export type AffectedScope = z.infer<typeof AffectedScopeSchema>;
 
 const OracleCommandSchema = z.object({
   kind: z.enum(ORACLE_KINDS), command: z.string().nullable(), sha256: z.string().nullable(),
@@ -836,6 +907,9 @@ const MEMBERS = {
     type: z.literal('DriftDetected'),
     data: DriftDetectedData,
   }),
+  BrownfieldEvidenceRecorded: EnvelopeSchema.extend({ type: z.literal('BrownfieldEvidenceRecorded'), data: BrownfieldEvidenceRecordedData }),
+  BrownfieldPredicateProposed: EnvelopeSchema.extend({ type: z.literal('BrownfieldPredicateProposed'), data: BrownfieldPredicateProposedData }),
+  BrownfieldPredicateEvaluated: EnvelopeSchema.extend({ type: z.literal('BrownfieldPredicateEvaluated'), data: BrownfieldPredicateEvaluatedData }),
   TaskGraphActivated: EnvelopeSchema.extend({ type: z.literal('TaskGraphActivated'), data: TaskGraphActivatedData }),
   TaskStarted: EnvelopeSchema.extend({ type: z.literal('TaskStarted'), data: TaskStartedData }),
   TaskAccepted: EnvelopeSchema.extend({ type: z.literal('TaskAccepted'), data: TaskAcceptedData }),
@@ -859,9 +933,15 @@ export const MienguEventSchema = z.discriminatedUnion(
 export type MienguEvent = z.infer<typeof MienguEventSchema>;
 export type EventOf<T extends EventType> = Extract<MienguEvent, { type: T }>;
 
-// V2 remains an input-only storage format. Its members deliberately reuse the Phase 2 data
-// schemas above; only the envelope version differs. Parsed legacy events are upcast in memory
-// to the sole current domain union and are never written back to disk.
+// V2 and the complete Phase 5 v3 vocabulary are input-only storage formats. Parsed legacy
+// events are upcast in memory to the sole current domain union and are never written back.
+const LegacyDriftDetectedData = z.object({
+  claim: ClaimIdSchema,
+  expected: z.string(),
+  observed: z.string(),
+  area: z.string().nullable(),
+}).strict();
+
 const V2EnvelopeSchema = EnvelopeSchema.extend({ schema_version: z.literal(2) });
 const V2_DATA = {
   WorkItemCreated: WorkItemCreatedData, WorkItemParked: WorkItemParkedData,
@@ -875,7 +955,7 @@ const V2_DATA = {
   BudgetExhausted: BudgetExhaustedData, CheckpointRaised: CheckpointRaisedData,
   CheckpointDecided: CheckpointDecidedData, AutoApproved: AutoApprovedData,
   AssumptionRecorded: AssumptionRecordedData, TestsFrozen: TestsFrozenData, TestsTampered: TestsTamperedData,
-  ItemArtifactRecorded: ItemArtifactRecordedData, DriftDetected: DriftDetectedData,
+  ItemArtifactRecorded: ItemArtifactRecordedData, DriftDetected: LegacyDriftDetectedData,
 } as const;
 const V2_EVENT_TYPES = Object.keys(V2_DATA) as readonly (keyof typeof V2_DATA)[];
 const V2_MEMBERS = Object.fromEntries(V2_EVENT_TYPES.map((type) => [
@@ -885,9 +965,56 @@ const V2_MEMBERS = Object.fromEntries(V2_EVENT_TYPES.map((type) => [
 const V2StoredEventSchema = z.discriminatedUnion(
   'type', Object.values(V2_MEMBERS) as [z.ZodDiscriminatedUnionOption<'type'>, ...z.ZodDiscriminatedUnionOption<'type'>[]],
 );
-export const StoredEventSchema: z.ZodType<MienguEvent> = z.union([MienguEventSchema, V2StoredEventSchema]).transform((event) =>
-  event.schema_version === 2 ? MienguEventSchema.parse({ ...event, schema_version: EVENT_SCHEMA_VERSION }) : event,
- ) as unknown as z.ZodType<MienguEvent>;
+const V3EnvelopeSchema = EnvelopeSchema.extend({ schema_version: z.literal(3) });
+const V3_DATA = {
+  ...V2_DATA,
+  TaskGraphActivated: TaskGraphActivatedData, TaskStarted: TaskStartedData,
+  TaskAccepted: TaskAcceptedData, FailureCauseOpened: FailureCauseOpenedData,
+  FailureAttempted: FailureAttemptedData, EscalationAdvanced: EscalationAdvancedData,
+  FailureCauseResolved: FailureCauseResolvedData, ArtifactsInvalidated: ArtifactsInvalidatedData,
+  OracleSweepStarted: OracleSweepStartedData, OracleResultRecorded: OracleResultRecordedData,
+  OracleSweepCompleted: OracleSweepCompletedData, WorkspaceCheckpointed: WorkspaceCheckpointedData,
+  WorkspaceRestored: WorkspaceRestoredData, FinalPatchCaptured: FinalPatchCapturedData,
+} as const;
+const V3_EVENT_TYPES = Object.keys(V3_DATA) as readonly (keyof typeof V3_DATA)[];
+const V3_MEMBERS = Object.fromEntries(V3_EVENT_TYPES.map((type) => [
+  type,
+  V3EnvelopeSchema.extend({ type: z.literal(type), data: V3_DATA[type] }),
+])) as unknown as { [T in keyof typeof V3_DATA]: z.ZodObject<z.ZodRawShape> };
+const V3StoredEventSchema = z.discriminatedUnion(
+  'type', Object.values(V3_MEMBERS) as [z.ZodDiscriminatedUnionOption<'type'>, ...z.ZodDiscriminatedUnionOption<'type'>[]],
+);
+
+const LEGACY_STORED_EVENT = Symbol('miengu.legacy-stored-event');
+
+/** True only for an event object produced by upcasting a legacy stored envelope. The marker
+ * is deliberately non-enumerable so canonical event JSON and replay identity are unchanged. */
+export function isLegacyStoredEvent(event: MienguEvent): boolean {
+  return (event as MienguEvent & { readonly [LEGACY_STORED_EVENT]?: true })[LEGACY_STORED_EVENT] === true;
+}
+
+export const StoredEventSchema: z.ZodType<MienguEvent> = z
+  .union([MienguEventSchema, V2StoredEventSchema, V3StoredEventSchema])
+  .transform((input) => {
+    const event = input as unknown as {
+      schema_version: number;
+      type: string;
+      item_id: string;
+      data: Record<string, unknown>;
+    };
+    if (event.schema_version === EVENT_SCHEMA_VERSION) return event;
+    const data = event.type === 'DriftDetected'
+      ? { ...event.data, claim_item: event.item_id }
+      : event.data;
+    const upcast = MienguEventSchema.parse({ ...event, schema_version: EVENT_SCHEMA_VERSION, data });
+    Object.defineProperty(upcast, LEGACY_STORED_EVENT, {
+      value: true,
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
+    return upcast;
+  }) as unknown as z.ZodType<MienguEvent>;
 export type StoredEvent = z.infer<typeof StoredEventSchema>;
 
 /** §7 default provenance per event type. The appender uses this unless overridden. */
@@ -920,6 +1047,9 @@ export const DEFAULT_TIER = {
   TestsTampered: 'T1',
   ItemArtifactRecorded: 'T2',
   DriftDetected: 'T1',
+  BrownfieldEvidenceRecorded: 'T1',
+  BrownfieldPredicateProposed: 'T2',
+  BrownfieldPredicateEvaluated: 'T1',
   TaskGraphActivated: 'T1',
   TaskStarted: 'T1',
   TaskAccepted: 'T1',

@@ -24,17 +24,21 @@ function hexId(prefix: string, n: number): string {
 }
 
 interface EventBuilder {
+  readonly itemId: string;
+  lastEventId: MienguEvent['event_id'] | null;
   readonly mkEvent: (type: EventType, data: unknown, causationId?: MienguEvent['causation_id']) => MienguEvent;
 }
 
 function makeItemBuilder(itemId: string): EventBuilder {
   let seq = 0;
-  return {
+  const builder: EventBuilder = {
+    itemId,
+    lastEventId: null,
     mkEvent(type: EventType, data: unknown, causationId: MienguEvent['causation_id'] = null): MienguEvent {
       seq += 1;
       globalCounter += 1;
-      return MienguEventSchema.parse({
-        schema_version: 3,
+      const event = MienguEventSchema.parse({
+        schema_version: 4,
         event_id: hexId('evt', globalCounter),
         seq,
         item_id: itemId,
@@ -46,8 +50,11 @@ function makeItemBuilder(itemId: string): EventBuilder {
         type,
         data,
       });
+      builder.lastEventId = event.event_id;
+      return event;
     },
   };
+  return builder;
 }
 
 function itemInput(itemId: string, events: readonly MienguEvent[]): BatchReportItemInput {
@@ -160,7 +167,8 @@ function driftDetected(
   observed: string,
   area: string | null = null,
 ): MienguEvent {
-  return eb.mkEvent('DriftDetected', { claim, expected, observed, area });
+  if (eb.lastEventId === null) throw new Error('drift fixture requires a prior event');
+  return eb.mkEvent('DriftDetected', { claim_item: eb.itemId, claim, expected, observed, area }, eb.lastEventId);
 }
 
 /** By default every oracle is skipped (declared with `command: null`). `activeKinds` names
@@ -339,6 +347,7 @@ function buildShippedItem(
         ],
         components: [{ component_id: componentId, responsibility: 'r', paths: [], depends_on: [] }],
         interfaces: [],
+        falsifications: [],
       },
     }),
   );
@@ -544,6 +553,7 @@ describe('agentOriginated', () => {
           ],
           components: [],
           interfaces: [],
+          falsifications: [],
         },
       }),
     );
@@ -635,6 +645,7 @@ describe('drift', () => {
           decisions: [],
           components: [{ component_id: 'component-drift-1', responsibility: 'r', paths: [], depends_on: [] }],
           interfaces: [],
+          falsifications: [],
         },
       }),
     );
@@ -672,6 +683,7 @@ describe('drift', () => {
         decisions: [],
         components: [{ component_id: 'component-drift3-other-1', responsibility: 'r', paths: [], depends_on: [] }],
         interfaces: [],
+        falsifications: [],
       },
     });
     // Re-sequence this extra event onto the end of the already-built item log.

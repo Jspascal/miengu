@@ -206,7 +206,7 @@ describe('replayCommand', () => {
     const lines = raw.trim().split('\n');
     expect(lines.length).toBeGreaterThan(2);
     const firstLine = JSON.parse(lines[0] ?? '{}') as { schema_version: number };
-    expect(firstLine.schema_version).toBe(3);
+    expect(firstLine.schema_version).toBe(4);
     firstLine.schema_version = 1;
     lines[0] = JSON.stringify(firstLine);
     await writeFile(paths.eventsFile, `${lines.join('\n')}\n`, 'utf8');

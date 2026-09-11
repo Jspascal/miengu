@@ -33,6 +33,7 @@ export interface ItemPaths {
   readonly transcriptsDir: string;
   readonly diffsDir: string;
   readonly oraclesDir: string;
+  readonly brownfieldDir: string;
   readonly workspacesDir: string;
 }
 
@@ -46,6 +47,7 @@ export function itemPaths(storeDir: string, itemId: WorkItemId): ItemPaths {
     transcriptsDir: join(itemDir, 'transcripts'),
     diffsDir: join(itemDir, 'diffs'),
     oraclesDir: join(itemDir, 'oracles'),
+    brownfieldDir: join(itemDir, 'brownfield'),
     workspacesDir: join(itemDir, 'workspaces'),
   };
 }
@@ -268,6 +270,68 @@ async function scanAndRecover(
   return { lastSeq, lastEventId, truncatedBytes, containsV2 };
 }
 
+export type FullLogValidation =
+  | { readonly ok: true; readonly events: readonly MienguEvent[] }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Non-mutating validation of a complete event-log file body, for readers that must not repair
+ * or lock the log they inspect (notably brownfield sibling-store scans).  Applies the same
+ * rules the writable-open scan enforces — ownership, first event, contiguous sequence — but
+ * reports the first failure as a classified reason instead of throwing or truncating.  A
+ * non-newline-terminated final fragment is ignored as never durable, exactly as the
+ * writable-open scan and the replay reader treat a torn tail; the preceding durable lines are
+ * still fully validated.  An empty body is a valid empty log.
+ */
+export function validateFullLog(content: string, itemId: WorkItemId): FullLogValidation {
+  if (content.length === 0) {
+    return { ok: true, events: [] };
+  }
+  const lines = content.split('\n').slice(0, -1);
+  const events: MienguEvent[] = [];
+  let lastSeq = 0;
+  for (let i = 0; i < lines.length; i += 1) {
+    const lineNumber = i + 1;
+    const line = lines[i];
+    if (line === undefined) {
+      continue;
+    }
+    let parsedJson: unknown;
+    try {
+      parsedJson = JSON.parse(line);
+    } catch {
+      return { ok: false, reason: `line ${String(lineNumber)}: not valid JSON` };
+    }
+    const result = StoredEventSchema.safeParse(parsedJson);
+    if (!result.success) {
+      return { ok: false, reason: `line ${String(lineNumber)}: failed schema validation` };
+    }
+    const event = result.data;
+    if (lineNumber === 1 && event.type !== 'WorkItemCreated') {
+      return {
+        ok: false,
+        reason: `line 1: first event must be WorkItemCreated, got "${event.type}"`,
+      };
+    }
+    if (event.item_id !== itemId) {
+      return {
+        ok: false,
+        reason: `line ${String(lineNumber)}: item_id "${event.item_id}" does not match expected "${itemId}"`,
+      };
+    }
+    const expectedSeq = lastSeq + 1;
+    if (event.seq !== expectedSeq) {
+      return {
+        ok: false,
+        reason: `line ${String(lineNumber)}: seq ${String(event.seq)} is not contiguous (expected ${String(expectedSeq)})`,
+      };
+    }
+    lastSeq = event.seq;
+    events.push(event);
+  }
+  return { ok: true, events };
+}
+
 export interface AppendInput {
   readonly type: EventType;
   readonly data: unknown;
@@ -332,6 +396,7 @@ export class EventLog {
     await mkdir(paths.transcriptsDir, { recursive: true });
     await mkdir(paths.diffsDir, { recursive: true });
     await mkdir(paths.oraclesDir, { recursive: true });
+    await mkdir(paths.brownfieldDir, { recursive: true });
     await mkdir(paths.workspacesDir, { recursive: true });
     const createHandle = await fsOpen(paths.eventsFile, 'wx');
     await createHandle.close();

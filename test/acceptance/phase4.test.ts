@@ -122,6 +122,7 @@ const ARCHITECTURE_PLAN_P4 = {
       req_ids: ['REQ-example-1'],
     },
   ],
+  falsifications: [],
 };
 
 const TASK_GRAPH_P4 = {
@@ -560,7 +561,7 @@ describe('Phase 4 acceptance: claims, provenance, context isolation, human view,
     const observedText = sentinel('quarantine-observed');
     await ctx.log.append({
       type: 'DriftDetected',
-      data: { claim: componentClaim.id, expected: expectedText, observed: observedText, area: null },
+      data: { claim_item: ctx.itemId, claim: componentClaim.id, expected: expectedText, observed: observedText, area: null },
       actor: { kind: 'system', id: null },
       causationId: ctx.log.lastEventId,
     });
@@ -644,8 +645,8 @@ describe('Phase 4 acceptance: claims, provenance, context isolation, human view,
   // Storage-format invariants: no event type added, no projection bump, replay still MATCHes.
   // ---------------------------------------------------------------------------------------
   it('EVENT_SCHEMA_VERSION and PROJECTION_VERSION are unchanged, and miengu replay reports MATCH', async () => {
-    expect(EVENT_SCHEMA_VERSION).toBe(3);
-    expect(PROJECTION_VERSION).toBe(4);
+    expect(EVENT_SCHEMA_VERSION).toBe(4);
+    expect(PROJECTION_VERSION).toBe(5);
 
     const replayResult = await replayCommand({ itemId: ctx.itemId, configPath: ctx.configPath, json: true });
     expect(replayResult).toBe(EXIT.OK);

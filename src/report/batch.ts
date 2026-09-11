@@ -16,7 +16,7 @@ import type { ProvenanceTier } from '../core/provenance.js';
 import type { CheckpointStateRecord, WorkItemState } from '../state/workitem.js';
 import { project } from '../state/projector.js';
 import type { Claim, ClaimSet, ContestedOutcome } from '../wiki/records.js';
-import { activeClaims, claimComponents, deriveClaims } from '../wiki/records.js';
+import { activeClaims, claimComponents, deriveStoreClaimSets } from '../wiki/records.js';
 import { ImplementationSchema } from '../contracts/implementation.js';
 import { assumptionFacts, escalates } from '../supervisor/assumptions.js';
 import { blastRadiusInput, classifyBlastRadius } from '../supervisor/blastRadius.js';
@@ -43,6 +43,9 @@ export interface BatchReportInput {
   readonly since: IsoTimestamp | null;
   readonly items: readonly BatchReportItemInput[];
   readonly corrupt: readonly { readonly itemId: WorkItemId; readonly error: string }[];
+  /** Event-id keyed raw evidence availability, supplied by the I/O command.  Pure callers may
+   * omit it when attachment state is unavailable. */
+  readonly attachmentAvailability?: ReadonlyMap<EventId, boolean>;
 }
 
 export interface BlockedCheckpoint {
@@ -101,7 +104,11 @@ export interface OracleFailureEntry {
 }
 
 export interface DriftEntry {
+  /** Item that recorded the observation. */
   readonly itemId: WorkItemId;
+  readonly observerItemId: WorkItemId;
+  /** Item that minted the drift target; equals observerItemId for v3/local drift. */
+  readonly ownerItemId: WorkItemId;
   readonly claimId: ClaimId;
   readonly resolution: 'claim-quarantined' | ContestedOutcome;
   readonly expected: string;
@@ -110,6 +117,7 @@ export interface DriftEntry {
   /** True when the drifted claim's components intersect this item's touched components. */
   readonly touched: boolean;
   readonly wikiLink: string | null;
+  readonly attachmentAvailable: boolean | null;
 }
 
 export interface ShippedTask {
@@ -230,13 +238,20 @@ interface LoadedItem {
  * unfiltered — a corrupt item has no `state.updatedAt` to filter against.
  */
 export function buildBatchReport(i: BatchReportInput): BatchReport {
-  const loaded: LoadedItem[] = i.items.map((item) => ({
+  const storeClaimSets = deriveStoreClaimSets(i.items.map((item) => ({ events: item.events })));
+  const loaded: LoadedItem[] = i.items.map((item) => {
+    const claimSet = storeClaimSets.get(item.itemId);
+    if (claimSet === undefined) {
+      throw new Error(`buildBatchReport missing claim set for ${item.itemId}`);
+    }
+    return ({
     itemId: item.itemId,
     events: item.events,
     state: project(item.events),
-    claimSet: deriveClaims(item.events),
+    claimSet,
     eventsById: new Map(item.events.map((e) => [e.event_id, e])),
-  }));
+    });
+  });
 
   const qualifying =
     i.since === null
@@ -400,66 +415,65 @@ export function buildBatchReport(i: BatchReportInput): BatchReport {
       (ORACLE_KINDS.indexOf(a.kind) - ORACLE_KINDS.indexOf(b.kind)),
   );
 
-  // --- drift in touched areas first (decision 18, position 5): quarantined claims and
-  // ClaimSet.contested (decision 5), never state.drift's raw event log directly. ---
+  // --- drift in touched areas first (decision 18, position 5).  The event's envelope item is
+  // the observer and its qualified claim_item is the owner; store-wide claim sets above resolve
+  // the latter without conflating equal claim ids from different work items. ---
   const drift: DriftEntry[] = [];
   for (const l of qualifying) {
-    const driftEventArea = new Map<EventId, string | null>();
-    for (const e of l.events) {
-      if (e.type === 'DriftDetected') {
-        driftEventArea.set(e.event_id, e.data.area);
-      }
-    }
-    const acceptedTaskComponents = new Set<string>();
+    const relevantComponents = new Set<string>();
     if (l.state.tasks !== null) {
       for (const record of Object.values(l.state.tasks.records)) {
-        if (record.status !== 'accepted') {
+        if (record.status !== 'accepted' && record.taskId !== l.state.tasks.currentTaskId) {
           continue;
         }
         const taskClaim = findTaskClaim(l.claimSet, record.taskId);
         if (taskClaim !== null) {
           for (const c of taskClaim.trace.componentIds) {
-            acceptedTaskComponents.add(c);
+            relevantComponents.add(c);
           }
         }
       }
     }
-    const touchedFor = (componentIds: readonly string[]): boolean =>
-      componentIds.some((c) => acceptedTaskComponents.has(c));
-
-    for (const claim of l.claimSet.claims) {
-      if (claim.status !== 'quarantined' || claim.quarantine === null) {
-        continue;
-      }
+    const scopePaths = l.events
+      .filter((event): event is Extract<MienguEvent, { type: 'BrownfieldEvidenceRecorded' }> => event.type === 'BrownfieldEvidenceRecorded')
+      .flatMap((event) => event.data.scope.paths);
+    const touchedFor = (claim: Claim | undefined): boolean =>
+      claim !== undefined && (
+        claim.trace.componentIds.some((component) => relevantComponents.has(component)) ||
+        claim.trace.paths.some((path) => scopePaths.includes(path))
+      );
+    for (const event of l.events) {
+      if (event.type !== 'DriftDetected') continue;
+      const ownerSet = storeClaimSets.get(event.data.claim_item);
+      const claim = ownerSet?.byId[event.data.claim];
+      const contested = ownerSet?.contested.find((entry) => entry.byEventId === event.event_id);
+      const resolution: DriftEntry['resolution'] =
+        claim?.quarantine?.byEventId === event.event_id
+          ? 'claim-quarantined'
+          : (contested?.outcome ?? 'unknown-claim');
       drift.push({
         itemId: l.itemId,
-        claimId: claim.id,
-        resolution: 'claim-quarantined',
-        expected: claim.quarantine.expected,
-        observed: claim.quarantine.observed,
-        area: driftEventArea.get(claim.quarantine.byEventId) ?? null,
-        touched: touchedFor(claim.trace.componentIds),
-        wikiLink: wikiLinkFor(l.itemId, claim),
-      });
-    }
-    for (const c of l.claimSet.contested) {
-      const claim = l.claimSet.byId[c.claimId];
-      drift.push({
-        itemId: l.itemId,
-        claimId: c.claimId,
-        resolution: c.outcome,
-        expected: c.expected,
-        observed: c.observed,
-        area: driftEventArea.get(c.byEventId) ?? null,
-        touched: claim !== undefined ? touchedFor(claim.trace.componentIds) : false,
-        wikiLink: claim !== undefined ? wikiLinkFor(l.itemId, claim) : null,
+        observerItemId: l.itemId,
+        ownerItemId: event.data.claim_item,
+        claimId: event.data.claim,
+        resolution,
+        expected: event.data.expected,
+        observed: event.data.observed,
+        area: event.data.area,
+        touched: touchedFor(claim),
+        wikiLink: claim !== undefined ? wikiLinkFor(event.data.claim_item, claim) : null,
+        attachmentAvailable:
+          event.causation_id === null
+            ? null
+            : (i.attachmentAvailability?.get(event.causation_id) ?? null),
       });
     }
   }
   drift.sort(
     (a, b) =>
       (b.touched ? 1 : 0) - (a.touched ? 1 : 0) ||
-      defaultCompare(a.itemId, b.itemId) ||
+      defaultCompare(a.observerItemId, b.observerItemId) ||
+      defaultCompare(a.ownerItemId, b.ownerItemId) ||
       defaultCompare(a.claimId, b.claimId),
   );
 
@@ -576,6 +590,12 @@ type ReportStringKey =
   | 'labelObserved'
   | 'labelArea'
   | 'labelTouched'
+  | 'labelObserver'
+  | 'labelOwnerItem'
+  | 'labelAttachment'
+  | 'labelAvailable'
+  | 'labelUnavailable'
+  | 'labelUnknown'
   | 'labelYes'
   | 'labelNo'
   | 'labelFilesTouched'
@@ -637,6 +657,12 @@ const REPORT_STRINGS: Record<'fr' | 'en', Record<ReportStringKey, string>> = {
     labelObserved: 'observed',
     labelArea: 'area',
     labelTouched: 'touched',
+    labelObserver: 'observer',
+    labelOwnerItem: 'owner item',
+    labelAttachment: 'attachment',
+    labelAvailable: 'available',
+    labelUnavailable: 'unavailable',
+    labelUnknown: 'unknown',
     labelYes: 'yes',
     labelNo: 'no',
     labelFilesTouched: 'files touched',
@@ -695,6 +721,12 @@ const REPORT_STRINGS: Record<'fr' | 'en', Record<ReportStringKey, string>> = {
     labelObserved: 'observé',
     labelArea: 'zone',
     labelTouched: 'touché',
+    labelObserver: 'observateur',
+    labelOwnerItem: 'élément propriétaire',
+    labelAttachment: 'pièce jointe',
+    labelAvailable: 'disponible',
+    labelUnavailable: 'indisponible',
+    labelUnknown: 'inconnu',
     labelYes: 'oui',
     labelNo: 'non',
     labelFilesTouched: 'fichiers touchés',
@@ -820,8 +852,11 @@ export function renderBatchReport(r: BatchReport, locale: 'fr' | 'en'): string {
       const note = d.resolution === 'unknown-claim' ? ` (${s.driftClaimNotFound})` : '';
       const areaPart = d.area !== null ? ` (${s.labelArea}: ${d.area})` : '';
       const linkPart = d.wikiLink !== null ? ` — ${d.wikiLink}` : '';
+      const attachment = d.attachmentAvailable === null
+        ? s.labelUnknown
+        : (d.attachmentAvailable ? s.labelAvailable : s.labelUnavailable);
       parts.push(
-        `- [${d.itemId}] ${d.claimId}${note} — ${resolutionLabel(d.resolution, s)} — ${s.labelExpected}: ${d.expected} / ${s.labelObserved}: ${d.observed}${areaPart} — ${s.labelTouched}: ${d.touched ? s.labelYes : s.labelNo}${linkPart}`,
+        `- [${d.observerItemId}] ${d.claimId}${note} — ${resolutionLabel(d.resolution, s)} — ${s.labelObserver}: ${d.observerItemId} — ${s.labelOwnerItem}: ${d.ownerItemId} — ${s.labelExpected}: ${d.expected} / ${s.labelObserved}: ${d.observed}${areaPart} — ${s.labelTouched}: ${d.touched ? s.labelYes : s.labelNo} — ${s.labelAttachment}: ${attachment}${linkPart}`,
       );
     }
   }

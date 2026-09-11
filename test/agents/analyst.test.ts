@@ -277,3 +277,33 @@ describe('analystModule', () => {
     expect(analystModule.artifactKind).toBe('requirement-set');
   });
 });
+
+describe('analystModule.validate', () => {
+  const ctx = {
+    requirementSet: null, architecturePlan: null, taskGraph: null,
+    maxPathsPerTask: 8, testDirs: [] as string[],
+  };
+
+  function setWith(question: string): RequirementSet {
+    return RequirementSetSchema.parse({
+      requirements: [
+        {
+          req_id: 'REQ-example-1', statement: 'a', rationale: 'b',
+          acceptance: ['c'], priority: 'must', source_span: 'quoted text',
+        },
+      ],
+      ambiguities: [{ question, affects: ['REQ-example-1'], options: ['a', 'b'], recommended: null }],
+      out_of_scope: [],
+    });
+  }
+
+  it('rejects an ambiguity the brownfield ladder can answer mechanically', () => {
+    const failures = analystModule.validate(setWith('Does src/app.ts exist in the current tree?'), ctx);
+    expect(failures.some((f) => f.includes('mechanically answerable'))).toBe(true);
+  });
+
+  it('allows a genuine intent question', () => {
+    const failures = analystModule.validate(setWith('Should the product charge admins a monthly fee?'), ctx);
+    expect(failures.some((f) => f.includes('mechanically answerable'))).toBe(false);
+  });
+});

@@ -5,6 +5,7 @@ import type { ContextPackSection } from '../wiki/contextpack.js';
 import { packSection } from '../wiki/contextpack.js';
 import { checkRequirementSet } from './checks.js';
 import type { CheckContext } from './checks.js';
+import { isIntentQuestion } from '../brownfield/bootstrap.js';
 import { renderEscalationContext } from './agent.js';
 import type { PackBuildInput, PostStepInput, PostStepResult, RoleModule } from './agent.js';
 import type { AppendInput } from '../core/log.js';
@@ -58,7 +59,20 @@ export function buildTaskSection(): string {
 }
 
 export function validate(artifact: unknown, c: CheckContext): readonly string[] {
-  return checkRequirementSet(artifact as RequirementSet, c);
+  const requirementSet = artifact as RequirementSet;
+  const failures = [...checkRequirementSet(requirementSet, c)];
+  // Only genuine intent belongs in an ambiguity: anything the brownfield ladder can settle
+  // mechanically (a path, a file, a framework, a command, a dependency, current behaviour)
+  // must be answered from evidence, never raised as a question for a human.
+  for (const ambiguity of requirementSet.ambiguities) {
+    if (!isIntentQuestion(ambiguity.question)) {
+      failures.push(
+        `ambiguity ${JSON.stringify(ambiguity.question)} is mechanically answerable and is not ` +
+          'a genuine intent question',
+      );
+    }
+  }
+  return failures;
 }
 
 /** Maps a `CheckpointDraft` (`src/supervisor/checkpointPolicy.ts`) onto the snake_case

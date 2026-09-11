@@ -167,6 +167,7 @@ const ARCHITECTURE_PLAN = {
       req_ids: ['REQ-example-1'],
     },
   ],
+  falsifications: [],
 };
 
 const TASK_GRAPH = {
@@ -662,6 +663,7 @@ describe('Phase 2 acceptance: the ten delta criteria', () => {
           req_ids: ['REQ-example-1', 'REQ-example-2'],
         },
       ],
+      falsifications: [],
     };
 
     const CYCLIC_TASK_GRAPH = {

@@ -21,7 +21,7 @@ function tsAt(n: number): string {
 
 function mkEvent(seq: number, type: EventType, data: unknown): MienguEvent {
   return MienguEventSchema.parse({
-    schema_version: 3,
+    schema_version: 4,
     event_id: hexId('evt', seq),
     seq,
     item_id: ITEM_ID,

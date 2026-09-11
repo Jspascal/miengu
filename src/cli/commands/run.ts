@@ -1,10 +1,13 @@
-import { mkdir, stat } from 'node:fs/promises';
+import { mkdir, readFile, stat } from 'node:fs/promises';
 import { basename, extname, join, resolve } from 'node:path';
 import { assertNever } from '../../core/events.js';
-import type { RunOutcome, Stage } from '../../core/events.js';
-import { sha256File } from '../../core/hash.js';
-import { itemPaths } from '../../core/log.js';
-import { EventLog, listItemIds } from '../../core/log.js';
+import type { MienguEvent, RunOutcome, Stage } from '../../core/events.js';
+import { sha256File, sha256Hex } from '../../core/hash.js';
+import { EventLog, itemPaths, listItemIds, validateFullLog } from '../../core/log.js';
+import { collectSkeleton } from '../../brownfield/skeleton.js';
+import { collectGit } from '../../brownfield/git.js';
+import { collectTests } from '../../brownfield/tests.js';
+import { evaluatePredicate } from '../../brownfield/falsification.js';
 import { epochSeconds, systemClock } from '../../core/clock.js';
 import type { Clock } from '../../core/clock.js';
 import { createIdMinter, systemRng } from '../../core/idgen.js';
@@ -108,12 +111,14 @@ async function runOneItem(o: {
   const messagesDir = join(paths.itemDir, 'messages');
   const frozenTestsDir = join(paths.itemDir, 'frozen-tests');
   const oraclesDir = paths.oraclesDir;
+  const brownfieldDir = paths.brownfieldDir;
   await Promise.all([
     mkdir(promptsDir, { recursive: true }),
     mkdir(schemasDir, { recursive: true }),
     mkdir(messagesDir, { recursive: true }),
     mkdir(frozenTestsDir, { recursive: true }),
     mkdir(oraclesDir, { recursive: true }),
+    mkdir(brownfieldDir, { recursive: true }),
   ]);
 
   const executors = buildExecutorRegistry({
@@ -153,6 +158,41 @@ async function runOneItem(o: {
     logger,
     signal,
     retainWorkspace,
+    brownfield: {
+      storeDir: loaded.storeDir,
+      evidenceDir: brownfieldDir,
+      targetRepoSha256: sha256Hex(loaded.targetRepo),
+      collectorVersion: 1,
+      collector: { collectSkeleton, collectGit, collectTests },
+      predicateRunner: { evaluate: evaluatePredicate },
+      readStore: async () => {
+        const items = [] as { itemId: WorkItemId; events: readonly MienguEvent[] }[];
+        const corrupt = [] as { itemId: WorkItemId; error: string }[];
+        for (const siblingId of await listItemIds(loaded.storeDir)) {
+          let raw: string;
+          try {
+            raw = await readFile(itemPaths(loaded.storeDir, siblingId).eventsFile, 'utf8');
+          } catch (error) {
+            corrupt.push({ itemId: siblingId, error: error instanceof Error ? error.message : String(error) });
+            continue;
+          }
+          const validation = validateFullLog(raw, siblingId);
+          if (!validation.ok) {
+            corrupt.push({ itemId: siblingId, error: validation.reason });
+            continue;
+          }
+          if (validation.events.length === 0) {
+            // A valid empty log (created but never given its WorkItemCreated, or whose only
+            // line is a never-durable torn tail) cannot be projected by deriveStoreClaimSets.
+            // Classify it as unusable alongside genuinely corrupt siblings.
+            corrupt.push({ itemId: siblingId, error: 'empty log: no durable events' });
+            continue;
+          }
+          items.push({ itemId: siblingId, events: validation.events });
+        }
+        return { items, corrupt };
+      },
+    },
   };
 
   let result = await runItem(deps);

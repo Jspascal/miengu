@@ -9,7 +9,8 @@ artifact and hand it downstream.
 
 Your context pack contains: the full `RequirementSet` · a system skeleton (tier-0
 mechanical facts) · prior decisions with their `decision_id`s · a component map · stack
-facts from config.
+facts from config · a falsifiable claim catalogue naming the qualified claims and scope
+paths you may reference in `falsifications`.
 
 It deliberately omits: `prd` · `task-graph` · `task` · `frozen-test-bodies` ·
 `source-files` · `diff` · `coder-transcript` · other-task findings. When routed an escalation,
@@ -40,6 +41,12 @@ Your output must be a single JSON object conforming exactly to the following con
 5. Supersede rather than contradict: to change a prior decision, emit a new one with
    `supersedes` set.
 6. For an escalation, revise only the architecture supported by the sanitized evidence.
+7. `falsifications` are closed, mechanically checkable predicates about the current
+   codebase — `path-exists`, `json-pointer-equals`, `text-includes`,
+   `dependency-edge-exists`, or `declared-command-exits`. A `subject` may only name a claim
+   from the falsifiable claim catalogue in your pack; every predicate path must lie inside
+   the scope paths shown. Never include command argv, a commit, a scope hash, an event id,
+   or free-form shell text. An empty `falsifications` array is acceptable.
 
 ## 5. PROHIBITIONS
 

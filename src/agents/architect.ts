@@ -42,6 +42,7 @@ export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[
   for (const systemSkeleton of i.raw.systemSkeleton) {
     sections.push(packSection('system-skeleton', 'System skeleton', systemSkeleton.body, systemSkeleton.tier, systemSkeleton.sourceEventId));
   }
+  addBrownfieldSections(sections, i);
   if (i.checkContext.requirementSet !== null) {
     sections.push(
       packSection(
@@ -71,10 +72,31 @@ export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[
   return sections;
 }
 
+function addBrownfieldSections(sections: ContextPackSection[], i: PackBuildInput): void {
+  for (const history of i.raw.brownfieldHistory ?? []) {
+    sections.push(packSection('brownfield-history', 'Brownfield history', history.body, history.tier, history.sourceEventId));
+  }
+  for (const falsification of i.raw.brownfieldFalsification ?? []) {
+    sections.push(packSection('brownfield-falsification', 'Brownfield falsification', falsification.body, falsification.tier, falsification.sourceEventId));
+  }
+  for (const catalogue of i.raw.brownfieldFalsifiableClaims ?? []) {
+    sections.push(packSection('brownfield-falsification', 'Falsifiable claim catalogue', catalogue.body, catalogue.tier, catalogue.sourceEventId));
+  }
+  for (const drift of i.raw.brownfieldDrift ?? []) {
+    sections.push(packSection('brownfield-drift', 'Touched brownfield drift', drift.body, drift.tier, drift.sourceEventId));
+  }
+}
+
 export function buildTaskSection(): string {
   return 'Read the requirements above and produce an ArchitecturePlan: decisions with their ' +
     'req_ids (empty when agent-originated), a component map, and interfaces precise enough ' +
-    'for the Test Author to write against without seeing an implementation.';
+    'for the Test Author to write against without seeing an implementation. Populate ' +
+    '`falsifications` with closed predicates (path-exists, json-pointer-equals, text-includes, ' +
+    'dependency-edge-exists, declared-command-exits) that a later loop can mechanically check ' +
+    'against the current codebase; a `subject` may only name a claim from the falsifiable ' +
+    'claim catalogue above, every predicate path must lie inside the scope shown, and an ' +
+    'empty array is acceptable. Never put command argv, commits, or free-form shell text in a ' +
+    'falsification.';
 }
 
 export function validate(artifact: unknown, c: CheckContext): readonly string[] {

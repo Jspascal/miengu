@@ -24,7 +24,7 @@ function mkEvent(
   ts?: string,
 ): MienguEvent {
   return MienguEventSchema.parse({
-    schema_version: 3,
+    schema_version: 4,
     event_id: hexId('evt', seq),
     seq,
     item_id: itemId,
@@ -70,11 +70,13 @@ function architecturePlanBody(overrides?: {
   decisions?: unknown[];
   components?: unknown[];
   interfaces?: unknown[];
+  falsifications?: unknown[];
 }): unknown {
   return {
     decisions: overrides?.decisions ?? [],
     components: overrides?.components ?? [],
     interfaces: overrides?.interfaces ?? [],
+    falsifications: overrides?.falsifications ?? [],
   };
 }
 
@@ -134,6 +136,7 @@ function diffCaptured(itemId: string, seq: number, filesTouched: string[]): Mien
 
 function driftDetected(itemId: string, seq: number, claim: string): MienguEvent {
   return mkEvent(itemId, seq, 'DriftDetected', {
+    claim_item: itemId,
     claim,
     expected: 'expected value',
     observed: 'observed value',

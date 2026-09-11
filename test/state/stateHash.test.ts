@@ -64,4 +64,20 @@ describe('stateHash', () => {
     const b: WorkItemState = { ...a, budget: { ...a.budget, consumed: { ...a.budget.consumed, turns: 1 } } };
     expect(stateHash(a)).not.toBe(stateHash(b));
   });
+
+  it('a qualified drift target change alters the hash', () => {
+    const a = baseState();
+    const b: WorkItemState = {
+      ...a,
+      drift: [{
+        claimItem: 'wi-other-abc123' as WorkItemState['itemId'],
+        claim: 'claim-example-1' as WorkItemState['drift'][number]['claim'],
+        expected: 'expected',
+        observed: 'observed',
+        area: null,
+        at: a.createdAt,
+      }],
+    };
+    expect(stateHash(a)).not.toBe(stateHash(b));
+  });
 });

@@ -1,4 +1,4 @@
-import { assertNever } from '../core/events.js';
+import { assertNever, isLegacyStoredEvent } from '../core/events.js';
 import type { MienguEvent } from '../core/events.js';
 import { ProjectionError } from '../errors.js';
 import { EMPTY_BUDGET_STATE, foldConsumed, foldExhausted } from '../supervisor/budget.js';
@@ -67,7 +67,11 @@ function buildInitialState(event: Extract<MienguEvent, { type: 'WorkItemCreated'
  * `e.item_id === s.itemId`, else `ProjectionError`. Never mutates `state`; always returns a
  * new object.
  */
-export function applyEvent(state: WorkItemState | null, event: MienguEvent): WorkItemState {
+export function applyEvent(
+  state: WorkItemState | null,
+  event: MienguEvent,
+  priorEvents?: ReadonlyMap<EventId, MienguEvent>,
+): WorkItemState {
   if (state === null) {
     if (event.type !== 'WorkItemCreated') {
       throw new ProjectionError(
@@ -492,11 +496,22 @@ export function applyEvent(state: WorkItemState | null, event: MienguEvent): Wor
       };
     }
     case 'DriftDetected': {
+      const priorEventIds = state.priorEventIds ?? (state.lastEventId === null ? [] : [state.lastEventId]);
+      // A native v4 drift event always carries a causal anchor to the evidence or
+      // evaluation event it was derived from. A legacy v3 drift upcast to v4 (WORK_ORDER
+      // decision 4) predates that rule and may carry none; tolerate a missing anchor only
+      // while replaying a stored stream (`priorEvents` supplied) so upcast v3 logs stay
+      // replayable and appendable. A fresh append keeps the strict requirement.
+      const legacyReplay = event.causation_id === null && isLegacyStoredEvent(event);
+      if (!legacyReplay && (event.causation_id === null || !priorEventIds.includes(event.causation_id))) {
+        throw new ProjectionError('DriftDetected causation_id must reference an existing prior event');
+      }
       return {
         ...base,
         drift: [
           ...base.drift,
           {
+            claimItem: event.data.claim_item,
             claim: event.data.claim,
             expected: event.data.expected,
             observed: event.data.observed,
@@ -505,6 +520,40 @@ export function applyEvent(state: WorkItemState | null, event: MienguEvent): Wor
           },
         ],
       };
+    }
+    case 'BrownfieldEvidenceRecorded': {
+      return base;
+    }
+    case 'BrownfieldPredicateProposed': {
+      const priorEventIds = state.priorEventIds ?? (state.lastEventId === null ? [] : [state.lastEventId]);
+      if (event.causation_id === null || !priorEventIds.includes(event.causation_id)) {
+        throw new ProjectionError('BrownfieldPredicateProposed causation_id must reference an existing prior event');
+      }
+      return base;
+    }
+    case 'BrownfieldPredicateEvaluated': {
+      const priorEventIds = state.priorEventIds ?? (state.lastEventId === null ? [] : [state.lastEventId]);
+      if (
+        event.causation_id === null ||
+        event.causation_id !== event.data.proposal_event_id ||
+        !priorEventIds.includes(event.data.proposal_event_id)
+      ) {
+        throw new ProjectionError('BrownfieldPredicateEvaluated must causally reference an existing proposal event');
+      }
+      // When the full replay context is available, the referenced event must actually be a
+      // BrownfieldPredicateProposed for the same target commit — an evaluation is only T1
+      // for the exact proposal and base commit it was run against (WORK_ORDER decision 14).
+      const proposal = priorEvents?.get(event.data.proposal_event_id);
+      if (
+        proposal !== undefined &&
+        (proposal.type !== 'BrownfieldPredicateProposed' ||
+          proposal.data.target_commit !== event.data.target_commit)
+      ) {
+        throw new ProjectionError(
+          'BrownfieldPredicateEvaluated must reference an earlier BrownfieldPredicateProposed with a matching target_commit',
+        );
+      }
+      return base;
     }
     case 'TaskGraphActivated': {
       if (base.artifacts.taskGraph?.eventId !== event.data.graph_event_id) throw new ProjectionError('TaskGraphActivated must reference the active task graph');
@@ -723,8 +772,10 @@ export function applyEvent(state: WorkItemState | null, event: MienguEvent): Wor
 
 export function project(events: Iterable<MienguEvent>, from?: WorkItemState): WorkItemState {
   let state: WorkItemState | null = from ?? null;
+  const priorEvents = new Map<EventId, MienguEvent>();
   for (const event of events) {
-    state = applyEvent(state, event);
+    state = applyEvent(state, event, priorEvents);
+    priorEvents.set(event.event_id, event);
   }
   if (state === null) {
     throw new ProjectionError('project() called with no events and no starting state');
@@ -737,8 +788,10 @@ export async function projectAsync(
   from?: WorkItemState,
 ): Promise<WorkItemState> {
   let state: WorkItemState | null = from ?? null;
+  const priorEvents = new Map<EventId, MienguEvent>();
   for await (const event of events) {
-    state = applyEvent(state, event);
+    state = applyEvent(state, event, priorEvents);
+    priorEvents.set(event.event_id, event);
   }
   if (state === null) {
     throw new ProjectionError('projectAsync() called with no events and no starting state');

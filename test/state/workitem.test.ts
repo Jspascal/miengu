@@ -44,7 +44,7 @@ describe('emptyQuotaAborts', () => {
 
 function buildFullState(): WorkItemState {
   return {
-    projectionVersion: 4,
+    projectionVersion: 5,
     itemId: 'wi-example-abc123' as WorkItemState['itemId'],
     slug: 'example' as WorkItemState['slug'],
     seq: 1,
@@ -107,7 +107,7 @@ function buildFullState(): WorkItemState {
 }
 
 describe('WorkItemStateSchema', () => {
-  it('parses a full v3 state', () => {
+  it('parses a full v5 state', () => {
     const state = buildFullState();
     expect(WorkItemStateSchema.parse(state)).toEqual(state);
   });

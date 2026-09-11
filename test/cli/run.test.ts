@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execFile } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -138,7 +138,7 @@ describe('runCommand', () => {
     );
   });
 
-  it('creates the four new store directories (prompts, schemas, messages, frozen-tests)', async () => {
+  it('creates the item support directories, including brownfield evidence', async () => {
     const prdFile = join(workDir, 'prd.md');
     await writeFile(prdFile, 'Build a thing.\n', 'utf8');
 
@@ -156,6 +156,34 @@ describe('runCommand', () => {
     await expect(stat(join(itemDir, 'schemas'))).resolves.toBeDefined();
     await expect(stat(join(itemDir, 'messages'))).resolves.toBeDefined();
     await expect(stat(join(itemDir, 'frozen-tests'))).resolves.toBeDefined();
+    await expect(stat(join(itemDir, 'brownfield'))).resolves.toBeDefined();
+  });
+
+  it('isolates a valid-but-empty sibling log as unusable instead of crashing the brownfield store scan', async () => {
+    // A sibling item directory that was created (empty events.jsonl) but never had a
+    // WorkItemCreated appended is a valid empty log. deriveStoreClaimSets cannot project an
+    // item with no WorkItemCreated event, so run.ts's readStore must classify it as
+    // corrupt/unusable rather than hand it to the store-wide claim projection.
+    const storeDir = join(workDir, '.miengu');
+    const emptySibling = join(storeDir, 'items', 'wi-empty-abc123');
+    await mkdir(emptySibling, { recursive: true });
+    await writeFile(join(emptySibling, 'events.jsonl'), '', 'utf8');
+
+    const prdFile = join(workDir, 'prd.md');
+    await writeFile(prdFile, 'Build a thing.\n', 'utf8');
+
+    const result = await runCommand({ prdFile, configPath });
+    expect(result).toBe(EXIT.OK);
+
+    // The valid new item still ran to completion; the empty sibling did not displace it.
+    const itemIds = await listItemIds(storeDir);
+    expect(itemIds).toContain('wi-empty-abc123');
+    const realItem = itemIds.find((id) => id !== 'wi-empty-abc123');
+    expect(realItem).toBeDefined();
+    if (realItem !== undefined) {
+      const raw = await readFile(itemPaths(storeDir, realItem).eventsFile, 'utf8');
+      expect(raw).toContain('WorkItemCompleted');
+    }
   });
 
   it('a config whose reviewer role names an executor lacking read-only fails before any StageEntered is appended', async () => {

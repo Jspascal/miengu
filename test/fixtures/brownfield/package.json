@@ -1,0 +1,7 @@
+{
+  "name": "brownfield-fixture",
+  "type": "module",
+  "main": "src/hot.ts",
+  "scripts": { "test": "vitest run" },
+  "dependencies": { "vitest": "^2.0.0" }
+}

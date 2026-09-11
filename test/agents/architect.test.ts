@@ -132,6 +132,7 @@ function plan(decisions: ArchitecturePlan['decisions']): ArchitecturePlan {
       { component_id: 'component-example-1', responsibility: 'r', paths: ['src/a.ts'], depends_on: [] },
     ],
     interfaces: [],
+    falsifications: [],
   });
 }
 
@@ -255,7 +256,7 @@ describe('architect.postStep', () => {
 
     function mkEvent(seq: number, type: EventType, data: unknown): MienguEvent {
       return MienguEventSchema.parse({
-        schema_version: 3,
+        schema_version: 4,
         event_id: `evt-00000000-0000-4000-8000-00000000000${String(seq)}`,
         seq,
         item_id: itemId,

@@ -181,6 +181,46 @@ export function validateConfig(c: MienguConfig): void {
     violations.push('a checkpoint class must declare an SLA and a default together, or neither');
   }
 
+  // V13 — bounded excerpt and scope limits must remain subsets of their collection caps.
+  if (c.brownfield.maxTestExcerptBytes > c.brownfield.maxFileBytes) {
+    violations.push(
+      'brownfield.maxTestExcerptBytes must be <= brownfield.maxFileBytes',
+    );
+  }
+  if (c.brownfield.maxFilesPerScope > c.brownfield.maxTreeEntries) {
+    violations.push(
+      'brownfield.maxFilesPerScope must be <= brownfield.maxTreeEntries',
+    );
+  }
+
+  // V14 — process predicates use the fixed wrapper protocol and never resolve executables via PATH.
+  const { commands, sandbox } = c.brownfield.falsification;
+  if (sandbox !== null) {
+    if (!sandbox.bin.startsWith('/')) {
+      violations.push('brownfield.falsification.sandbox.bin must be an absolute path');
+    }
+    for (const argument of sandbox.argvPrefix) {
+      if (argument.includes('\0')) {
+        violations.push('brownfield.falsification.sandbox.argvPrefix members must not contain NUL');
+      }
+    }
+  }
+  for (const [name, command] of Object.entries(commands)) {
+    const executable = command.argv[0];
+    if (executable !== undefined && !executable.startsWith('/')) {
+      violations.push(
+        `brownfield.falsification.commands.${JSON.stringify(name)}.argv[0] must be an absolute path`,
+      );
+    }
+    for (const argument of command.argv) {
+      if (argument.includes('\0')) {
+        violations.push(
+          `brownfield.falsification.commands.${JSON.stringify(name)}.argv members must not contain NUL`,
+        );
+      }
+    }
+  }
+
   if (violations.length > 0) {
     throw new ConfigError(violations.join('\n'), { violations });
   }

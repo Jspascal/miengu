@@ -30,6 +30,9 @@ export const PACK_SOURCE_KINDS = [
   'current-task-reviewer-findings',
   'other-task-reviewer-findings',
   'escalation-context',
+  'brownfield-history',
+  'brownfield-falsification',
+  'brownfield-drift',
 ] as const;
 export type PackSourceKind = (typeof PACK_SOURCE_KINDS)[number];
 
@@ -89,6 +92,7 @@ export const ROLE_PACK_POLICY = {
       'coder-transcript',
       'current-task-reviewer-findings',
       'other-task-reviewer-findings',
+      'brownfield-history', 'brownfield-falsification', 'brownfield-drift',
     ],
   ),
   architect: rolePolicy(
@@ -107,6 +111,7 @@ export const ROLE_PACK_POLICY = {
       'frozen-test-list',
       'assumptions',
       'escalation-context',
+      'brownfield-history', 'brownfield-falsification', 'brownfield-drift',
     ],
     ['requirement-set'],
     [
@@ -141,6 +146,7 @@ export const ROLE_PACK_POLICY = {
       'oracle-results',
       'assumptions',
       'escalation-context',
+      'brownfield-history', 'brownfield-falsification', 'brownfield-drift',
     ],
     ['requirement-set', 'architecture-decisions', 'architecture-components', 'architecture-interfaces'],
     [
@@ -179,6 +185,7 @@ export const ROLE_PACK_POLICY = {
       'current-task-reviewer-findings',
       'other-task-reviewer-findings',
       'escalation-context',
+      'brownfield-history', 'brownfield-falsification', 'brownfield-drift',
     ],
   ),
   coder: rolePolicy(
@@ -200,6 +207,7 @@ export const ROLE_PACK_POLICY = {
       'oracle-results',
       'assumptions',
       'current-task-reviewer-findings',
+      'brownfield-history', 'brownfield-falsification', 'brownfield-drift',
     ],
     ['task', 'frozen-test-bodies', 'architecture-interfaces'],
     [
@@ -226,6 +234,7 @@ export const ROLE_PACK_POLICY = {
       'oracle-results',
       'assumptions',
       'current-task-reviewer-findings',
+      'brownfield-history', 'brownfield-falsification', 'brownfield-drift',
     ],
     ['diff', 'requirement-set', 'frozen-test-list'],
     [

@@ -215,6 +215,49 @@ describe('validateConfig', () => {
     );
   });
 
+  it('V13: rejects brownfield caps that exceed their enclosing collection limits', () => {
+    const raw = validRaw();
+    raw['brownfield'] = {
+      maxFileBytes: 10,
+      maxTestExcerptBytes: 11,
+      maxTreeEntries: 10,
+      maxFilesPerScope: 11,
+    };
+    try {
+      validateConfig(parse(raw));
+      throw new Error('expected validateConfig to throw');
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      expect((error as ConfigError).message).toContain(
+        'brownfield.maxTestExcerptBytes must be <= brownfield.maxFileBytes',
+      );
+      expect((error as ConfigError).message).toContain(
+        'brownfield.maxFilesPerScope must be <= brownfield.maxTreeEntries',
+      );
+    }
+  });
+
+  it('V14: requires absolute process executables and rejects NUL arguments', () => {
+    const raw = validRaw();
+    raw['brownfield'] = {
+      falsification: {
+        sandbox: { bin: 'wrapper', argvPrefix: ['--flag\0'] },
+        commands: { check: { argv: ['command', '--arg\0'] } },
+      },
+    };
+    try {
+      validateConfig(parse(raw));
+      throw new Error('expected validateConfig to throw');
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      const message = (error as ConfigError).message;
+      expect(message).toContain('brownfield.falsification.sandbox.bin must be an absolute path');
+      expect(message).toContain('brownfield.falsification.sandbox.argvPrefix members must not contain NUL');
+      expect(message).toContain('brownfield.falsification.commands."check".argv[0] must be an absolute path');
+      expect(message).toContain('brownfield.falsification.commands."check".argv members must not contain NUL');
+    }
+  });
+
   it('collects two simultaneous violations into one error naming both', () => {
     const raw = validRaw();
     (raw['executors'] as Record<string, Record<string, unknown>>)['cc-sonnet']['account'] =

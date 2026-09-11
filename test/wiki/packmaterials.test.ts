@@ -5,6 +5,14 @@ import type { EventType, MienguEvent } from '../../src/core/events.js';
 import { deriveClaims } from '../../src/wiki/records.js';
 import {
   fileMapBodies,
+  brownfieldDriftBodies,
+  brownfieldFalsificationBodies,
+  brownfieldFileMapBodies,
+  brownfieldHistoryBodies,
+  brownfieldStackFactsBodies,
+  brownfieldSystemSkeletonBodies,
+  brownfieldTestConventionLines,
+  brownfieldTestSpecFiles,
   stackFactsBodies,
   systemSkeletonBodies,
   wikiIndexBodies,
@@ -25,7 +33,7 @@ function tsAt(n: number): string {
 
 function mkEvent(seq: number, type: EventType, data: unknown): MienguEvent {
   return MienguEventSchema.parse({
-    schema_version: 3,
+    schema_version: 4,
     event_id: hexId('evt', seq),
     seq,
     item_id: ITEM_ID,
@@ -71,11 +79,13 @@ function architecturePlanBody(overrides?: {
   decisions?: unknown[];
   components?: unknown[];
   interfaces?: unknown[];
+  falsifications?: unknown[];
 }): unknown {
   return {
     decisions: overrides?.decisions ?? [],
     components: overrides?.components ?? [],
     interfaces: overrides?.interfaces ?? [],
+    falsifications: overrides?.falsifications ?? [],
   };
 }
 
@@ -110,6 +120,7 @@ function diffCaptured(seq: number, filesTouched: string[]): MienguEvent {
 
 function driftDetected(seq: number, claim: string): MienguEvent {
   return mkEvent(seq, 'DriftDetected', {
+    claim_item: ITEM_ID,
     claim,
     expected: 'expected value',
     observed: 'observed value',
@@ -126,6 +137,133 @@ function artifactsInvalidated(seq: number, artifactEventIds: string[]): MienguEv
     reason: 'invalidated for test',
   });
 }
+
+describe('brownfield pack materials', () => {
+  const scope = 'a'.repeat(64);
+  const eventId = (n: number) => hexId('evt', 700 + n);
+  const attachment = { sha256: 'b'.repeat(64), path: 'brownfield/MIENGU_SENTINEL_RAW_ATTACHMENT.json', bytes: 1 };
+  const events = [
+    {
+      type: 'BrownfieldEvidenceRecorded', event_id: eventId(1), seq: 1, tier: 'T1',
+      data: {
+        ladder_tier: 'git-archaeology', scope: { sha256: scope }, evidence: attachment,
+        facts: [
+          { kind: 'git-vocabulary', token: 'fix', count: 2 },
+          { kind: 'file', path: 'src/not-history.ts', sha256: 'c'.repeat(64), bytes: 1 },
+        ],
+      },
+    },
+    {
+      type: 'BrownfieldPredicateProposed', event_id: eventId(2), seq: 2, tier: 'T2',
+      data: { scope_sha256: scope, assertion: 'package exists', area: 'package.json' },
+    },
+    {
+      type: 'BrownfieldPredicateEvaluated', event_id: eventId(3), seq: 3, tier: 'T1',
+      data: { proposal_event_id: eventId(2), outcome: 'confirmed', reason: 'predicate-true', expected: 'true', observed: 'true', evidence: attachment },
+    },
+    {
+      type: 'BrownfieldPredicateEvaluated', event_id: eventId(4), seq: 4, tier: 'T1',
+      data: { proposal_event_id: eventId(2), outcome: 'inconclusive', reason: 'unavailable', expected: 'true', observed: 'unknown', evidence: attachment },
+    },
+    {
+      type: 'DriftDetected', event_id: eventId(5), seq: 5, tier: 'T1',
+      data: { claim_item: ITEM_ID, claim: 'claim-example-1', expected: 'a', observed: 'b', area: 'src/a.ts' },
+    },
+  ] as unknown as MienguEvent[];
+
+  it('renders scoped normalized history, completed falsification and selected drift without attachments', () => {
+    const history = brownfieldHistoryBodies(events, scope);
+    expect(history).toHaveLength(1);
+    expect(history[0]?.body).toContain('git-vocabulary');
+    expect(history[0]?.body).not.toContain('not-history');
+    expect(history[0]?.body).not.toContain('MIENGU_SENTINEL_RAW_ATTACHMENT');
+
+    const falsification = brownfieldFalsificationBodies(events, scope);
+    expect(falsification).toHaveLength(1);
+    expect(falsification[0]?.body).toContain('package exists');
+    expect(falsification[0]?.body).not.toContain('MIENGU_SENTINEL_RAW_ATTACHMENT');
+
+    expect(brownfieldDriftBodies(events, [eventId(5) as never])).toHaveLength(1);
+    expect(brownfieldDriftBodies(events, []).map((body) => body.body)).toEqual([]);
+  });
+});
+
+describe('brownfield tier-0 / tests-as-spec pack mapping', () => {
+  const baseCommit = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+  const treeScope = 'e'.repeat(64);
+  const selectedScope = 'f'.repeat(64);
+  const raw = { sha256: 'b'.repeat(64), path: 'brownfield/RAW.json', bytes: 1 };
+  const evt = (n: number) => hexId('evt', 800 + n);
+  const events = [
+    {
+      type: 'BrownfieldEvidenceRecorded', event_id: evt(1), seq: 1, tier: 'T1',
+      data: {
+        ladder_tier: 'mechanical-skeleton',
+        scope: { target_commit: baseCommit, sha256: treeScope },
+        evidence: raw,
+        facts: [
+          { kind: 'file', path: 'src/z.ts', sha256: 'c'.repeat(64), bytes: 3 },
+          { kind: 'file', path: 'src/a.ts', sha256: 'd'.repeat(64), bytes: 3 },
+          { kind: 'manifest', path: 'package.json', ecosystem: 'npm' },
+          { kind: 'framework', name: 'vitest', manifest_path: 'package.json' },
+          { kind: 'test-command', name: 'test', command: 'npm test', manifest_path: 'package.json' },
+          { kind: 'dependency-edge', from: 'src/a.ts', to: 'src/z.ts' },
+          { kind: 'entrypoint', path: 'src/main.ts', source: 'package.json:bin' },
+        ],
+      },
+    },
+    {
+      type: 'BrownfieldEvidenceRecorded', event_id: evt(2), seq: 2, tier: 'T1',
+      data: {
+        ladder_tier: 'tests-as-spec',
+        scope: { target_commit: baseCommit, sha256: selectedScope },
+        evidence: raw,
+        facts: [
+          { kind: 'test-spec', path: 'test/a.test.ts', test_id: 'does A', source_sha256: 'a'.repeat(64), bytes: 12, excerpt: 'it("does A", () => {})' },
+          { kind: 'test-spec', path: 'test/a.test.ts', test_id: 'does B', source_sha256: 'a'.repeat(64), bytes: 12, excerpt: 'it("does B", () => {})' },
+        ],
+      },
+    },
+  ] as unknown as MienguEvent[];
+
+  it('routes skeleton facts into stack-facts, system-skeleton and file-map, pinned to the base commit', () => {
+    const stack = brownfieldStackFactsBodies(events, baseCommit);
+    expect(stack).toHaveLength(1);
+    expect(stack[0]?.body).toContain('framework');
+    expect(stack[0]?.body).toContain('test-command');
+    expect(stack[0]?.body).toContain('manifest');
+    expect(stack[0]?.body).not.toContain('dependency-edge');
+    expect(stack[0]?.sourceEventId).toBe(evt(1));
+
+    const skeleton = brownfieldSystemSkeletonBodies(events, baseCommit);
+    expect(skeleton[0]?.body).toContain('dependency-edge');
+    expect(skeleton[0]?.body).toContain('entrypoint');
+    expect(skeleton[0]?.body).not.toContain('framework');
+
+    const fileMap = brownfieldFileMapBodies(events, baseCommit);
+    expect(fileMap[0]?.body).toBe('src/a.ts\nsrc/z.ts');
+
+    expect(brownfieldStackFactsBodies(events, 'other-commit')).toEqual([]);
+  });
+
+  it('gives the Test Author / Reviewer identifiers and hashes but never excerpts', () => {
+    const lines = brownfieldTestConventionLines(events, selectedScope);
+    expect(lines).toEqual([
+      `test/a.test.ts::does A (sha256=${'a'.repeat(64)}, bytes=12)`,
+      `test/a.test.ts::does B (sha256=${'a'.repeat(64)}, bytes=12)`,
+    ]);
+    expect(lines.join('\n')).not.toContain('it("does A"');
+  });
+
+  it('groups tests-as-spec excerpts by path for the Coder-only source-files channel', () => {
+    const files = brownfieldTestSpecFiles(events, selectedScope);
+    expect(files).toHaveLength(1);
+    expect(files[0]?.path).toBe('test/a.test.ts');
+    expect(files[0]?.body).toContain('it("does A"');
+    expect(files[0]?.body).toContain('it("does B"');
+    expect(brownfieldTestSpecFiles(events, treeScope)).toEqual([]);
+  });
+});
 
 describe('wikiIndexBodies', () => {
   it('empty claim set yields []', () => {

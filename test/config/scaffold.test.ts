@@ -35,6 +35,27 @@ describe('CONFIG_TEMPLATE', () => {
     expect(parsed.oracles).toEqual({ build: null, test: null, lint: null, typecheck: null });
   });
 
+  it('ships bounded brownfield defaults with no executable predicate configuration', () => {
+    const parsed = MienguConfigSchema.parse(parseYaml(CONFIG_TEMPLATE));
+    expect(parsed.brownfield).toEqual({
+      enabled: true,
+      maxTreeEntries: 5000,
+      maxFilesPerScope: 200,
+      maxDependencyDepth: 2,
+      maxFileBytes: 262144,
+      maxTestExcerptBytes: 8192,
+      maxGitCommits: 200,
+      maxFilesPerCommit: 50,
+      falsification: {
+        maxPredicatesPerScope: 8,
+        maxWallSeconds: 30,
+        maxOutputBytes: 65536,
+        commands: {},
+        sandbox: null,
+      },
+    });
+  });
+
   it('ships a populated blast-radius starter block (binding decision 6)', () => {
     const parsed = MienguConfigSchema.parse(parseYaml(CONFIG_TEMPLATE));
     expect(parsed.checkpoints.defaultOwner).toBe('operator');

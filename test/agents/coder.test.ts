@@ -119,6 +119,26 @@ describe('coder.buildCandidates / buildTaskSection use the state-selected task',
   });
 });
 
+describe('coder.buildCandidates source-file relevance for brownfield tests-as-spec excerpts', () => {
+  it('keeps a brownfield tests-as-spec excerpt whose observed path is under no task expected_paths', () => {
+    const sections = buildCandidates(
+      pack({
+        sourceFiles: [
+          { path: 'test/legacy/hot.spec.ts', body: 'it("hot path", () => {})' },
+          { path: 'src/a.ts', body: 'sibling task output' },
+          { path: 'src/b.ts', body: 'this task output' },
+        ],
+      }),
+    );
+    const sourceSection = sections.find((s) => s.kind === 'source-files');
+    expect(sourceSection?.body).toContain('test/legacy/hot.spec.ts');
+    expect(sourceSection?.body).toContain('it("hot path"');
+    // per-task isolation is preserved: a sibling task's expected output is still withheld
+    expect(sourceSection?.body).not.toContain('src/a.ts');
+    expect(sourceSection?.body).toContain('src/b.ts');
+  });
+});
+
 let root: string;
 let workdir: string;
 let frozenTestsDir: string;

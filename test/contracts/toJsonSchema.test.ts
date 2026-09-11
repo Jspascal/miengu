@@ -98,8 +98,14 @@ describe('unsupported nodes', () => {
     expect(() => toJsonSchema(schema, 'Bad')).toThrow(ContractError);
   });
 
-  it('a z.union([z.string(), z.number()]) throws ContractError', () => {
+  it('a z.union([z.string(), z.number()]) converts to anyOf', () => {
     const schema = z.object({ a: z.union([z.string(), z.number()]) }).strict();
+    const result = toJsonSchema(schema, 'Ok') as { properties: { a: { anyOf: unknown[] } } };
+    expect(result.properties.a.anyOf).toEqual([{ type: 'string' }, { type: 'number' }]);
+  });
+
+  it('a z.record() throws ContractError', () => {
+    const schema = z.object({ a: z.record(z.string(), z.string()) }).strict();
     expect(() => toJsonSchema(schema, 'Bad')).toThrow(ContractError);
   });
 });

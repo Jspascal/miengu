@@ -1,4 +1,5 @@
 import { loadConfig } from '../../config/load.js';
+import { stat } from 'node:fs/promises';
 import { IsoTimestampSchema } from '../../core/clock.js';
 import type { IsoTimestamp } from '../../core/clock.js';
 import { itemPaths, listItemIds } from '../../core/log.js';
@@ -7,6 +8,25 @@ import { buildBatchReport, renderBatchReport } from '../../report/batch.js';
 import type { BatchReportItemInput } from '../../report/batch.js';
 import { EXIT } from '../exit.js';
 import { readEventsReadOnly } from './replay.js';
+
+async function attachmentAvailability(items: readonly BatchReportItemInput[]): Promise<ReadonlyMap<import('../../core/ids.js').EventId, boolean>> {
+  const availability = new Map<import('../../core/ids.js').EventId, boolean>();
+  for (const item of items) {
+    for (const event of item.events) {
+      const ref = event.type === 'BrownfieldEvidenceRecorded' || event.type === 'BrownfieldPredicateEvaluated'
+        ? event.data.evidence
+        : null;
+      if (ref === null) continue;
+      try {
+        const info = await stat(ref.path);
+        availability.set(event.event_id, info.isFile() && info.size === ref.bytes);
+      } catch {
+        availability.set(event.event_id, false);
+      }
+    }
+  }
+  return availability;
+}
 
 export interface ReportCommandOptions {
   readonly since?: string | undefined;
@@ -67,7 +87,13 @@ export async function reportCommand(options: ReportCommandOptions): Promise<numb
     }
   }
 
-  const report = buildBatchReport({ locale: loaded.config.locale, since, items, corrupt });
+  const report = buildBatchReport({
+    locale: loaded.config.locale,
+    since,
+    items,
+    corrupt,
+    attachmentAvailability: await attachmentAvailability(items),
+  });
 
   const anyCorrupt = corrupt.length > 0;
 

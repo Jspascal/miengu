@@ -31,6 +31,7 @@ const VALID = {
       req_ids: ['REQ-auth-1'],
     },
   ],
+  falsifications: [],
 };
 
 describe('ArchitecturePlanSchema', () => {
@@ -65,6 +66,60 @@ describe('ArchitecturePlanSchema', () => {
 
   it('rejects an extra key', () => {
     const result = ArchitecturePlanSchema.safeParse({ ...VALID, bogus: true });
+    expect(result.success).toBe(false);
+  });
+
+  it('requires the falsifications array', () => {
+    const withoutFalsifications = {
+      decisions: VALID.decisions,
+      components: VALID.components,
+      interfaces: VALID.interfaces,
+    };
+    expect(ArchitecturePlanSchema.safeParse(withoutFalsifications).success).toBe(false);
+  });
+
+  it('accepts a falsification with a null subject and a closed predicate', () => {
+    const result = ArchitecturePlanSchema.safeParse({
+      ...VALID,
+      falsifications: [
+        {
+          assertion: 'the auth module still lives under src/auth',
+          subject: null,
+          area: 'src/auth',
+          predicate: { kind: 'path-exists', path: 'src/auth/index.ts', expected: true },
+        },
+      ],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts a falsification whose subject is a qualified existing claim', () => {
+    const result = ArchitecturePlanSchema.safeParse({
+      ...VALID,
+      falsifications: [
+        {
+          assertion: 'the hot module contract holds',
+          subject: { claim_item: 'wi-hotfix-aaaaaa', claim: 'claim-hot-1' },
+          area: null,
+          predicate: { kind: 'text-includes', path: 'src/hot.ts', needle: 'export function hot', expected: true },
+        },
+      ],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects a falsification carrying free-form executable text', () => {
+    const result = ArchitecturePlanSchema.safeParse({
+      ...VALID,
+      falsifications: [
+        {
+          assertion: 'a',
+          subject: null,
+          area: null,
+          predicate: { kind: 'path-exists', path: 'src/x.ts', expected: true, argv: ['rm', '-rf'] },
+        },
+      ],
+    });
     expect(result.success).toBe(false);
   });
 });

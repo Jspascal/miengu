@@ -85,6 +85,16 @@ describe('(b) acceptance criterion 4: context isolation is provable, one test pe
 });
 
 describe('(c) the two load-bearing rows, asserted by name', () => {
+  it('partitions all brownfield kinds: downstream implementation roles include them; Analyst and Test Author omit them', () => {
+    const brownfieldKinds = ['brownfield-history', 'brownfield-falsification', 'brownfield-drift'] as const;
+    for (const role of ['architect', 'planner', 'coder', 'reviewer'] as const) {
+      for (const kind of brownfieldKinds) expect(ROLE_PACK_POLICY[role].includes).toContain(kind);
+    }
+    for (const role of ['analyst', 'testAuthor'] as const) {
+      for (const kind of brownfieldKinds) expect(ROLE_PACK_POLICY[role].omits).toContain(kind);
+    }
+  });
+
   it('testAuthor.omits contains architecture-components, file-map and task-graph', () => {
     const omits = ROLE_PACK_POLICY.testAuthor.omits;
     expect(omits).toContain('architecture-components');

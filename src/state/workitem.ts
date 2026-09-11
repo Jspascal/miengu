@@ -81,13 +81,10 @@ import type {
   ReqId,
 } from '../core/ids.js';
 
-// Bumped from 3 to 4 because a defect fix changed the WorkspaceDiscarded fold's derivation
-// (it now nulls `state.workspace` outright instead of keeping it non-null with
-// `discarded: true`), not the projection's shape. Snapshots written under the old fold must
-// be discarded and rebuilt from events, or `latestValid` (src/core/snapshot.ts) would accept
-// a stale-derivation snapshot as a valid base. The event log is untouched: EVENT_SCHEMA_VERSION
-// stays 3.
-export const PROJECTION_VERSION = 4;
+// Bumped from 4 to 5 because qualified drift now retains the item that minted the target claim.
+// Snapshots written under the old fold must be discarded and rebuilt from events; event logs are
+// untouched and remain independently versioned by EVENT_SCHEMA_VERSION.
+export const PROJECTION_VERSION = 5;
 
 export const STAGE_ORDER: readonly Stage[] = STAGES;
 
@@ -445,6 +442,7 @@ export interface WorkItemState {
   readonly checkpoints: Readonly<Record<string, CheckpointStateRecord>>;
   readonly assumptions: readonly AssumptionRecord[];
   readonly drift: readonly {
+    claimItem: WorkItemId;
     claim: ClaimId;
     expected: string;
     observed: string;
@@ -733,6 +731,7 @@ const AssumptionRecordSchema = z
 
 const DriftRecordSchema = z
   .object({
+    claimItem: WorkItemIdSchema,
     claim: ClaimIdSchema,
     expected: z.string(),
     observed: z.string(),

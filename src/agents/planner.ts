@@ -38,6 +38,7 @@ export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[
   for (const systemSkeleton of i.raw.systemSkeleton) {
     sections.push(packSection('system-skeleton', 'System skeleton', systemSkeleton.body, systemSkeleton.tier, systemSkeleton.sourceEventId));
   }
+  addBrownfieldSections(sections, i);
   if (i.checkContext.requirementSet !== null) {
     sections.push(
       packSection(
@@ -74,6 +75,18 @@ export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[
     sections.push(packSection('escalation-context', 'Escalation context', renderEscalationContext('planner', i.raw.escalationContext), escalationTier));
   }
   return sections;
+}
+
+function addBrownfieldSections(sections: ContextPackSection[], i: PackBuildInput): void {
+  for (const history of i.raw.brownfieldHistory ?? []) {
+    sections.push(packSection('brownfield-history', 'Brownfield history', history.body, history.tier, history.sourceEventId));
+  }
+  for (const falsification of i.raw.brownfieldFalsification ?? []) {
+    sections.push(packSection('brownfield-falsification', 'Brownfield falsification', falsification.body, falsification.tier, falsification.sourceEventId));
+  }
+  for (const drift of i.raw.brownfieldDrift ?? []) {
+    sections.push(packSection('brownfield-drift', 'Touched brownfield drift', drift.body, drift.tier, drift.sourceEventId));
+  }
 }
 
 export function buildTaskSection(): string {

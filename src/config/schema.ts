@@ -187,6 +187,43 @@ export const AssumptionsConfigSchema = z
   })
   .strict();
 
+export const BrownfieldCommandSchema = z
+  .object({
+    argv: z.array(z.string()).min(1),
+  })
+  .strict();
+
+export const BrownfieldSandboxSchema = z
+  .object({
+    bin: z.string(),
+    argvPrefix: z.array(z.string()),
+  })
+  .strict();
+
+export const BrownfieldFalsificationConfigSchema = z
+  .object({
+    maxPredicatesPerScope: z.number().int().positive().default(8),
+    maxWallSeconds: z.number().int().positive().default(30),
+    maxOutputBytes: z.number().int().positive().default(65536),
+    commands: z.record(BrownfieldCommandSchema).default({}),
+    sandbox: BrownfieldSandboxSchema.nullable().default(null),
+  })
+  .strict();
+
+export const BrownfieldConfigSchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    maxTreeEntries: z.number().int().positive().default(5000),
+    maxFilesPerScope: z.number().int().positive().default(200),
+    maxDependencyDepth: z.number().int().nonnegative().default(2),
+    maxFileBytes: z.number().int().positive().default(262144),
+    maxTestExcerptBytes: z.number().int().positive().default(8192),
+    maxGitCommits: z.number().int().positive().default(200),
+    maxFilesPerCommit: z.number().int().positive().default(50),
+    falsification: BrownfieldFalsificationConfigSchema.default({}),
+  })
+  .strict();
+
 export const MienguConfigSchema = z
   .object({
     target: TargetConfigSchema,
@@ -199,6 +236,7 @@ export const MienguConfigSchema = z
     limits: LimitsConfigSchema.default({}),
     planner: PlannerConfigSchema.default({}),
     assumptions: AssumptionsConfigSchema.default({}),
+    brownfield: BrownfieldConfigSchema.default({}),
     checkpoints: CheckpointsConfigSchema.default({}),
     wiki: WikiConfigSchema.default({}),
     locale: z.enum(['fr', 'en']).default('fr'),

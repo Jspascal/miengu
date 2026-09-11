@@ -9,6 +9,8 @@ import type { BacklogCandidate, BacklogEntry } from '../../supervisor/backlog.js
 import type { WorkItemState } from '../../state/workitem.js';
 import { EXIT } from '../exit.js';
 import { projectAccelerated, readEventsReadOnly } from './replay.js';
+import { deriveStoreClaimSets } from '../../wiki/records.js';
+import type { ClaimSet } from '../../wiki/records.js';
 
 export interface StatusCommandOptions {
   readonly configPath?: string | undefined;
@@ -43,7 +45,50 @@ interface StatusRow {
   readonly openBlockingCheckpoints: number | null;
   readonly blastRadiusDeclared: boolean | null;
   readonly backlog: StatusBacklog | null;
+  readonly brownfieldEvidence: number | null;
+  readonly brownfieldPartial: number | null;
+  readonly brownfieldInconclusive: number | null;
+  readonly touchedDrift: number | null;
   readonly updatedAt: string | null;
+}
+
+interface BrownfieldCounts {
+  readonly evidence: number;
+  readonly partial: number;
+  readonly inconclusive: number;
+  readonly touched: number;
+}
+
+function brownfieldCounts(
+  events: readonly import('../../core/events.js').MienguEvent[],
+  state: WorkItemState,
+  claimSets: ReadonlyMap<WorkItemId, ClaimSet>,
+  itemId: WorkItemId,
+): BrownfieldCounts {
+  const evidence = events.filter((event) => event.type === 'BrownfieldEvidenceRecorded');
+  const partial = evidence.filter((event) => event.data.coverage === 'partial').length;
+  const inconclusive = events.filter(
+    (event) => event.type === 'BrownfieldPredicateEvaluated' && event.data.outcome === 'inconclusive',
+  ).length;
+  const relevantComponents = new Set<string>();
+  const observerSet = claimSets.get(itemId);
+  if (state.tasks?.currentTaskId !== null && state.tasks !== null && observerSet !== undefined) {
+    const taskClaim = observerSet.claims.find(
+      (claim) => claim.kind === 'task' && claim.subject === state.tasks?.currentTaskId,
+    );
+    for (const component of taskClaim?.trace.componentIds ?? []) {
+      relevantComponents.add(component);
+    }
+  }
+  const scopePaths = evidence.flatMap((event) => event.data.scope.paths);
+  const touched = events.filter((event) => {
+    if (event.type !== 'DriftDetected') return false;
+    const target = claimSets.get(event.data.claim_item)?.byId[event.data.claim];
+    if (target === undefined) return false;
+    return target.trace.componentIds.some((component) => relevantComponents.has(component)) ||
+      target.trace.paths.some((path) => scopePaths.includes(path));
+  }).length;
+  return { evidence: evidence.length, partial, inconclusive, touched };
 }
 
 function countOpenBlocking(state: WorkItemState): number {
@@ -81,7 +126,7 @@ export async function statusCommand(options: StatusCommandOptions): Promise<numb
   const policy = policyFromConfig(loaded.config);
   const clock = systemClock;
 
-  const states = new Map<WorkItemId, { readonly state: WorkItemState; readonly blastRadiusDeclared: boolean }>();
+  const states = new Map<WorkItemId, { readonly state: WorkItemState; readonly blastRadiusDeclared: boolean; readonly events: readonly import('../../core/events.js').MienguEvent[] }>();
   const corrupt = new Map<WorkItemId, string>();
 
   for (const itemId of itemIds) {
@@ -95,7 +140,7 @@ export async function statusCommand(options: StatusCommandOptions): Promise<numb
         blastRadius.externalContractPaths.length > 0 ||
         blastRadius.protectedPaths.length > 0 ||
         blastRadius.dependencyManifestPaths.length > 0;
-      states.set(itemId, { state, blastRadiusDeclared });
+      states.set(itemId, { state, blastRadiusDeclared, events });
     } catch (err) {
       corrupt.set(itemId, err instanceof Error ? err.message : String(err));
     }
@@ -120,6 +165,7 @@ export async function statusCommand(options: StatusCommandOptions): Promise<numb
     });
   }
   const entryByItem = new Map<WorkItemId, BacklogEntry>(planBacklog(candidates).map((e) => [e.itemId, e]));
+  const claimSets = deriveStoreClaimSets([...states.values()].map((entry) => ({ events: entry.events })));
 
   const rows: StatusRow[] = [];
   for (const itemId of itemIds) {
@@ -141,11 +187,16 @@ export async function statusCommand(options: StatusCommandOptions): Promise<numb
         openBlockingCheckpoints: null,
         blastRadiusDeclared: null,
         backlog: null,
+        brownfieldEvidence: null,
+        brownfieldPartial: null,
+        brownfieldInconclusive: null,
+        touchedDrift: null,
         updatedAt: null,
       });
       continue;
     }
-    const { state, blastRadiusDeclared } = projected;
+    const { state, blastRadiusDeclared, events } = projected;
+    const brownfield = brownfieldCounts(events, state, claimSets, itemId);
     const entry = entryByItem.get(itemId) ?? null;
     rows.push({
       itemId,
@@ -171,6 +222,10 @@ export async function statusCommand(options: StatusCommandOptions): Promise<numb
       openBlockingCheckpoints: countOpenBlocking(state),
       blastRadiusDeclared,
       backlog: entry === null ? null : { ready: entry.ready, blocker: entry.blocker },
+      brownfieldEvidence: brownfield.evidence,
+      brownfieldPartial: brownfield.partial,
+      brownfieldInconclusive: brownfield.inconclusive,
+      touchedDrift: brownfield.touched,
       updatedAt: state.updatedAt,
     });
   }
@@ -182,7 +237,7 @@ export async function statusCommand(options: StatusCommandOptions): Promise<numb
     return anyCorrupt ? EXIT.STORE : EXIT.OK;
   }
 
-  const header = `${pad('ITEM', 24)}${pad('STAGE', 16)}${pad('STATUS', 12)}${pad('ATTEMPTS', 10)}${pad('TASK', 18)}${pad('CAUSE', 18)}${pad('CAUSE ATTEMPTS', 64)}${pad('PARK', 20)}${pad('BACKLOG', 24)}UPDATED`;
+  const header = `${pad('ITEM', 24)}${pad('STAGE', 16)}${pad('STATUS', 12)}${pad('ATTEMPTS', 10)}${pad('TASK', 18)}${pad('CAUSE', 18)}${pad('CAUSE ATTEMPTS', 64)}${pad('PARK', 20)}${pad('BACKLOG', 24)}${pad('BROWNFIELD', 28)}UPDATED`;
   const lines = [header];
   for (const row of rows) {
     if (row.corrupt) {
@@ -190,7 +245,7 @@ export async function statusCommand(options: StatusCommandOptions): Promise<numb
       continue;
     }
     lines.push(
-      `${pad(row.itemId, 24)}${pad(row.stage ?? '', 16)}${pad(row.status ?? '', 12)}${pad(String(row.attemptsOnStage ?? ''), 10)}${pad(row.currentTaskId ?? '', 18)}${pad(row.activeCauseId === null ? '' : `${row.activeCauseId}:${row.activeCauseLevel ?? ''}`, 18)}${pad(renderCausalAttempts(row.causalAttempts), 64)}${pad(renderPark(row.park), 20)}${pad(renderBacklog(row.backlog), 24)}${row.updatedAt ?? ''}`,
+      `${pad(row.itemId, 24)}${pad(row.stage ?? '', 16)}${pad(row.status ?? '', 12)}${pad(String(row.attemptsOnStage ?? ''), 10)}${pad(row.currentTaskId ?? '', 18)}${pad(row.activeCauseId === null ? '' : `${row.activeCauseId}:${row.activeCauseLevel ?? ''}`, 18)}${pad(renderCausalAttempts(row.causalAttempts), 64)}${pad(renderPark(row.park), 20)}${pad(renderBacklog(row.backlog), 24)}${pad(renderBrownfield(row), 28)}${row.updatedAt ?? ''}`,
     );
   }
   process.stdout.write(`${lines.join('\n')}\n`);
@@ -224,4 +279,9 @@ function pad(value: string, width: number): string {
 
 function renderCausalAttempts(attempts: Record<string, number> | null): string {
   return attempts === null ? '' : Object.entries(attempts).map(([bucket, count]) => `${bucket}=${String(count)}`).join(',');
+}
+
+function renderBrownfield(row: StatusRow): string {
+  if (row.brownfieldEvidence === null) return '';
+  return `e=${String(row.brownfieldEvidence)} p=${String(row.brownfieldPartial)} i=${String(row.brownfieldInconclusive)} t=${String(row.touchedDrift)}`;
 }

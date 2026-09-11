@@ -1,4 +1,4 @@
-import type { Implementation } from '../contracts/index.js';
+import type { Implementation, TaskGraph } from '../contracts/index.js';
 import type { ContextPackSection } from '../wiki/contextpack.js';
 import { packSection } from '../wiki/contextpack.js';
 import { restoreFrozenTests, verifyFrozenTests } from '../supervisor/freeze.js';
@@ -39,6 +39,7 @@ export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[
   for (const systemSkeleton of i.raw.systemSkeleton) {
     sections.push(packSection('system-skeleton', 'System skeleton', systemSkeleton.body, systemSkeleton.tier, systemSkeleton.sourceEventId));
   }
+  addBrownfieldSections(sections, i);
 
   if (task !== null && i.checkContext.architecturePlan !== null) {
     const plan = i.checkContext.architecturePlan;
@@ -92,7 +93,7 @@ export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[
     );
   }
   const relevantSourceFiles = task !== null
-    ? i.raw.sourceFiles.filter((f) => task.expected_paths.some((p) => f.path.startsWith(p)))
+    ? i.raw.sourceFiles.filter((f) => sourceFileBelongsToTask(f.path, task, i.checkContext.taskGraph))
     : i.raw.sourceFiles;
   if (relevantSourceFiles.length > 0) {
     sections.push(
@@ -112,6 +113,44 @@ export function buildCandidates(i: PackBuildInput): readonly ContextPackSection[
     sections.push(packSection('assumptions', 'Recorded assumptions', JSON.stringify(i.raw.assumptions, null, 2), 'T2'));
   }
   return sections;
+}
+
+/**
+ * §15.5 / decision 20: `raw.sourceFiles` is the Coder-only body channel and is already the
+ * neighborhood-scoped set the caller selected for this task (frozen-test bodies and
+ * brownfield tests-as-spec excerpts, the latter carried at their observed pre-existing
+ * paths). Prefixing that filter with the task's `expected_paths` — its *new* output paths —
+ * silently drops every brownfield excerpt, since an observed path like `test/foo.test.ts`
+ * never shares a prefix with a task's output. Relevance rule instead: a file under this
+ * task's own `expected_paths` is always kept; a file under a *sibling* task's
+ * `expected_paths` is withheld (that is the leakage the prefix filter guarded against); a
+ * file under neither is pre-existing context upstream already tied to this task, so it is
+ * kept.
+ */
+function sourceFileBelongsToTask(
+  path: string,
+  task: NonNullable<PackBuildInput['task']>,
+  taskGraph: TaskGraph | null,
+): boolean {
+  if (task.expected_paths.some((p) => path.startsWith(p))) {
+    return true;
+  }
+  const siblingPaths = (taskGraph?.tasks ?? [])
+    .filter((t) => t.task_id !== task.task_id)
+    .flatMap((t) => t.expected_paths);
+  return !siblingPaths.some((p) => path.startsWith(p));
+}
+
+function addBrownfieldSections(sections: ContextPackSection[], i: PackBuildInput): void {
+  for (const history of i.raw.brownfieldHistory ?? []) {
+    sections.push(packSection('brownfield-history', 'Brownfield history', history.body, history.tier, history.sourceEventId));
+  }
+  for (const falsification of i.raw.brownfieldFalsification ?? []) {
+    sections.push(packSection('brownfield-falsification', 'Brownfield falsification', falsification.body, falsification.tier, falsification.sourceEventId));
+  }
+  for (const drift of i.raw.brownfieldDrift ?? []) {
+    sections.push(packSection('brownfield-drift', 'Touched brownfield drift', drift.body, drift.tier, drift.sourceEventId));
+  }
 }
 
 export function buildTaskSection(i: PackBuildInput): string {

@@ -3,7 +3,7 @@ import type { EventId, WorkItemId } from '../core/ids.js';
 import type { ProvenanceTier } from '../core/provenance.js';
 import { PROVENANCE_TIERS } from '../core/provenance.js';
 import type { Claim, ClaimSet, ClaimStatus } from './records.js';
-import { deriveClaims } from './records.js';
+import { deriveStoreClaimSets } from './records.js';
 
 /** §4/§7: the human view lives under `<store.dir>/wiki/`; the CLI joins this to the store dir. */
 export const WIKI_DIR = 'wiki';
@@ -319,8 +319,8 @@ function renderIndex(entries: readonly IndexEntry[], strings: Record<WikiStringK
 /**
  * Pure. Deterministic. Performs no I/O.
  *
- * Projects each item's events into a `ClaimSet` via `deriveClaims` (records.ts, Group A) and
- * renders from that alone (§4/§12: no other module, no filesystem, no clock). Split by
+ * Projects the complete store into qualified `ClaimSet`s via `deriveStoreClaimSets` and renders
+ * from that alone (§4/§12: no other module, no filesystem, no clock). Split by
  * component (decision 8), never by stage: a claim renders in every file its
  * `trace.componentIds` names, and in `_unassigned.md` when that set is empty. Because claim
  * ids are unique only within a work item (decision 3), every anchor and cross-reference in a
@@ -328,12 +328,19 @@ function renderIndex(entries: readonly IndexEntry[], strings: Record<WikiStringK
  */
 export function renderHumanView(i: HumanViewInput): readonly WikiFile[] {
   const strings = WIKI_STRINGS[i.language];
+  const storeSets = deriveStoreClaimSets(i.items.map((item) => ({ events: item.events })));
 
-  const itemEntries: ItemEntry[] = i.items.map((item) => ({
-    itemId: item.itemId,
-    claimSet: deriveClaims(item.events),
-    invalidationCauseByOriginEventId: buildInvalidationCauseMap(item.events),
-  }));
+  const itemEntries: ItemEntry[] = i.items.map((item) => {
+    const claimSet = storeSets.get(item.itemId);
+    if (claimSet === undefined) {
+      throw new Error(`renderHumanView missing claim set for ${item.itemId}`);
+    }
+    return {
+      itemId: item.itemId,
+      claimSet,
+      invalidationCauseByOriginEventId: buildInvalidationCauseMap(item.events),
+    };
+  });
 
   itemEntries.sort((a, b) => {
     const byCreated = defaultCompare(a.claimSet.createdAt, b.claimSet.createdAt);

@@ -169,6 +169,7 @@ const ARCHITECTURE_PLAN_BASE = {
       req_ids: ['REQ-example-1'],
     },
   ],
+  falsifications: [],
 };
 
 const MODEL_NAMES: Readonly<Record<Role, string>> = {
@@ -1013,8 +1014,8 @@ describe('Phase 5 acceptance: criterion 4 — an actionable report', () => {
 // =========================================================================================
 describe('Phase 5 acceptance: nothing shipped moves', () => {
   it('EVENT_SCHEMA_VERSION and PROJECTION_VERSION are unchanged, and EVENT_TYPES matches its committed snapshot', async () => {
-    expect(EVENT_SCHEMA_VERSION).toBe(3);
-    expect(PROJECTION_VERSION).toBe(4);
+    expect(EVENT_SCHEMA_VERSION).toBe(4);
+    expect(PROJECTION_VERSION).toBe(5);
 
     const snapPath = fileURLToPath(new URL('../core/__snapshots__/events.test.ts.snap', import.meta.url));
     const snapText = await readFile(snapPath, 'utf8');

@@ -384,6 +384,26 @@ export function deriveClaims(events: readonly MienguEvent[]): ClaimSet {
   if (created === undefined) {
     throw new ProjectionError('deriveClaims requires a WorkItemCreated event in the log');
   }
+  const ordered = [...events].sort((a, b) => a.seq - b.seq);
+  // A per-item projection deliberately sees only observations made about claims in that same
+  // item. Store-wide callers use deriveStoreClaimSets below for qualified foreign drift.
+  const localDrift = ordered.filter(
+    (event): event is EventOf<'DriftDetected'> =>
+      event.type === 'DriftDetected' && event.data.claim_item === created.item_id,
+  );
+  return deriveClaimsWithDrift(events, localDrift);
+}
+
+function deriveClaimsWithDrift(
+  events: readonly MienguEvent[],
+  driftEvents: readonly EventOf<'DriftDetected'>[],
+): ClaimSet {
+  const created = events.find(
+    (e): e is EventOf<'WorkItemCreated'> => e.type === 'WorkItemCreated',
+  );
+  if (created === undefined) {
+    throw new ProjectionError('deriveClaims requires a WorkItemCreated event in the log');
+  }
   const itemId = created.item_id;
   const slug = created.data.slug;
   const title = created.data.title;
@@ -469,10 +489,7 @@ export function deriveClaims(events: readonly MienguEvent[]): ClaimSet {
   const byId = new Map(minted.map((c) => [c.id, c]));
   const quarantineById = new Map<ClaimId, ClaimQuarantine>();
   const contested: ContestedDrift[] = [];
-  for (const event of ordered) {
-    if (event.type !== 'DriftDetected') {
-      continue;
-    }
+  for (const event of driftEvents) {
     const claim = byId.get(event.data.claim);
     if (claim === undefined) {
       contested.push({
@@ -588,6 +605,75 @@ export function deriveClaims(events: readonly MienguEvent[]): ClaimSet {
   }
 
   return { itemId, slug, title, createdAt, updatedAt, claims, byId: byIdRecord, contested };
+}
+
+/** An event log with its own WorkItemCreated envelope. */
+export interface ClaimLogInput {
+  readonly events: readonly MienguEvent[];
+}
+
+function compareStoreDrift(a: EventOf<'DriftDetected'>, b: EventOf<'DriftDetected'>): number {
+  const byTimestamp = defaultCompare(a.ts, b.ts);
+  if (byTimestamp !== 0) return byTimestamp;
+  const byObserver = defaultCompare(a.item_id, b.item_id);
+  if (byObserver !== 0) return byObserver;
+  if (a.seq !== b.seq) return a.seq - b.seq;
+  return defaultCompare(a.event_id, b.event_id);
+}
+
+/**
+ * Projects independent item logs, then resolves v4's qualified drift key globally. Claim ids
+ * are scoped by item id here: two items are permitted to have the same slug and serial ids.
+ */
+export function deriveStoreClaimSets(
+  items: readonly ClaimLogInput[],
+): ReadonlyMap<WorkItemId, ClaimSet> {
+  const base = items.map((item) => deriveClaimsWithDrift(item.events, []));
+  base.sort((a, b) => defaultCompare(a.itemId, b.itemId));
+
+  const baseByItem = new Map<WorkItemId, ClaimSet>();
+  const claimOwners = new Map<string, WorkItemId>();
+  for (const set of base) {
+    if (baseByItem.has(set.itemId)) {
+      throw new ProjectionError(`deriveStoreClaimSets received duplicate item ${set.itemId}`);
+    }
+    baseByItem.set(set.itemId, set);
+    for (const claim of set.claims) {
+      claimOwners.set(`${set.itemId}\x00${claim.id}`, set.itemId);
+    }
+  }
+
+  const allDrift = items.flatMap((item) => item.events).filter(
+    (event): event is EventOf<'DriftDetected'> => event.type === 'DriftDetected',
+  ).sort(compareStoreDrift);
+  const driftByResolutionItem = new Map<WorkItemId, EventOf<'DriftDetected'>[]>();
+  for (const drift of allDrift) {
+    const owner = claimOwners.get(`${drift.data.claim_item}\x00${drift.data.claim}`);
+    // Unknown qualified claims remain contested in the observer's record, rather than being
+    // attached to an arbitrary item with a matching slug/serial.
+    const resolutionItem = owner ?? drift.item_id;
+    const arr = driftByResolutionItem.get(resolutionItem);
+    if (arr === undefined) {
+      driftByResolutionItem.set(resolutionItem, [drift]);
+    } else {
+      arr.push(drift);
+    }
+  }
+
+  const out = new Map<WorkItemId, ClaimSet>();
+  for (const item of base) {
+    const input = items.find((candidate) => {
+      const created = candidate.events.find(
+        (event): event is EventOf<'WorkItemCreated'> => event.type === 'WorkItemCreated',
+      );
+      return created?.item_id === item.itemId;
+    });
+    if (input === undefined) {
+      throw new ProjectionError(`deriveStoreClaimSets could not find item ${item.itemId}`);
+    }
+    out.set(item.itemId, deriveClaimsWithDrift(input.events, driftByResolutionItem.get(item.itemId) ?? []));
+  }
+  return out;
 }
 
 /** Active claims only, in mint order. */

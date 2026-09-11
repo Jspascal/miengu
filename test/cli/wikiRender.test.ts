@@ -96,6 +96,7 @@ async function createItemFixture(slug: string, componentId: string): Promise<Wor
           decisions: [],
           components: [{ component_id: componentId, responsibility: `owns ${slug}`, paths: [], depends_on: [] }],
           interfaces: [],
+          falsifications: [],
         },
       },
     },

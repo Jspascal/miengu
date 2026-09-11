@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { access, mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { EventLog, itemPaths, listItemIds } from '../../src/core/log.js';
+import { EventLog, itemPaths, listItemIds, validateFullLog } from '../../src/core/log.js';
 import type { AppendInput, OpenLogOptions } from '../../src/core/log.js';
 import { WorkItemIdSchema, RunIdSchema } from '../../src/core/ids.js';
 import type { WorkItemId } from '../../src/core/ids.js';
@@ -211,6 +211,44 @@ describe('EventLog', () => {
     await expect(readFile(paths.lockFile, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  it('opens a valid v3 log, upcasts reads, and appends only a v4 event', async () => {
+    const { log } = await EventLog.create(makeOptions(storeDir, itemId, 'v3-writable'));
+    await log.append(WORK_ITEM_CREATED);
+    await log.append(budgetConsumed());
+    await log.close();
+
+    const paths = itemPaths(storeDir, itemId);
+    const v3 = (await readFile(paths.eventsFile, 'utf8')).trim().split('\n').map((line) => {
+      const event = JSON.parse(line) as Record<string, unknown>;
+      return JSON.stringify({ ...event, schema_version: 3 });
+    }).join('\n').concat('\n');
+    await writeFile(paths.eventsFile, v3, 'utf8');
+
+    const reopened = await EventLog.open(makeOptions(storeDir, itemId, 'v3-writable'));
+    expect((await reopened.log.readAll()).map((event) => event.schema_version)).toEqual([4, 4]);
+    await reopened.log.append(budgetConsumed());
+    await reopened.log.close();
+
+    const versions = (await readFile(paths.eventsFile, 'utf8')).trim().split('\n').map((line) =>
+      (JSON.parse(line) as { schema_version: number }).schema_version,
+    );
+    expect(versions).toEqual([3, 3, 4]);
+  });
+
+  it('recovers a torn v4 tail after a valid v3 prefix', async () => {
+    const { log } = await EventLog.create(makeOptions(storeDir, itemId, 'mixed-torn-tail'));
+    await log.append(WORK_ITEM_CREATED);
+    await log.close();
+    const paths = itemPaths(storeDir, itemId);
+    const v3First = JSON.stringify({ ...JSON.parse((await readFile(paths.eventsFile, 'utf8')).trim()), schema_version: 3 });
+    await writeFile(paths.eventsFile, `${v3First}\n{"schema_version":4`, 'utf8');
+
+    const reopened = await EventLog.open(makeOptions(storeDir, itemId, 'mixed-torn-tail'));
+    expect(reopened.truncatedBytes).toBeGreaterThan(0);
+    expect(reopened.log.lastSeq).toBe(1);
+    await reopened.log.close();
+  });
+
   it('does not misclassify a v3 payload mentioning schema_version 2 as a v2 envelope', async () => {
     const { log } = await EventLog.create(makeOptions(storeDir, itemId, 'v3-payload-version'));
     await log.append({
@@ -221,6 +259,73 @@ describe('EventLog', () => {
     const reopened = await EventLog.open(makeOptions(storeDir, itemId, 'v3-payload-version'));
     expect(reopened.log.lastSeq).toBe(1);
     await reopened.log.close();
+  });
+});
+
+describe('validateFullLog', () => {
+  async function validBody(seed: string): Promise<string> {
+    const { log } = await EventLog.create(makeOptions(storeDir, itemId, seed));
+    await log.append(WORK_ITEM_CREATED);
+    await log.append(budgetConsumed());
+    await log.append(budgetConsumed());
+    await log.close();
+    return readFile(itemPaths(storeDir, itemId).eventsFile, 'utf8');
+  }
+
+  it('accepts an empty body as a valid empty log', () => {
+    expect(validateFullLog('', itemId)).toEqual({ ok: true, events: [] });
+  });
+
+  it('accepts a well-formed, owned, contiguous log and returns its events', async () => {
+    const result = validateFullLog(await validBody('vfl-ok'), itemId);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.events.map((e) => e.seq)).toEqual([1, 2, 3]);
+      expect(result.events[0]?.type).toBe('WorkItemCreated');
+    }
+  });
+
+  it('ignores a non-newline-terminated final fragment and validates the durable prefix', async () => {
+    const body = await validBody('vfl-torn');
+    // Chop the newline plus part of the third line: that record was never durable, exactly as
+    // the writable-open scan and the replay reader treat a torn tail.
+    const result = validateFullLog(body.slice(0, -5), itemId);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.events.map((e) => e.seq)).toEqual([1, 2]);
+    }
+  });
+
+  it('treats a body whose only line is a torn fragment as an empty log', () => {
+    expect(validateFullLog('{"schema_version":3', itemId)).toEqual({ ok: true, events: [] });
+  });
+
+  it('classifies a foreign item_id as corrupt', async () => {
+    const body = await validBody('vfl-owner');
+    const other = WorkItemIdSchema.parse('wi-other-def456');
+    const result = validateFullLog(body, other);
+    expect(result).toEqual({ ok: false, reason: expect.stringContaining('does not match expected') });
+  });
+
+  it('classifies a non-contiguous sequence as corrupt', async () => {
+    const body = await validBody('vfl-seq');
+    const lines = body.trimEnd().split('\n');
+    const third = JSON.parse(lines[2] as string) as Record<string, unknown>;
+    lines[2] = JSON.stringify({ ...third, seq: 9 });
+    const result = validateFullLog(`${lines.join('\n')}\n`, itemId);
+    expect(result).toEqual({ ok: false, reason: expect.stringContaining('not contiguous') });
+  });
+
+  it('classifies a first event that is not WorkItemCreated as corrupt', async () => {
+    const body = await validBody('vfl-first');
+    const lines = body.trimEnd().split('\n');
+    const result = validateFullLog(`${lines[1] as string}\n`, itemId);
+    expect(result).toEqual({ ok: false, reason: expect.stringContaining('first event must be WorkItemCreated') });
+  });
+
+  it('classifies a non-JSON line as corrupt', () => {
+    const result = validateFullLog('not json\n', itemId);
+    expect(result).toEqual({ ok: false, reason: expect.stringContaining('not valid JSON') });
   });
 });
 

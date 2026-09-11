@@ -1,11 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFile } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { EventLog, itemPaths } from '../../src/core/log.js';
-import type { Role } from '../../src/core/events.js';
+import type { EventType, MienguEvent, Role } from '../../src/core/events.js';
+import { DEFAULT_TIER, MienguEventSchema } from '../../src/core/events.js';
+import type { PredicateRunner } from '../../src/brownfield/types.js';
 import { RunIdSchema, WorkItemIdSchema, AccountIdSchema, ExecutorInstanceIdSchema } from '../../src/core/ids.js';
 import { fixedClock } from '../../src/core/clock.js';
 import type { IsoTimestamp } from '../../src/core/clock.js';
@@ -21,6 +23,7 @@ import { policyFromConfig } from '../../src/supervisor/nextStage.js';
 import { StubExecutor } from '../../src/executors/stub.js';
 import type { StubScript } from '../../src/executors/stub.js';
 import { createWorkspaceProvider } from '../../src/executors/isolation.js';
+import type { WorkspaceProvider } from '../../src/executors/isolation.js';
 import type {
   Executor,
   ExecutorInput,
@@ -31,6 +34,7 @@ import type {
 import type { ExecutorHandle, ExecutorRegistry, ResolvedRoleSettings } from '../../src/executors/registry.js';
 import { runItem, MAX_LOOP_ITERATIONS } from '../../src/supervisor/loop.js';
 import type { RunItemDeps } from '../../src/supervisor/loop.js';
+import type { BrownfieldCollector, CollectedEvidence } from '../../src/brownfield/types.js';
 
 const execFileAsync = promisify(execFile);
 const START = '2024-01-01T00:00:00.000Z' as IsoTimestamp;
@@ -73,7 +77,7 @@ afterEach(async () => {
   await rm(storeDir, { recursive: true, force: true });
 });
 
-function makeConfig(overrides: { maxWallSecondsPerInvocation?: number; snapshotEvery?: number; failBuildOracle?: boolean; oneAttemptPerRung?: boolean; oracles?: Record<'build' | 'typecheck' | 'lint' | 'test', string | null>; checkpoints?: unknown } = {}) {
+function makeConfig(overrides: { maxWallSecondsPerInvocation?: number; snapshotEvery?: number; failBuildOracle?: boolean; oneAttemptPerRung?: boolean; oracles?: Record<'build' | 'typecheck' | 'lint' | 'test', string | null>; checkpoints?: unknown; brownfieldEnabled?: boolean } = {}) {
   return MienguConfigSchema.parse({
     target: { repo: targetRepo },
     accounts: { 'stub-account': {} },
@@ -108,6 +112,7 @@ function makeConfig(overrides: { maxWallSecondsPerInvocation?: number; snapshotE
     limits: overrides.oneAttemptPerRung ? { kOracle: 1, kTest: 1, kReview: 1, maxAttemptsPerStage: 1 } : {},
     store: { snapshotEvery: overrides.snapshotEvery ?? 200 },
     ...(overrides.checkpoints !== undefined ? { checkpoints: overrides.checkpoints } : {}),
+    ...(overrides.brownfieldEnabled !== undefined ? { brownfield: { enabled: overrides.brownfieldEnabled } } : {}),
   });
 }
 
@@ -156,6 +161,8 @@ async function makeDeps(o: {
   executors: ExecutorRegistry;
   config: ReturnType<typeof makeConfig>;
   retainWorkspace?: boolean;
+  brownfield?: RunItemDeps['brownfield'];
+  workspace?: WorkspaceProvider;
 }): Promise<{ deps: RunItemDeps; log: EventLog }> {
   const runId = RunIdSchema.parse('run-01234567-89ab-cdef-0123-456789abcdef');
   const clock = fixedClock(START);
@@ -195,7 +202,7 @@ async function makeDeps(o: {
     config: o.config,
     policy: policyFromConfig(o.config),
     executors: o.executors,
-    workspace: createWorkspaceProvider('worktree'),
+    workspace: o.workspace ?? createWorkspaceProvider('worktree'),
     targetRepo,
     workspacesDir: paths.workspacesDir,
     promptsDir: join(paths.itemDir, 'prompts'),
@@ -207,6 +214,7 @@ async function makeDeps(o: {
     logger: silentLogger,
     signal: new AbortController().signal,
     retainWorkspace: o.retainWorkspace ?? false,
+    ...(o.brownfield !== undefined ? { brownfield: o.brownfield } : {}),
   };
   return { deps, log };
 }
@@ -280,6 +288,7 @@ const ARCHITECTURE_PLAN = {
       req_ids: ['REQ-example-1'],
     },
   ],
+  falsifications: [],
 };
 
 const TASK_GRAPH = {
@@ -1634,5 +1643,294 @@ describe('runItem: blast-radius classification (Phase 5)', () => {
 describe('MAX_LOOP_ITERATIONS', () => {
   it('is exported and equals 1000', () => {
     expect(MAX_LOOP_ITERATIONS).toBe(1000);
+  });
+});
+
+describe('runItem: brownfield collectors observe an immutable pinned checkout', () => {
+  it('runs collectors against a dedicated detached worktree at WorkspacePrepared.baseCommit, then discards it', async () => {
+    const itemId = WorkItemIdSchema.parse('wi-example-bfpin1');
+    // An uncommitted change in the operator's source checkout must never be visible to a
+    // collector; the agent worktree is likewise off-limits.
+    await writeFile(join(targetRepo, 'DIRTY.txt'), 'uncommitted\n');
+    const repoHead = (await git(targetRepo, ['rev-parse', 'HEAD'])).trim();
+
+    const seenRoots: string[] = [];
+    const probes: { head: string; readmeReadable: boolean; dirtyAbsent: boolean }[] = [];
+    const emptyEvidence: CollectedEvidence = {
+      facts: [], omissions: [], coverage: 'complete', treePaths: [], raw: { probe: true },
+    };
+    async function probe(targetRoot: string): Promise<void> {
+      seenRoots.push(targetRoot);
+      probes.push({
+        head: (await git(targetRoot, ['rev-parse', 'HEAD'])).trim(),
+        readmeReadable: await readFile(join(targetRoot, 'README.md'), 'utf8').then(() => true, () => false),
+        dirtyAbsent: await readFile(join(targetRoot, 'DIRTY.txt'), 'utf8').then(() => false, () => true),
+      });
+    }
+    const collector: BrownfieldCollector = {
+      async collectSkeleton(input) { await probe(input.targetRoot); return emptyEvidence; },
+      async collectGit(input) { await probe(input.targetRoot); return emptyEvidence; },
+      async collectTests(input) { await probe(input.targetRoot); return emptyEvidence; },
+    };
+
+    const paths = itemPaths(storeDir, itemId);
+    const { deps, log } = await makeDeps({
+      itemId,
+      seed: 'loop-bfpin',
+      executors: makeStubRegistry(happyPathScripts(), 'loop-bfpin-exec'),
+      config: makeConfig(),
+      brownfield: {
+        storeDir,
+        evidenceDir: paths.brownfieldDir,
+        targetRepoSha256: 'a'.repeat(64),
+        collectorVersion: 1,
+        collector,
+        predicateRunner: { evaluate: async () => { throw new Error('no predicate proposals in this run'); } },
+        readStore: async () => ({ items: [], corrupt: [] }),
+      },
+    });
+
+    const result = await runItem(deps);
+    expect(result.outcome).toBe('completed');
+
+    expect(seenRoots.length).toBeGreaterThan(0);
+    const pinned = join(paths.workspacesDir, 'brownfield-base');
+    const agentWorkdir = join(paths.workspacesDir, 'workspace');
+    for (const root of seenRoots) {
+      expect(root).toBe(pinned);
+      expect(root).not.toBe(targetRepo);
+      expect(root).not.toBe(agentWorkdir);
+    }
+    for (const p of probes) {
+      expect(p.head).toBe(repoHead);
+      expect(p.readmeReadable).toBe(true);
+      expect(p.dirtyAbsent).toBe(true);
+    }
+    // The dedicated checkout is discarded, not retained.
+    await expect(stat(pinned)).rejects.toMatchObject({ code: 'ENOENT' });
+
+    await log.close();
+  });
+
+  it('prepares no pinned worktree and runs no collector when brownfield is disabled', async () => {
+    const itemId = WorkItemIdSchema.parse('wi-example-bfoff1');
+    const preparedNames: string[] = [];
+    const inner = createWorkspaceProvider('worktree');
+    const workspace: WorkspaceProvider = {
+      ...inner,
+      prepare: async (opts) => { preparedNames.push(opts.name); return inner.prepare(opts); },
+    };
+    let collectorCalls = 0;
+    const emptyEvidence: CollectedEvidence = {
+      facts: [], omissions: [], coverage: 'complete', treePaths: [], raw: { probe: true },
+    };
+    const collector: BrownfieldCollector = {
+      async collectSkeleton() { collectorCalls += 1; return emptyEvidence; },
+      async collectGit() { collectorCalls += 1; return emptyEvidence; },
+      async collectTests() { collectorCalls += 1; return emptyEvidence; },
+    };
+
+    const paths = itemPaths(storeDir, itemId);
+    const { deps, log } = await makeDeps({
+      itemId,
+      seed: 'loop-bfoff',
+      executors: makeStubRegistry(happyPathScripts(), 'loop-bfoff-exec'),
+      config: makeConfig({ brownfieldEnabled: false }),
+      workspace,
+      brownfield: {
+        storeDir,
+        evidenceDir: paths.brownfieldDir,
+        targetRepoSha256: 'a'.repeat(64),
+        collectorVersion: 1,
+        collector,
+        predicateRunner: { evaluate: async () => { throw new Error('no predicate proposals in this run'); } },
+        readStore: async () => ({ items: [], corrupt: [] }),
+      },
+    });
+
+    const result = await runItem(deps);
+    expect(result.outcome).toBe('completed');
+    expect(collectorCalls).toBe(0);
+    expect(preparedNames).not.toContain('brownfield-base');
+    expect(preparedNames).toContain('workspace');
+    await expect(stat(join(paths.workspacesDir, 'brownfield-base'))).rejects.toMatchObject({ code: 'ENOENT' });
+
+    await log.close();
+  });
+});
+
+describe('runItem: architecture falsification proposal → evaluation (Phase 6 decision 23)', () => {
+  const SIBLING_ITEM = WorkItemIdSchema.parse('wi-hotfix-hhhhhh');
+  const HEX64 = '0'.repeat(64);
+
+  function hexId(prefix: string, n: number): string {
+    const hex = n.toString(16).padStart(32, '0');
+    return `${prefix}-${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+  }
+
+  /** A sibling item that has minted one falsifiable component claim over `src/hot.ts`. */
+  function siblingEvents(): MienguEvent[] {
+    const runId = hexId('run', 0x5117);
+    const mk = (seq: number, type: EventType, data: unknown): MienguEvent =>
+      MienguEventSchema.parse({
+        schema_version: 4,
+        event_id: hexId('evt', 0xb0000 + seq),
+        seq,
+        item_id: SIBLING_ITEM,
+        run_id: runId,
+        ts: `2024-01-01T00:00:0${String(seq)}.000Z`,
+        tier: DEFAULT_TIER[type],
+        actor: { kind: 'system', id: null },
+        causation_id: null,
+        type,
+        data,
+      });
+    return [
+      mk(1, 'WorkItemCreated', {
+        title: 'Hotfix', slug: 'hotfix',
+        source: { kind: 'prd-file', path: 'prd.md', sha256: 'a'.repeat(64), bytes: 1 },
+        config_hash: 'x',
+      }),
+      mk(2, 'StageCompleted', {
+        stage: 'architecture', attempt: 1,
+        artifact: {
+          kind: 'architecture-plan', sha256: 'b'.repeat(64),
+          body: {
+            decisions: [],
+            components: [{ component_id: 'component-hot-1', responsibility: 'owns the hot module', paths: ['src/hot.ts'], depends_on: [] }],
+            interfaces: [],
+            falsifications: [],
+          },
+        },
+      }),
+    ];
+  }
+
+  function skeletonCollector(): BrownfieldCollector {
+    const empty: CollectedEvidence = { facts: [], omissions: [], coverage: 'complete', treePaths: [], raw: { probe: true } };
+    return {
+      async collectSkeleton() {
+        return {
+          facts: [{ kind: 'file', path: 'src/hot.ts', sha256: HEX64, bytes: 1 }],
+          omissions: [], coverage: 'complete',
+          treePaths: ['README.md', 'src/hot.ts'],
+          raw: { probe: 'skeleton' },
+        };
+      },
+      async collectGit() { return empty; },
+      async collectTests() { return empty; },
+    };
+  }
+
+  function architectFalsificationScripts(entries: unknown[]): Partial<Record<Role, StubScript>> {
+    return {
+      ...happyPathScripts(),
+      architect: completedStep({ ...ARCHITECTURE_PLAN, falsifications: entries }),
+    };
+  }
+
+  it('records proposal→evaluation causation through an ordinary runItem and a refuted qualified proposal produces drift', async () => {
+    const itemId = WorkItemIdSchema.parse('wi-example-fals01');
+    await mkdir(join(targetRepo, 'src'), { recursive: true });
+    await writeFile(join(targetRepo, 'src/hot.ts'), 'export function hot() { return 1; }\n');
+    await git(targetRepo, ['add', '-A']);
+    await git(targetRepo, ['commit', '-m', 'add hot module']);
+
+    const paths = itemPaths(storeDir, itemId);
+    const refutingRunner: PredicateRunner = {
+      async evaluate(input) {
+        const refuted = input.proposal.subject !== null;
+        return { data: {
+          proposal_event_id: input.proposalEventId,
+          target_commit: input.targetCommit,
+          outcome: refuted ? 'refuted' : 'confirmed',
+          reason: refuted ? 'predicate-false' : 'predicate-true',
+          expected: 'present', observed: refuted ? 'absent' : 'present',
+          duration_ms: 0,
+          evidence: { sha256: HEX64, path: 'eval.json', bytes: 1 },
+        } };
+      },
+    };
+
+    const { deps, log } = await makeDeps({
+      itemId,
+      seed: 'loop-fals',
+      executors: makeStubRegistry(architectFalsificationScripts([
+        {
+          assertion: 'the hot module is still present at the base commit',
+          subject: { claim_item: SIBLING_ITEM, claim: 'claim-hotfix-1' },
+          area: 'src/hot.ts',
+          predicate: { kind: 'path-exists', path: 'src/hot.ts', expected: true },
+        },
+      ]), 'loop-fals-exec'),
+      config: makeConfig(),
+      brownfield: {
+        storeDir,
+        evidenceDir: paths.brownfieldDir,
+        targetRepoSha256: 'a'.repeat(64),
+        collectorVersion: 1,
+        collector: skeletonCollector(),
+        predicateRunner: refutingRunner,
+        readStore: async () => ({ items: [{ itemId: SIBLING_ITEM, events: siblingEvents() }], corrupt: [] }),
+      },
+    });
+
+    const result = await runItem(deps);
+    expect(result.outcome).toBe('completed');
+
+    const events = await log.readAll();
+    const architectureCompleted = events.find(
+      (e) => e.type === 'StageCompleted' && e.data.stage === 'architecture',
+    );
+    const proposal = events.find((e) => e.type === 'BrownfieldPredicateProposed');
+    const evaluation = events.find((e) => e.type === 'BrownfieldPredicateEvaluated');
+    const drift = events.find((e) => e.type === 'DriftDetected');
+
+    expect(architectureCompleted).toBeDefined();
+    expect(proposal).toBeDefined();
+    expect(proposal?.actor).toEqual({ kind: 'executor', id: 'stub-architect' });
+    expect(proposal?.causation_id).toBe(architectureCompleted?.event_id);
+    expect(proposal?.type === 'BrownfieldPredicateProposed' && proposal.data.subject).toEqual({
+      claim_item: SIBLING_ITEM, claim: 'claim-hotfix-1',
+    });
+
+    expect(evaluation).toBeDefined();
+    expect(evaluation?.causation_id).toBe(proposal?.event_id);
+    expect(evaluation?.type === 'BrownfieldPredicateEvaluated' && evaluation.data.outcome).toBe('refuted');
+
+    expect(drift).toBeDefined();
+    expect(drift?.type === 'DriftDetected' && drift.data.claim_item).toBe(SIBLING_ITEM);
+    expect(drift?.type === 'DriftDetected' && drift.data.claim).toBe('claim-hotfix-1');
+
+    await log.close();
+  });
+
+  it('an empty falsifications array produces no BrownfieldPredicateProposed', async () => {
+    const itemId = WorkItemIdSchema.parse('wi-example-fals02');
+    await mkdir(join(targetRepo, 'src'), { recursive: true });
+    await writeFile(join(targetRepo, 'src/hot.ts'), 'export function hot() { return 1; }\n');
+    await git(targetRepo, ['add', '-A']);
+    await git(targetRepo, ['commit', '-m', 'add hot module']);
+    const paths = itemPaths(storeDir, itemId);
+    const { deps, log } = await makeDeps({
+      itemId,
+      seed: 'loop-fals-empty',
+      executors: makeStubRegistry(architectFalsificationScripts([]), 'loop-fals-empty-exec'),
+      config: makeConfig(),
+      brownfield: {
+        storeDir,
+        evidenceDir: paths.brownfieldDir,
+        targetRepoSha256: 'a'.repeat(64),
+        collectorVersion: 1,
+        collector: skeletonCollector(),
+        predicateRunner: { evaluate: async () => { throw new Error('no proposals expected'); } },
+        readStore: async () => ({ items: [], corrupt: [] }),
+      },
+    });
+    const result = await runItem(deps);
+    expect(result.outcome).toBe('completed');
+    const events = await log.readAll();
+    expect(events.some((e) => e.type === 'BrownfieldPredicateProposed')).toBe(false);
+    await log.close();
   });
 });

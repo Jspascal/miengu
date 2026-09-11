@@ -102,6 +102,7 @@ const VALID_ARCHITECTURE_PLAN: ArchitecturePlan = ArchitecturePlanSchema.parse({
       req_ids: ['REQ-example-1'],
     },
   ],
+  falsifications: [],
 });
 
 const VALID_TASK_GRAPH: TaskGraph = TaskGraphSchema.parse({
@@ -278,6 +279,90 @@ describe('checkArchitecturePlan (architect)', () => {
     expect(
       failures.some((f) => f.includes("unresolved component_id 'component-example-9'")),
     ).toBe(true);
+  });
+
+  const withFalsifications = (entries: ArchitecturePlan['falsifications']): ArchitecturePlan => ({
+    ...VALID_ARCHITECTURE_PLAN,
+    falsifications: entries,
+  });
+
+  it('accepts an empty falsifications array regardless of catalogue or scope', () => {
+    expect(checkArchitecturePlan(withFalsifications([]), ctx())).toEqual([]);
+  });
+
+  it('accepts a null-subject falsification whose predicate path is inside the selected scope', () => {
+    const failures = checkArchitecturePlan(
+      withFalsifications([
+        { assertion: 'thing still there', subject: null, area: 'src/thing.ts', predicate: { kind: 'path-exists', path: 'src/thing.ts', expected: true } },
+      ]),
+      ctx({ selectedScopePaths: ['src/thing.ts'] }),
+    );
+    expect(failures).toEqual([]);
+  });
+
+  it('accepts a qualified subject that is in the falsifiable claim catalogue', () => {
+    const failures = checkArchitecturePlan(
+      withFalsifications([
+        { assertion: 'hot module contract', subject: { claim_item: 'wi-hotfix-aaaaaa' as never, claim: 'claim-hot-1' as never }, area: null, predicate: { kind: 'text-includes', path: 'src/hot.ts', needle: 'export', expected: true } },
+      ]),
+      ctx({
+        selectedScopePaths: ['src/hot.ts'],
+        falsifiableClaims: [{ claimItem: 'wi-hotfix-aaaaaa' as never, claim: 'claim-hot-1' as never, statement: 'owns the hot module' }],
+      }),
+    );
+    expect(failures).toEqual([]);
+  });
+
+  it('rejects a qualified subject absent from the falsifiable claim catalogue', () => {
+    const failures = checkArchitecturePlan(
+      withFalsifications([
+        { assertion: 'a', subject: { claim_item: 'wi-hotfix-aaaaaa' as never, claim: 'claim-ghost-9' as never }, area: null, predicate: { kind: 'path-exists', path: 'src/thing.ts', expected: true } },
+      ]),
+      ctx({ selectedScopePaths: ['src/thing.ts'], falsifiableClaims: [] }),
+    );
+    expect(failures.some((f) => f.includes("subject 'claim-ghost-9'") && f.includes('not a falsifiable claim in the selected scope'))).toBe(true);
+  });
+
+  it('rejects a predicate path target outside the selected scope', () => {
+    const failures = checkArchitecturePlan(
+      withFalsifications([
+        { assertion: 'a', subject: null, area: null, predicate: { kind: 'path-exists', path: 'src/elsewhere.ts', expected: true } },
+      ]),
+      ctx({ selectedScopePaths: ['src/thing.ts'] }),
+    );
+    expect(failures).toContain("falsification 0 predicate path 'src/elsewhere.ts' is outside the selected scope");
+  });
+
+  it('empty scope means nothing is in scope: a path-bearing predicate is rejected', () => {
+    const failures = checkArchitecturePlan(
+      withFalsifications([
+        { assertion: 'a', subject: null, area: null, predicate: { kind: 'path-exists', path: 'src/thing.ts', expected: true } },
+      ]),
+      ctx({ selectedScopePaths: [] }),
+    );
+    expect(failures).toContain("falsification 0 predicate path 'src/thing.ts' is outside the selected scope");
+  });
+
+  it('a declared-command-exits predicate has no path target and is unaffected by an empty scope', () => {
+    const failures = checkArchitecturePlan(
+      withFalsifications([
+        { assertion: 'the test command passes', subject: null, area: null, predicate: { kind: 'declared-command-exits', command: 'test', expected_exit_codes: [0] } },
+      ]),
+      ctx({ selectedScopePaths: [] }),
+    );
+    expect(failures).toEqual([]);
+  });
+
+  it('rejects every non-empty falsification set when no brownfield scope was supplied', () => {
+    const failures = checkArchitecturePlan(
+      withFalsifications([
+        { assertion: 'the configured test exits cleanly', subject: null, area: null, predicate: { kind: 'declared-command-exits', command: 'test', expected_exit_codes: [0] } },
+      ]),
+      ctx(),
+    );
+    expect(failures).toContain(
+      'falsifications require brownfield evidence supplied to the architecture invocation',
+    );
   });
 });
 

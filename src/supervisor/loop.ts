@@ -1,4 +1,4 @@
-import { access, readFile } from 'node:fs/promises';
+import { access, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { assertNever } from '../core/events.js';
 import type { Actor, FailureAttemptBucket, RunOutcome, Stage } from '../core/events.js';
@@ -23,13 +23,30 @@ import { nextStage } from './nextStage.js';
 import type { StagePolicy } from './nextStage.js';
 import { runRoleStage, runSupervisorStage } from './stages.js';
 import type { StageRunContext } from './stages.js';
-import type { CheckContext } from '../agents/checks.js';
+import type { CheckContext, FalsifiableClaimRef } from '../agents/checks.js';
 import type { AppendFn, GateContext, PackBuildInput, RawPackMaterials } from '../agents/agent.js';
 import type { ArchitecturePlan, RequirementSet, TaskGraph, TestSuiteSpec } from '../contracts/index.js';
-import type { AccountId, ExecutorInstanceId } from '../core/ids.js';
+import type { AccountId, ExecutorInstanceId, WorkItemId } from '../core/ids.js';
 import type { CauseId, EventId, TaskId } from '../core/ids.js';
-import { artifactSectionTier, deriveClaims } from '../wiki/records.js';
+import { artifactSectionTier, deriveClaims, deriveStoreClaimSets } from '../wiki/records.js';
 import { fileMapBodies, stackFactsBodies, systemSkeletonBodies, wikiIndexBodies } from '../wiki/packmaterials.js';
+import {
+  brownfieldDriftBodies,
+  brownfieldFalsifiableClaimBodies,
+  brownfieldFalsificationBodies,
+  brownfieldFileMapBodies,
+  brownfieldHistoryBodies,
+  brownfieldStackFactsBodies,
+  brownfieldSystemSkeletonBodies,
+  brownfieldTestConventionLines,
+  brownfieldTestSpecFiles,
+  falsifiableClaimCatalogue,
+} from '../wiki/packmaterials.js';
+import type { TieredBody } from '../wiki/packmaterials.js';
+import { ensureBrownfieldEvidence } from '../brownfield/bootstrap.js';
+import type { BrownfieldCollector, PredicateRunner } from '../brownfield/types.js';
+import type { DriftCandidate } from '../brownfield/types.js';
+import { sha256Hex } from '../core/hash.js';
 import { runOracleSweep } from '../oracles/runner.js';
 import { checkpointAcceptedTask, checkpointFrozenTests, captureFinalPatch, rebuildWorkspace } from '../integrator/merge.js';
 import { bucketLimit, classifyFailure, deterministicTaskOrder, escalationRank, invalidationClosure, nextEscalationLevel } from './escalation.js';
@@ -76,6 +93,18 @@ export interface RunItemDeps {
   readonly logger: Logger;
   readonly signal: AbortSignal;
   readonly retainWorkspace: boolean;
+  readonly brownfield?: {
+    readonly storeDir: string;
+    readonly evidenceDir: string;
+    readonly targetRepoSha256: string;
+    readonly collectorVersion: number;
+    readonly collector: BrownfieldCollector;
+    readonly predicateRunner: PredicateRunner;
+    readonly readStore: () => Promise<{
+      readonly items: readonly { readonly itemId: import('../core/ids.js').WorkItemId; readonly events: readonly MienguEvent[] }[];
+      readonly corrupt: readonly { readonly itemId: import('../core/ids.js').WorkItemId; readonly error: string }[];
+    }>;
+  };
 }
 
 export interface RunItemResult {
@@ -116,11 +145,11 @@ async function appendEvent(
   deps: RunItemDeps,
   state: WorkItemState,
   input: Omit<AppendInput, 'causationId'> & { readonly causationId?: EventId | null },
-): Promise<{ readonly state: WorkItemState; readonly ts: IsoTimestamp }> {
+): Promise<{ readonly state: WorkItemState; readonly ts: IsoTimestamp; readonly event: MienguEvent }> {
   const event = await deps.log.append({ ...input, causationId: input.causationId ?? deps.log.lastEventId });
   const next = applyEvent(state, event);
   await maybeSnapshot(deps, next, false);
-  return { state: next, ts: event.ts };
+  return { state: next, ts: event.ts, event };
 }
 
 async function appendAndFold(
@@ -182,6 +211,7 @@ function buildCheckContext(
   state: WorkItemState,
   config: MienguConfig,
   testDirs: readonly string[],
+  falsifiable: { readonly claims: readonly FalsifiableClaimRef[]; readonly scopePaths: readonly string[] } | null = null,
 ): CheckContext {
   return {
     requirementSet: getArtifactBody<RequirementSet>(events, state.artifacts.requirementSet?.eventId ?? null),
@@ -189,7 +219,53 @@ function buildCheckContext(
     taskGraph: getArtifactBody<TaskGraph>(events, state.artifacts.taskGraph?.eventId ?? null),
     maxPathsPerTask: config.planner.maxPathsPerTask,
     testDirs,
+    ...(falsifiable === null
+      ? {}
+      : {
+          falsifiableClaims: falsifiable.claims,
+          selectedScopePaths: falsifiable.scopePaths,
+        }),
   };
+}
+
+/** The mechanical-skeleton evidence scope actually supplied to an invocation at `baseCommit`
+ *  — the Tier-0 evidence the Architect proposes against (Phase 6 decision 23). */
+function suppliedSkeletonScope(
+  events: readonly MienguEvent[],
+  baseCommit: string,
+): { readonly targetCommit: string; readonly sha256: string; readonly paths: readonly string[] } | null {
+  const evidence = events
+    .filter((event): event is Extract<MienguEvent, { type: 'BrownfieldEvidenceRecorded' }> =>
+      event.type === 'BrownfieldEvidenceRecorded' &&
+      event.data.ladder_tier === 'mechanical-skeleton' &&
+      event.data.scope.target_commit === baseCommit,
+    )
+    .at(-1);
+  return evidence === undefined
+    ? null
+    : { targetCommit: evidence.data.scope.target_commit, sha256: evidence.data.scope.sha256, paths: evidence.data.scope.paths };
+}
+
+/** The scoped falsifiable claim catalogue for the Architect's pack and checks: every item's
+ *  claims resolved store-wide (so a qualified cross-item subject is nameable), then filtered
+ *  to the supplied Tier-0 scope. */
+async function falsifiableCatalogueFor(
+  deps: RunItemDeps,
+  events: readonly MienguEvent[],
+  itemId: WorkItemId,
+  scopePaths: readonly string[],
+): Promise<readonly FalsifiableClaimRef[]> {
+  const inputs: { readonly events: readonly MienguEvent[] }[] = [{ events }];
+  if (deps.brownfield !== undefined) {
+    const store = await deps.brownfield.readStore();
+    for (const sibling of store.items) {
+      if (sibling.itemId !== itemId) {
+        inputs.push({ events: sibling.events });
+      }
+    }
+  }
+  const sets = deriveStoreClaimSets(inputs);
+  return falsifiableClaimCatalogue(sets.values(), scopePaths);
 }
 
 /** Detected conventions: whichever of the common test directory names actually exist in the
@@ -241,6 +317,10 @@ async function buildRawPackMaterials(o: {
    *  from it (§15.6 lists the diff first); every other role omits the kind, so passing it
    *  is harmless for them and `assemblePack` drops it. */
   readonly diff: string | null;
+  /** Normalized brownfield evidence already persisted for this base commit. */
+  readonly brownfield: BrownfieldPackMaterials;
+  /** Architect-only: the scoped falsifiable claim catalogue (Phase 6 decision 23). */
+  readonly falsifiableClaims: readonly FalsifiableClaimRef[];
 }): Promise<RawPackMaterials> {
   const prd = await readTextFileOrNull(o.prdPath);
 
@@ -276,13 +356,16 @@ async function buildRawPackMaterials(o: {
     wikiIndex: wikiIndexBodies(claimSet),
     existingReqIds: o.requirementSet?.requirements.map((r) => r.req_id) ?? [],
     priorOutOfScope: o.requirementSet?.out_of_scope ?? [],
-    stackFacts: stackFactsBodies(claimSet),
-    systemSkeleton: systemSkeletonBodies(claimSet),
-    fileMap: fileMapBodies(claimSet),
-    testConventions: `Tests live under: ${o.testDirs.join(', ')}`,
-    // The Coder runs inside the prepared worktree and can read files itself; shipping bodies
-    // it can already read buys no review minutes and is not a Phase 4 contract (§9).
-    sourceFiles: [],
+    stackFacts: [...stackFactsBodies(claimSet), ...o.brownfield.stackFacts],
+    systemSkeleton: [...systemSkeletonBodies(claimSet), ...o.brownfield.systemSkeleton],
+    fileMap: [...fileMapBodies(claimSet), ...o.brownfield.fileMap],
+    testConventions: o.brownfield.testConventionLines.length === 0
+      ? `Tests live under: ${o.testDirs.join(', ')}`
+      : `Tests live under: ${o.testDirs.join(', ')}\nObserved tests at base commit:\n${o.brownfield.testConventionLines.join('\n')}`,
+    // The Coder runs inside the prepared worktree and can read current files itself; the only
+    // bodies shipped here are the tests-as-spec excerpts observed at the immutable base commit,
+    // which the Coder's task-scoped filter narrows further (decision 20).
+    sourceFiles: [...o.brownfield.testSpecFiles],
     frozenTestList,
     frozenTestBodies,
     diff: o.diff,
@@ -300,6 +383,10 @@ async function buildRawPackMaterials(o: {
       taskGraph: artifactSectionTier(claimSet, artifacts.taskGraph?.eventId ?? null, 'T2'),
       testSuiteSpec: artifactSectionTier(claimSet, artifacts.testSuiteSpec?.eventId ?? null, 'T2'),
     },
+    brownfieldHistory: o.brownfield.history,
+    brownfieldFalsification: o.brownfield.falsification,
+    brownfieldFalsifiableClaims: brownfieldFalsifiableClaimBodies(o.falsifiableClaims),
+    brownfieldDrift: o.brownfield.drift,
   };
 }
 
@@ -344,6 +431,62 @@ function activeEscalationContext(
     t1OracleSummaries: oracleResults === null ? [] : [oracleResults],
     taskIds: cause.affects.taskIds,
     currentTaskReviewerFindings: reviewerFindings,
+  };
+}
+
+function sameDrift(candidate: DriftCandidate, event: Extract<MienguEvent, { type: 'DriftDetected' }>): boolean {
+  return candidate.claimItem === event.data.claim_item &&
+    candidate.claim === event.data.claim &&
+    candidate.expected === event.data.expected &&
+    candidate.observed === event.data.observed &&
+    candidate.area === event.data.area;
+}
+
+/** Everything the coordinator has already persisted, projected onto pack material. */
+interface BrownfieldPackMaterials {
+  readonly history: readonly TieredBody[];
+  readonly falsification: readonly TieredBody[];
+  readonly drift: readonly TieredBody[];
+  readonly stackFacts: readonly TieredBody[];
+  readonly systemSkeleton: readonly TieredBody[];
+  readonly fileMap: readonly TieredBody[];
+  readonly testConventionLines: readonly string[];
+  readonly testSpecFiles: readonly { readonly path: string; readonly body: string }[];
+}
+
+const EMPTY_BROWNFIELD_MATERIALS: BrownfieldPackMaterials = {
+  history: [], falsification: [], drift: [],
+  stackFacts: [], systemSkeleton: [], fileMap: [],
+  testConventionLines: [], testSpecFiles: [],
+};
+
+/** Build only normalized, selected brownfield sections after the coordinator has persisted
+ * all observations.  Tier-0 skeleton facts route through the existing stack-facts,
+ * system-skeleton and file-map channels; tests-as-spec identifiers/hashes through
+ * test-conventions and verbatim excerpts through source-files — so every existing role
+ * isolation and body rule applies to them unchanged.  The selected-neighborhood scope is
+ * the latest evidence scope for this immutable base commit. */
+function brownfieldMaterials(
+  events: readonly MienguEvent[],
+  baseCommit: string,
+  touched: readonly DriftCandidate[],
+): BrownfieldPackMaterials {
+  const scope = events.filter((event): event is Extract<MienguEvent, { type: 'BrownfieldEvidenceRecorded' }> =>
+    event.type === 'BrownfieldEvidenceRecorded' && event.data.scope.target_commit === baseCommit,
+  ).at(-1)?.data.scope.sha256;
+  if (scope === undefined) return EMPTY_BROWNFIELD_MATERIALS;
+  const touchedEventIds = events.filter((event): event is Extract<MienguEvent, { type: 'DriftDetected' }> =>
+    event.type === 'DriftDetected' && touched.some((candidate) => sameDrift(candidate, event)),
+  ).map((event) => event.event_id);
+  return {
+    history: brownfieldHistoryBodies(events, scope),
+    falsification: brownfieldFalsificationBodies(events, scope),
+    drift: brownfieldDriftBodies(events, touchedEventIds),
+    stackFacts: brownfieldStackFactsBodies(events, baseCommit),
+    systemSkeleton: brownfieldSystemSkeletonBodies(events, baseCommit),
+    fileMap: brownfieldFileMapBodies(events, baseCommit),
+    testConventionLines: brownfieldTestConventionLines(events, scope),
+    testSpecFiles: brownfieldTestSpecFiles(events, scope),
   };
 }
 
@@ -447,6 +590,83 @@ async function performRunAttempt(
     throw new StoreError('workspace preparation did not populate state.workspace');
   }
 
+  // Brownfield collection is deliberately between preparation and every role pack. The
+  // coordinator receives the original detached base commit, never a later task checkpoint.
+  // It appends through this loop so its durable facts are folded before pack construction.
+  let touchedBrownfieldDrift: readonly DriftCandidate[] = [];
+  if (deps.brownfield !== undefined && deps.config.brownfield.enabled) {
+    const brownfieldEvents = await deps.log.readAll();
+    const architecturePlan = getArtifactBody<ArchitecturePlan>(brownfieldEvents, state.artifacts.architecturePlan?.eventId ?? null);
+    const taskGraph = getArtifactBody<TaskGraph>(brownfieldEvents, state.artifacts.taskGraph?.eventId ?? null);
+    const policy = deps.config.brownfield.falsification;
+    // Collectors must observe an immutable checkout pinned exactly at
+    // WorkspacePrepared.baseCommit. The agent worktree accumulates accepted-task commits and
+    // the operator's source checkout is mutable, so neither is a sound basis for evidence
+    // about the original base. This dedicated detached worktree is discarded on every path,
+    // including a previous run's crashed remnant.
+    const pinnedName = 'brownfield-base';
+    const pinnedWorkdir = join(deps.workspacesDir, pinnedName);
+    const pinnedRemnant: PreparedWorkspace = {
+      mode: workspaceInfo.mode,
+      targetRepo: workspaceInfo.targetRepo,
+      workdir: pinnedWorkdir,
+      baseRef: workspaceInfo.baseCommit,
+      baseCommit: workspaceInfo.baseCommit,
+    };
+    await deps.workspace.discard(pinnedRemnant, { retain: false }).catch(() => undefined);
+    await rm(pinnedWorkdir, { recursive: true, force: true }).catch(() => undefined);
+    const pinned = await deps.workspace.prepare({
+      itemId: deps.log.itemId,
+      targetRepo: deps.targetRepo,
+      baseRef: workspaceInfo.baseCommit,
+      workspacesDir: deps.workspacesDir,
+      name: pinnedName,
+    });
+    try {
+      const result = await ensureBrownfieldEvidence({
+        enabled: deps.config.brownfield.enabled,
+        stage: decision.stage,
+        itemId: state.itemId,
+        events: brownfieldEvents,
+        targetRoot: pinned.workdir,
+        storeDir: deps.brownfield.storeDir,
+        workspaceMetadataDirs: [deps.workspacesDir],
+        targetCommit: workspaceInfo.baseCommit,
+        targetRepoSha256: deps.brownfield.targetRepoSha256 || sha256Hex(workspaceInfo.targetRepo),
+        evidenceDir: deps.brownfield.evidenceDir,
+        collectorVersion: deps.brownfield.collectorVersion,
+        limits: {
+          maxTreeEntries: deps.config.brownfield.maxTreeEntries,
+          maxFileBytes: deps.config.brownfield.maxFileBytes,
+          maxTestExcerptBytes: deps.config.brownfield.maxTestExcerptBytes,
+          maxGitCommits: deps.config.brownfield.maxGitCommits,
+          maxFilesPerCommit: deps.config.brownfield.maxFilesPerCommit,
+          maxFilesPerScope: deps.config.brownfield.maxFilesPerScope,
+          maxDependencyDepth: deps.config.brownfield.maxDependencyDepth,
+        },
+        configuredTestCommand: deps.config.oracles.test,
+        dependencyEdges: [],
+        architecturePlan,
+        taskGraph,
+        activeTaskId: state.tasks?.currentTaskId ?? null,
+        collector: deps.brownfield.collector,
+        predicateRunner: deps.brownfield.predicateRunner,
+        predicatePolicy: policy,
+        signal: deps.signal,
+        append: async (input) => {
+          const appended = await appendEvent(deps, state, input);
+          state = appended.state;
+          return appended.event;
+        },
+        readStore: deps.brownfield.readStore,
+      });
+      touchedBrownfieldDrift = result.touchedDrift;
+    } finally {
+      await deps.workspace.discard(pinned, { retain: false }).catch(() => undefined);
+      await rm(pinned.workdir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
   if (state.worktreeLock !== null) {
     const staleLock = state.worktreeLock;
     deps.logger.warn(
@@ -477,7 +697,19 @@ async function performRunAttempt(
 
   const events = await deps.log.readAll();
   const testDirs = await detectTestDirs(workspaceInfo.workdir);
-  const checkContext = buildCheckContext(events, state, deps.config, testDirs);
+  // Phase 6 decision 23: only the Architect authors Tier-3 proposals, so only its pack and
+  // checks carry the scoped falsifiable claim catalogue and the Tier-0 scope it proposes
+  // against — the evidence actually supplied to this invocation.
+  const suppliedScope = decision.stage === 'architecture'
+    ? suppliedSkeletonScope(events, workspaceInfo.baseCommit)
+    : null;
+  const falsifiable = suppliedScope === null
+    ? null
+    : {
+        claims: await falsifiableCatalogueFor(deps, events, state.itemId, suppliedScope.paths),
+        scopePaths: suppliedScope.paths,
+      };
+  const checkContext = buildCheckContext(events, state, deps.config, testDirs, falsifiable);
   const testSuiteSpec = getArtifactBody<TestSuiteSpec>(events, state.artifacts.testSuiteSpec?.eventId ?? null);
   const task = state.tasks?.currentTaskId === null || state.tasks === null || checkContext.taskGraph === null
     ? null
@@ -500,6 +732,8 @@ async function performRunAttempt(
     oracleResults,
     currentTaskReviewerFindings: reviewerFindings,
     escalationContext: activeEscalationContext(state, oracleResults, reviewerFindings),
+    brownfield: brownfieldMaterials(events, workspaceInfo.baseCommit, touchedBrownfieldDrift),
+    falsifiableClaims: falsifiable?.claims ?? [],
   });
   const pack: PackBuildInput = {
     itemId: state.itemId,
@@ -720,6 +954,38 @@ async function performRunAttempt(
     data: { stage: decision.stage, attempt: decision.attempt, artifact: outcome.artifact },
     actor: SUPERVISOR_ACTOR,
   });
+  const stageCompletedEventId = deps.log.lastEventId;
+
+  // Phase 6 decision 23: the Architect is the sole Tier-3 proposal author; the supervisor is
+  // the producer. After a validated architecture `StageCompleted`, append one
+  // `BrownfieldPredicateProposed` per `falsifications` entry, in artifact order, with actor
+  // equal to the invoking executor, `causation_id` equal to that `StageCompleted`, and
+  // target commit / scope hash copied from the Tier-0 evidence actually supplied to this
+  // invocation. Agents never append these; the following runItem iteration evaluates them.
+  if (
+    decision.stage === 'architecture' &&
+    suppliedScope !== null &&
+    stageCompletedEventId !== null &&
+    outcome.artifact !== null &&
+    outcome.artifact.kind === 'architecture-plan'
+  ) {
+    const plan = outcome.artifact.body as ArchitecturePlan;
+    for (const entry of plan.falsifications) {
+      state = await appendAndFold(deps, state, {
+        type: 'BrownfieldPredicateProposed',
+        data: {
+          target_commit: suppliedScope.targetCommit,
+          scope_sha256: suppliedScope.sha256,
+          subject: entry.subject,
+          assertion: entry.assertion,
+          area: entry.area,
+          predicate: entry.predicate,
+        },
+        actor: { kind: 'executor', id: handle.executor.id },
+        causationId: stageCompletedEventId,
+      });
+    }
+  }
 
   // Blast-radius classification (binding decision 11): completion path only, after
   // `StageCompleted` and before `releaseLock`. Never on a failure path (every failure path

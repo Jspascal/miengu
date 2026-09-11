@@ -10,6 +10,9 @@ import { parseSerial } from '../core/ids.js';
 import type { ComponentId, DecisionId, ReqId, TaskId } from '../core/ids.js';
 import type { EscalationLevel } from '../core/events.js';
 import { escalationRank } from '../supervisor/escalation.js';
+import type { FalsifiableClaimRef } from '../wiki/packmaterials.js';
+
+export type { FalsifiableClaimRef } from '../wiki/packmaterials.js';
 
 export interface CheckContext {
   readonly requirementSet: RequirementSet | null;
@@ -17,6 +20,13 @@ export interface CheckContext {
   readonly taskGraph: TaskGraph | null;
   readonly maxPathsPerTask: number; // from config.planner — no literal in code
   readonly testDirs: readonly string[]; // from detected conventions
+  /** Phase 6 decision 23: the scoped falsifiable claim catalogue present in the Architect's
+   *  pack. `undefined`/empty means the pack carried none — any qualified subject is then
+   *  out of scope. */
+  readonly falsifiableClaims?: readonly FalsifiableClaimRef[];
+  /** Normalized paths of the brownfield evidence actually supplied to the invocation. When
+   *  non-empty, every falsification predicate path target must fall inside it. */
+  readonly selectedScopePaths?: readonly string[];
 }
 
 /** All `priority: 'must'` requirements' `req_id`s, in declared order. */
@@ -242,6 +252,70 @@ export function checkArchitecturePlan(a: ArchitecturePlan, c: CheckContext): rea
       );
     }
   }
+
+  failures.push(...checkFalsifications(a, c));
+
+  return failures;
+}
+
+/** The path (or dependency-edge endpoint) targets a closed predicate reads. A
+ *  `declared-command-exits` predicate names a config key, never a path, so it has none. */
+function predicatePathTargets(
+  predicate: ArchitecturePlan['falsifications'][number]['predicate'],
+): readonly string[] {
+  switch (predicate.kind) {
+    case 'path-exists':
+    case 'json-pointer-equals':
+    case 'text-includes':
+      return [predicate.path];
+    case 'dependency-edge-exists':
+      return [predicate.from, predicate.to];
+    case 'declared-command-exits':
+      return [];
+  }
+}
+
+/** Collision-free serialization of the two halves of a qualified claim key. */
+function qualifiedKey(claimItem: string, claim: string): string {
+  return JSON.stringify([claimItem, claim]);
+}
+
+/**
+ * Phase 6 decision 23: the Architect may propose only against the falsifiable claim
+ * catalogue and the selected-scope paths present in its pack. A qualified `subject` must name
+ * a catalogue entry; every predicate path target must fall inside the supplied selected
+ * scope. An explicitly supplied empty scope means no path is in scope; an absent scope means
+ * no proposal of any kind is valid because no brownfield evidence reached the invocation.
+ */
+function checkFalsifications(a: ArchitecturePlan, c: CheckContext): readonly string[] {
+  const failures: string[] = [];
+  if (a.falsifications.length > 0 && c.selectedScopePaths === undefined) {
+    failures.push('falsifications require brownfield evidence supplied to the architecture invocation');
+    return failures;
+  }
+  const catalogue = new Set(
+    (c.falsifiableClaims ?? []).map((ref) => qualifiedKey(ref.claimItem, ref.claim)),
+  );
+  const scopePaths = c.selectedScopePaths ?? [];
+  const inScope = (target: string): boolean =>
+    scopePaths.some((path) => target === path || target.startsWith(`${path}/`) || path.startsWith(`${target}/`));
+
+  a.falsifications.forEach((entry, index) => {
+    if (entry.subject !== null) {
+      const key = qualifiedKey(entry.subject.claim_item, entry.subject.claim);
+      if (!catalogue.has(key)) {
+        failures.push(
+          `falsification ${String(index)} subject '${entry.subject.claim}' (item '${entry.subject.claim_item}') ` +
+            'is not a falsifiable claim in the selected scope',
+        );
+      }
+    }
+    for (const target of predicatePathTargets(entry.predicate)) {
+      if (!inScope(target)) {
+        failures.push(`falsification ${String(index)} predicate path '${target}' is outside the selected scope`);
+      }
+    }
+  });
 
   return failures;
 }

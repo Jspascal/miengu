@@ -118,6 +118,23 @@ describe('MienguConfigSchema', () => {
       limits: { kOracle: 3, kTest: 3, kReview: 2, maxAttemptsPerStage: 3 },
       planner: { maxPathsPerTask: 8 },
       assumptions: { maxStackDepth: 2 },
+      brownfield: {
+        enabled: true,
+        maxTreeEntries: 5000,
+        maxFilesPerScope: 200,
+        maxDependencyDepth: 2,
+        maxFileBytes: 262144,
+        maxTestExcerptBytes: 8192,
+        maxGitCommits: 200,
+        maxFilesPerCommit: 50,
+        falsification: {
+          maxPredicatesPerScope: 8,
+          maxWallSeconds: 30,
+          maxOutputBytes: 65536,
+          commands: {},
+          sandbox: null,
+        },
+      },
       checkpoints: {
         defaultOwner: 'operator',
         reversible: { slaSeconds: 86400, default: 'accept' },
@@ -182,6 +199,10 @@ describe('MienguConfigSchema', () => {
     ['limits', { ...validConfig(), limits: { bogus: true } }],
     ['planner', { ...validConfig(), planner: { bogus: true } }],
     ['assumptions', { ...validConfig(), assumptions: { bogus: true } }],
+    ['brownfield', { ...validConfig(), brownfield: { bogus: true } }],
+    ['brownfield.falsification', { ...validConfig(), brownfield: { falsification: { bogus: true } } }],
+    ['brownfield.falsification.commands.*', { ...validConfig(), brownfield: { falsification: { commands: { check: { bogus: true } } } } }],
+    ['brownfield.falsification.sandbox', { ...validConfig(), brownfield: { falsification: { sandbox: { bogus: true } } } }],
     ['checkpoints', { ...validConfig(), checkpoints: { bogus: true } }],
     ['checkpoints.reversible', { ...validConfig(), checkpoints: { reversible: { bogus: true } } }],
     ['checkpoints.blastRadius', { ...validConfig(), checkpoints: { blastRadius: { bogus: true } } }],
@@ -289,6 +310,42 @@ describe('MienguConfigSchema', () => {
       'dependency-manifest': 'blocking',
       'diff-size': 'advisory',
     });
+  });
+
+  it('defaults the bounded brownfield block with no process predicate configuration', () => {
+    const parsed = MienguConfigSchema.parse(validConfig());
+    expect(parsed.brownfield).toEqual({
+      enabled: true,
+      maxTreeEntries: 5000,
+      maxFilesPerScope: 200,
+      maxDependencyDepth: 2,
+      maxFileBytes: 262144,
+      maxTestExcerptBytes: 8192,
+      maxGitCommits: 200,
+      maxFilesPerCommit: 50,
+      falsification: {
+        maxPredicatesPerScope: 8,
+        maxWallSeconds: 30,
+        maxOutputBytes: 65536,
+        commands: {},
+        sandbox: null,
+      },
+    });
+  });
+
+  it('requires non-empty command argv and nonnegative dependency depth', () => {
+    expect(
+      MienguConfigSchema.safeParse({
+        ...validConfig(),
+        brownfield: { falsification: { commands: { check: { argv: [] } } } },
+      }).success,
+    ).toBe(false);
+    expect(
+      MienguConfigSchema.safeParse({
+        ...validConfig(),
+        brownfield: { maxDependencyDepth: -1 },
+      }).success,
+    ).toBe(false);
   });
 });
 

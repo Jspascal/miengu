@@ -72,6 +72,7 @@ const ARCHITECTURE_PLAN: ArchitecturePlan = ArchitecturePlanSchema.parse({
       req_ids: ['REQ-example-1'],
     },
   ],
+  falsifications: [],
 });
 
 const TASK_GRAPH: TaskGraph = TaskGraphSchema.parse({
@@ -115,6 +116,9 @@ function maximalRaw(): RawPackMaterials {
       taskIds: [],
       currentTaskReviewerFindings: null,
     },
+    brownfieldHistory: [tieredBody('brownfield-history', 'T1')],
+    brownfieldFalsification: [tieredBody('brownfield-falsification', 'T1')],
+    brownfieldDrift: [tieredBody('brownfield-drift', 'T1')],
     assumptions: [{ question: 'q', chosen: sentinel('assumptions'), affects: [] }],
     artifactTiers: {
       requirementSet: 'T2',
@@ -168,6 +172,40 @@ describe('acceptance criterion 4: the rendered pack bytes exclude every kind in 
 });
 
 describe('the two load-bearing rows, asserted by name', () => {
+  it('Analyst and Test Author never receive any brownfield section', () => {
+    for (const role of ['analyst', 'testAuthor'] as const) {
+      const module = ROLE_MODULES[role];
+      const rendered = renderPack(assemblePack({
+        itemId: ITEM_ID,
+        stage: module.stage,
+        role,
+        candidates: module.buildCandidates(maximalPack()),
+        budgetTokens: 1_000_000,
+        tierFloor: 'T3',
+      }));
+      for (const kind of ['brownfield-history', 'brownfield-falsification', 'brownfield-drift']) {
+        expect(rendered).not.toContain(sentinel(kind));
+      }
+    }
+  });
+
+  it('Architect, Planner, Coder and Reviewer receive only supplied normalized brownfield sections', () => {
+    for (const role of ['architect', 'planner', 'coder', 'reviewer'] as const) {
+      const module = ROLE_MODULES[role];
+      const rendered = renderPack(assemblePack({
+        itemId: ITEM_ID,
+        stage: module.stage,
+        role,
+        candidates: module.buildCandidates(maximalPack()),
+        budgetTokens: 1_000_000,
+        tierFloor: 'T3',
+      }));
+      for (const kind of ['brownfield-history', 'brownfield-falsification', 'brownfield-drift']) {
+        expect(rendered).toContain(sentinel(kind));
+      }
+    }
+  });
+
   it("the Test Author's rendered pack contains no implementation, diff, source-file, task-graph, architecture-component, file-map, wiki-index or system-skeleton sentinel", () => {
     const module = ROLE_MODULES.testAuthor;
     const candidates = module.buildCandidates(maximalPack());
@@ -296,7 +334,7 @@ function tsAt(n: number): string {
 
 function mkEvent(seq: number, type: EventType, data: unknown): MienguEvent {
   return MienguEventSchema.parse({
-    schema_version: 3,
+    schema_version: 4,
     event_id: hexId('evt', seq),
     seq,
     item_id: ITEM_ID,
@@ -330,13 +368,20 @@ function architectureStageCompleted(seq: number, componentId: string, responsibi
         decisions: [],
         components: [{ component_id: componentId, responsibility, paths: [], depends_on: [] }],
         interfaces: [],
+        falsifications: [],
       },
     },
   });
 }
 
 function driftDetected(seq: number, claim: string): MienguEvent {
-  return mkEvent(seq, 'DriftDetected', { claim, expected: 'expected', observed: 'observed', area: null });
+  return mkEvent(seq, 'DriftDetected', {
+    claim_item: ITEM_ID,
+    claim,
+    expected: 'expected',
+    observed: 'observed',
+    area: null,
+  });
 }
 
 function artifactsInvalidated(seq: number, artifactEventIds: string[]): MienguEvent {

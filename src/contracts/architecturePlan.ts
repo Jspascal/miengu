@@ -1,5 +1,13 @@
 import { z } from 'zod';
-import { ComponentIdSchema, DecisionIdSchema, InterfaceIdSchema, ReqIdSchema } from '../core/ids.js';
+import {
+  ClaimIdSchema,
+  ComponentIdSchema,
+  DecisionIdSchema,
+  InterfaceIdSchema,
+  ReqIdSchema,
+  WorkItemIdSchema,
+} from '../core/ids.js';
+import { BrownfieldPredicateSchema } from '../core/events.js';
 
 export const ArchitecturePlanSchema = z
   .object({
@@ -35,6 +43,23 @@ export const ArchitecturePlanSchema = z
           signature: z.string().min(1),
           behaviour: z.string().min(1),
           req_ids: z.array(ReqIdSchema).min(1),
+        })
+        .strict(),
+    ),
+    // Phase 6 decision 23: the Architect is the sole Tier-3 falsification proposal author.
+    // Each entry carries only an assertion, a nullable qualified existing claim subject, a
+    // nullable area, and a closed predicate — never command argv, target commit, scope hash,
+    // event id, routing choice or free-form executable text. An empty array is valid.
+    falsifications: z.array(
+      z
+        .object({
+          assertion: z.string().min(1),
+          subject: z
+            .object({ claim_item: WorkItemIdSchema, claim: ClaimIdSchema })
+            .strict()
+            .nullable(),
+          area: z.string().nullable(),
+          predicate: BrownfieldPredicateSchema,
         })
         .strict(),
     ),

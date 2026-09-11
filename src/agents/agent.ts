@@ -72,6 +72,14 @@ export interface RawPackMaterials {
   readonly currentTaskReviewerFindings: string | null;
   /** Safe escalation facts, reduced further for each upstream recipient. */
   readonly escalationContext: EscalationContext | null;
+  /** Scoped, normalized brownfield evidence. Raw attachments never enter packs. */
+  readonly brownfieldHistory?: readonly TieredBody[];
+  readonly brownfieldFalsification?: readonly TieredBody[];
+  /** Phase 6 decision 23: the Architect-only scoped falsifiable claim catalogue. Rendered
+   *  into the `brownfield-falsification` kind; the Test Author never receives it. */
+  readonly brownfieldFalsifiableClaims?: readonly TieredBody[];
+  /** Touched drift only; scope selection completes before pack construction. */
+  readonly brownfieldDrift?: readonly TieredBody[];
   readonly assumptions: readonly {
     readonly question: string;
     readonly chosen: string;

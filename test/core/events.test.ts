@@ -5,6 +5,7 @@ import {
   EVENT_TYPES,
   DEFAULT_TIER,
   MienguEventSchema,
+  StoredEventSchema,
 } from '../../src/core/events.js';
 import type { EventType } from '../../src/core/events.js';
 
@@ -200,7 +201,19 @@ const VALID_DATA: Record<EventType, Record<string, unknown>> = {
     sha256: 'a'.repeat(64),
     summary: 'x',
   },
-  DriftDetected: { claim: 'claim-example-1', expected: 'a', observed: 'b', area: null },
+  DriftDetected: { claim_item: 'wi-example-abc123', claim: 'claim-example-1', expected: 'a', observed: 'b', area: null },
+  BrownfieldEvidenceRecorded: {
+    ladder_tier: 'mechanical-skeleton', collector_version: 1, target_repo_sha256: 'a'.repeat(64),
+    scope: { target_commit: 'a'.repeat(40), roots: [], paths: [], dependency_depth: 0, max_files: 1, truncated: false, sha256: 'b'.repeat(64) },
+    coverage: 'complete', facts: [{ kind: 'file', path: 'package.json', sha256: 'c'.repeat(64), bytes: 1 }], omissions: [], evidence: ORACLE_EVIDENCE,
+  },
+  BrownfieldPredicateProposed: {
+    target_commit: 'a'.repeat(40), scope_sha256: 'b'.repeat(64), subject: { claim_item: 'wi-example-abc123', claim: 'claim-example-1' }, assertion: 'package exists', area: null,
+    predicate: { kind: 'path-exists', path: 'package.json', expected: true },
+  },
+  BrownfieldPredicateEvaluated: {
+    proposal_event_id: 'evt-01234567-89ab-cdef-0123-456789abcdef', target_commit: 'a'.repeat(40), outcome: 'confirmed', reason: 'predicate-true', expected: 'true', observed: 'true', duration_ms: 0, evidence: ORACLE_EVIDENCE,
+  },
   TaskGraphActivated: { graph_event_id: 'evt-01234567-89ab-cdef-0123-456789abcdef', ordered_task_ids: ['task-example-1'] },
   TaskStarted: { task_id: 'task-example-1', order_index: 0, graph_event_id: 'evt-01234567-89ab-cdef-0123-456789abcdef' },
   TaskAccepted: { task_id: 'task-example-1', implementation_event_id: 'evt-01234567-89ab-cdef-0123-456789abcdef', review_event_id: 'evt-01234567-89ab-cdef-0123-456789abcdef', oracle_sweep_id: 'evt-01234567-89ab-cdef-0123-456789abcdef', checkpoint_event_id: 'evt-01234567-89ab-cdef-0123-456789abcdef' },
@@ -222,8 +235,8 @@ function buildEvent(type: EventType): Record<string, unknown> {
 }
 
 describe('EVENT_SCHEMA_VERSION', () => {
-  it('is 3 with v2 accepted only at the stored-event compatibility boundary', () => {
-    expect(EVENT_SCHEMA_VERSION).toBe(3);
+  it('is 4 with v2/v3 accepted only at the stored-event compatibility boundary', () => {
+    expect(EVENT_SCHEMA_VERSION).toBe(4);
   });
 });
 
@@ -277,19 +290,38 @@ describe('OracleResultRecorded durable stream evidence', () => {
   });
 });
 
+describe('stored event compatibility', () => {
+  it('upcasts a frozen v3 drift event to the v4 qualified drift shape', () => {
+    const event = buildEvent('DriftDetected');
+    const v3Data = { ...(event.data as Record<string, unknown>) };
+    delete v3Data.claim_item;
+    const parsed = StoredEventSchema.parse({ ...event, schema_version: 3, data: v3Data });
+    expect(parsed).toMatchObject({ schema_version: 4, type: 'DriftDetected', data: { claim_item: BASE_ENVELOPE.item_id } });
+  });
+
+  it('does not accept a v3 brownfield event', () => {
+    const event = buildEvent('BrownfieldEvidenceRecorded');
+    expect(StoredEventSchema.safeParse({ ...event, schema_version: 3 }).success).toBe(false);
+  });
+});
+
 describe('tier assignment', () => {
-  it('matches §3: WorkItemCreated=T0, CheckpointDecided=T0, AssumptionRecorded=T2, ItemArtifactRecorded=T2, AutoApproved=T1, else T1', () => {
+  it('assigns BrownfieldPredicateProposed T2 and evidence/evaluation T1', () => {
     expect(DEFAULT_TIER.WorkItemCreated).toBe('T0');
     expect(DEFAULT_TIER.CheckpointDecided).toBe('T0');
     expect(DEFAULT_TIER.AssumptionRecorded).toBe('T2');
     expect(DEFAULT_TIER.ItemArtifactRecorded).toBe('T2');
+    expect(DEFAULT_TIER.BrownfieldPredicateProposed).toBe('T2');
+    expect(DEFAULT_TIER.BrownfieldEvidenceRecorded).toBe('T1');
+    expect(DEFAULT_TIER.BrownfieldPredicateEvaluated).toBe('T1');
     expect(DEFAULT_TIER.AutoApproved).toBe('T1');
     for (const type of EVENT_TYPES) {
       if (
         type === 'WorkItemCreated' ||
         type === 'CheckpointDecided' ||
         type === 'AssumptionRecorded' ||
-        type === 'ItemArtifactRecorded'
+        type === 'ItemArtifactRecorded' ||
+        type === 'BrownfieldPredicateProposed'
       ) {
         continue;
       }

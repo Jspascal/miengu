@@ -9,6 +9,22 @@ oracles:                    # Phase 3 consumes; null = not declared
   lint:      null
   typecheck: null
 
+brownfield:
+  enabled: true
+  maxTreeEntries: 5000
+  maxFilesPerScope: 200
+  maxDependencyDepth: 2
+  maxFileBytes: 262144
+  maxTestExcerptBytes: 8192
+  maxGitCommits: 200
+  maxFilesPerCommit: 50
+  falsification:
+    maxPredicatesPerScope: 8
+    maxWallSeconds: 30
+    maxOutputBytes: 65536
+    commands: {}
+    sandbox: null
+
 # 1. Quota pools. Every executor instance must name one of these keys.
 accounts:
   claude-personal:

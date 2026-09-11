@@ -112,6 +112,7 @@ const DEFAULT_ARTIFACTS: Readonly<Record<string, unknown>> = {
         req_ids: ['REQ-example-1'],
       },
     ],
+    falsifications: [],
   },
   planning: {
     tasks: [

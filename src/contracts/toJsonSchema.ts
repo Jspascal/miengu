@@ -81,6 +81,23 @@ function nodeToJsonSchema(schema: z.ZodTypeAny, path: string): Record<string, un
     return { type: 'boolean' };
   }
 
+  if (typeName === 'ZodNull') {
+    return { type: 'null' };
+  }
+
+  if (typeName === 'ZodUnion' || typeName === 'ZodDiscriminatedUnion') {
+    const rawOptions = (schema as unknown as { _def: { options: unknown } })._def.options;
+    const list: readonly unknown[] =
+      rawOptions instanceof Map
+        ? Array.from(rawOptions.values() as Iterable<unknown>)
+        : Array.isArray(rawOptions)
+          ? (rawOptions as readonly unknown[])
+          : [];
+    return {
+      anyOf: list.map((option, index) => nodeToJsonSchema(option as z.ZodTypeAny, `${path}|${String(index)}`)),
+    };
+  }
+
   if (typeName === 'ZodEnum') {
     const enum_ = schema as unknown as z.ZodEnum<[string, ...string[]]>;
     return { type: 'string', enum: [...enum_.options] };

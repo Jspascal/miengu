@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { fixedClock, IsoTimestampSchema } from '../../src/core/clock.js';
 import { createIdMinter, fixedRng } from '../../src/core/idgen.js';
 import { AccountIdSchema, ExecutorInstanceIdSchema } from '../../src/core/ids.js';
-import { DEFAULT_TIER, MienguEventSchema } from '../../src/core/events.js';
+import { DEFAULT_TIER, MienguEventSchema, StoredEventSchema } from '../../src/core/events.js';
 import type { EventType, MienguEvent } from '../../src/core/events.js';
 import { ProjectionError } from '../../src/errors.js';
 import { accumulate, EMPTY_LEDGER } from '../../src/supervisor/budget.js';
@@ -27,7 +27,7 @@ const oracleEvidence = { sha256: '0'.repeat(64), path: '/tmp/oracle.out', bytes:
 
 function mkEvent(seq: number, type: EventType, data: unknown, causationId: MienguEvent['causation_id'] = null): MienguEvent {
   return MienguEventSchema.parse({
-    schema_version: 3,
+    schema_version: 4,
     event_id: ids.eventId(),
     seq,
     item_id: ITEM_ID,
@@ -46,8 +46,8 @@ function mkEvent(seq: number, type: EventType, data: unknown, causationId: Mieng
  * extra BudgetConsumed on a second account so the two-accumulator fold is exercised. */
 function buildFixture(): MienguEvent[] {
   const events: MienguEvent[] = [];
-  function push(type: EventType, data: unknown): void {
-    events.push(mkEvent(events.length + 1, type, data));
+  function push(type: EventType, data: unknown, causationId: MienguEvent['causation_id'] = null): void {
+    events.push(mkEvent(events.length + 1, type, data, causationId));
   }
 
   push('WorkItemCreated', {
@@ -235,7 +235,7 @@ function buildFixture(): MienguEvent[] {
     sha256: 'a'.repeat(64),
     summary: 'covers all requirements',
   });
-  push('DriftDetected', { claim: 'claim-example-1', expected: 'x', observed: 'y', area: 'auth' });
+  push('DriftDetected', { claim_item: ITEM_ID, claim: 'claim-example-1', expected: 'x', observed: 'y', area: 'auth' }, events.at(-1)!.event_id);
   push('BudgetExhausted', {
     scope: 'task',
     account: 'claude-personal',
@@ -562,7 +562,7 @@ describe('applyEvent: one fixture per event type asserts the exact state delta',
 
   apply('DriftDetected appends a drift record', () => {
     expect(state.drift).toEqual([
-      { claim: 'claim-example-1', expected: 'x', observed: 'y', area: 'auth', at: state.updatedAt },
+      { claimItem: ITEM_ID, claim: 'claim-example-1', expected: 'x', observed: 'y', area: 'auth', at: state.updatedAt },
     ]);
   });
 
@@ -826,6 +826,182 @@ describe('TestsFrozen: a second freeze for a different suite throws', () => {
   });
 });
 
+describe('applyEvent: Phase 6 brownfield folds', () => {
+  const evidenceData = {
+    ladder_tier: 'tests-as-spec' as const,
+    collector_version: 1,
+    target_repo_sha256: 'a'.repeat(64),
+    scope: {
+      target_commit: 'b'.repeat(40), roots: [], paths: [], dependency_depth: 0,
+      max_files: 1, truncated: false, sha256: 'c'.repeat(64),
+    },
+    coverage: 'complete' as const,
+    facts: [],
+    omissions: [],
+    evidence: { sha256: 'd'.repeat(64), path: 'brownfield/evidence.json', bytes: 1 },
+  };
+  const proposalData = {
+    target_commit: 'b'.repeat(40), scope_sha256: 'c'.repeat(64), subject: null,
+    assertion: 'the selected test exists', area: null,
+    predicate: { kind: 'path-exists' as const, path: 'test/example.test.ts', expected: true },
+  };
+  const evaluationData = (proposalEventId: MienguEvent['event_id']) => ({
+    proposal_event_id: proposalEventId, target_commit: 'b'.repeat(40), outcome: 'confirmed' as const,
+    reason: 'predicate-true' as const, expected: 'true', observed: 'true', duration_ms: 0,
+    evidence: { sha256: 'e'.repeat(64), path: 'brownfield/evaluation.json', bytes: 1 },
+  });
+
+  it('folds durable brownfield evidence and predicate chain as envelope-only state changes', () => {
+    const created = mkEvent(1, 'WorkItemCreated', {
+      title: 'brownfield', slug: 'brownfield',
+      source: { kind: 'prd-file', path: 'prd.md', sha256: 'a'.repeat(64), bytes: 1 }, config_hash: 'x',
+    });
+    const evidence = mkEvent(2, 'BrownfieldEvidenceRecorded', evidenceData);
+    const proposal = mkEvent(3, 'BrownfieldPredicateProposed', proposalData, evidence.event_id);
+    const evaluation = mkEvent(4, 'BrownfieldPredicateEvaluated', evaluationData(proposal.event_id), proposal.event_id);
+    let state = applyEvent(null, created);
+    for (const event of [evidence, proposal, evaluation]) {
+      const before = state;
+      state = applyEvent(state, event);
+      expect(state).toEqual({
+        ...before,
+        seq: event.seq,
+        lastEventId: event.event_id,
+        priorEventIds: [...(before.priorEventIds ?? []), event.event_id],
+        updatedAt: event.ts,
+      });
+    }
+  });
+
+  it('rejects missing or mismatched brownfield causal references', () => {
+    const created = mkEvent(1, 'WorkItemCreated', {
+      title: 'brownfield', slug: 'brownfield',
+      source: { kind: 'prd-file', path: 'prd.md', sha256: 'a'.repeat(64), bytes: 1 }, config_hash: 'x',
+    });
+    const state = applyEvent(null, created);
+    expect(() => applyEvent(state, mkEvent(2, 'BrownfieldPredicateProposed', proposalData))).toThrow(/existing prior event/);
+    const evidence = mkEvent(2, 'BrownfieldEvidenceRecorded', evidenceData);
+    const afterEvidence = applyEvent(state, evidence);
+    const proposal = mkEvent(3, 'BrownfieldPredicateProposed', proposalData, evidence.event_id);
+    const afterProposal = applyEvent(afterEvidence, proposal);
+    expect(() => applyEvent(afterProposal, mkEvent(4, 'BrownfieldPredicateEvaluated', evaluationData(proposal.event_id), evidence.event_id))).toThrow(/proposal event/);
+    expect(() => applyEvent(afterProposal, mkEvent(4, 'DriftDetected', {
+      claim_item: ITEM_ID, claim: 'claim-example-1', expected: 'expected', observed: 'observed', area: null,
+    }))).toThrow(/existing prior event/);
+  });
+});
+
+describe('project: Phase 6 legacy v3 compatibility and brownfield causal integrity', () => {
+  const source = { kind: 'prd-file' as const, path: 'prd.md', sha256: 'a'.repeat(64), bytes: 1 };
+  const created = (): MienguEvent =>
+    mkEvent(1, 'WorkItemCreated', { title: 't', slug: 's', source, config_hash: 'x' });
+  const evidenceData = {
+    ladder_tier: 'tests-as-spec' as const,
+    collector_version: 1,
+    target_repo_sha256: 'a'.repeat(64),
+    scope: {
+      target_commit: 'b'.repeat(40), roots: [], paths: [], dependency_depth: 0,
+      max_files: 1, truncated: false, sha256: 'c'.repeat(64),
+    },
+    coverage: 'complete' as const,
+    facts: [],
+    omissions: [],
+    evidence: { sha256: 'd'.repeat(64), path: 'brownfield/evidence.json', bytes: 1 },
+  };
+  const proposalData = {
+    target_commit: 'b'.repeat(40), scope_sha256: 'c'.repeat(64), subject: null,
+    assertion: 'the selected test exists', area: null,
+    predicate: { kind: 'path-exists' as const, path: 'test/example.test.ts', expected: true },
+  };
+  const evaluationData = (proposalEventId: MienguEvent['event_id'], targetCommit = 'b'.repeat(40)) => ({
+    proposal_event_id: proposalEventId, target_commit: targetCommit, outcome: 'confirmed' as const,
+    reason: 'predicate-true' as const, expected: 'true', observed: 'true', duration_ms: 0,
+    evidence: { sha256: 'e'.repeat(64), path: 'brownfield/evaluation.json', bytes: 1 },
+  });
+
+  it('replays a legacy v3 DriftDetected with no causation after it is upcast to v4', () => {
+    const wic = created();
+    const v3Drift = {
+      schema_version: 3,
+      event_id: ids.eventId(),
+      seq: 2,
+      item_id: ITEM_ID,
+      run_id: RUN_ID,
+      ts: clock.now(),
+      tier: DEFAULT_TIER.DriftDetected,
+      actor: { kind: 'system', id: null },
+      causation_id: null,
+      type: 'DriftDetected',
+      data: { claim: 'claim-example-1', expected: 'x', observed: 'y', area: 'auth' },
+    };
+    const upcast = StoredEventSchema.parse(v3Drift) as MienguEvent;
+    expect(upcast.schema_version).toBe(4);
+
+    const state = project([wic, upcast]);
+    expect(state.drift).toEqual([
+      { claimItem: ITEM_ID, claim: 'claim-example-1', expected: 'x', observed: 'y', area: 'auth', at: state.updatedAt },
+    ]);
+    // Still appendable: a following v4 event folds onto the upcast prefix without error.
+    const consumed = mkEvent(3, 'BudgetConsumed', { scope: 'task', account: 'claude-personal', wall_seconds: 1, turns: 1, usd: null }, upcast.event_id);
+    expect(() => project([wic, upcast, consumed])).not.toThrow();
+  });
+
+  it('still rejects a fresh v4 DriftDetected with no causal anchor on the append path', () => {
+    const state = applyEvent(null, created());
+    expect(() =>
+      applyEvent(state, mkEvent(2, 'DriftDetected', {
+        claim_item: ITEM_ID, claim: 'claim-example-1', expected: 'x', observed: 'y', area: null,
+      })),
+    ).toThrow(/reference an existing prior event/);
+  });
+
+  it('rejects a native v4 DriftDetected with no causal anchor during full replay', () => {
+    const wic = created();
+    const drift = mkEvent(2, 'DriftDetected', {
+      claim_item: ITEM_ID, claim: 'claim-example-1', expected: 'x', observed: 'y', area: null,
+    });
+    expect(() => project([wic, drift])).toThrow(/reference an existing prior event/);
+  });
+
+  it('rejects a DriftDetected whose non-null causation does not resolve, even on replay', () => {
+    const wic = created();
+    const drift = mkEvent(2, 'DriftDetected', {
+      claim_item: ITEM_ID, claim: 'claim-example-1', expected: 'x', observed: 'y', area: null,
+    }, ids.eventId());
+    expect(() => project([wic, drift])).toThrow(/reference an existing prior event/);
+  });
+
+  it('replays a well-formed evidence/proposal/evaluation/drift chain', () => {
+    const wic = created();
+    const evidence = mkEvent(2, 'BrownfieldEvidenceRecorded', evidenceData);
+    const proposal = mkEvent(3, 'BrownfieldPredicateProposed', proposalData, evidence.event_id);
+    const evaluation = mkEvent(4, 'BrownfieldPredicateEvaluated', evaluationData(proposal.event_id), proposal.event_id);
+    const drift = mkEvent(5, 'DriftDetected', {
+      claim_item: ITEM_ID, claim: 'claim-example-1', expected: 'x', observed: 'y', area: null,
+    }, evaluation.event_id);
+    const state = project([wic, evidence, proposal, evaluation, drift]);
+    expect(state.seq).toBe(5);
+    expect(state.drift).toEqual([
+      { claimItem: ITEM_ID, claim: 'claim-example-1', expected: 'x', observed: 'y', area: null, at: state.updatedAt },
+    ]);
+  });
+
+  it('rejects a BrownfieldPredicateEvaluated whose target_commit differs from its proposal', () => {
+    const wic = created();
+    const evidence = mkEvent(2, 'BrownfieldEvidenceRecorded', evidenceData);
+    const proposal = mkEvent(3, 'BrownfieldPredicateProposed', proposalData, evidence.event_id);
+    const evaluation = mkEvent(4, 'BrownfieldPredicateEvaluated', evaluationData(proposal.event_id, 'f'.repeat(40)), proposal.event_id);
+    expect(() => project([wic, evidence, proposal, evaluation])).toThrow(/matching target_commit/);
+  });
+
+  it('rejects a BrownfieldPredicateEvaluated that references a non-proposal event', () => {
+    const wic = created();
+    const evidence = mkEvent(2, 'BrownfieldEvidenceRecorded', evidenceData);
+    const evaluation = mkEvent(3, 'BrownfieldPredicateEvaluated', evaluationData(evidence.event_id), evidence.event_id);
+    expect(() => project([wic, evidence, evaluation])).toThrow(/BrownfieldPredicateProposed/);
+  });
+});
+
 describe('applyEvent: error paths', () => {
   const events = buildFixture();
 
@@ -857,7 +1033,7 @@ describe('applyEvent: error paths', () => {
   it('throws on a mismatched item_id', () => {
     const state = applyEvent(null, events[0] as MienguEvent);
     const wrongItem = MienguEventSchema.parse({
-      schema_version: 3,
+      schema_version: 4,
       event_id: ids.eventId(),
       seq: 2,
       item_id: 'wi-other-abc123',
