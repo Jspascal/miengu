@@ -347,6 +347,8 @@ export interface OpenLogOptions {
   readonly clock: Clock;
   readonly ids: IdMinter;
   readonly logger: Logger;
+  /** Called after an event has been written and synced. Observer failures never fail the log append. */
+  readonly onAppend?: ((event: MienguEvent) => void) | undefined;
   readonly force?: boolean;
 }
 
@@ -364,6 +366,8 @@ interface EventLogInit {
   readonly fileHandle: FileHandle;
   readonly lastSeq: number;
   readonly lastEventId: EventId | null;
+  readonly logger: Logger;
+  readonly onAppend?: ((event: MienguEvent) => void) | undefined;
 }
 
 export class EventLog {
@@ -373,6 +377,8 @@ export class EventLog {
   private readonly ids: IdMinter;
   private readonly paths: ItemPaths;
   private readonly fileHandle: FileHandle;
+  private readonly logger: Logger;
+  private readonly onAppend: ((event: MienguEvent) => void) | undefined;
   private _lastSeq: number;
   private _lastEventId: EventId | null;
   private chain: Promise<void> = Promise.resolve();
@@ -385,6 +391,8 @@ export class EventLog {
     this.ids = init.ids;
     this.paths = init.paths;
     this.fileHandle = init.fileHandle;
+    this.logger = init.logger;
+    this.onAppend = init.onAppend;
     this._lastSeq = init.lastSeq;
     this._lastEventId = init.lastEventId;
   }
@@ -441,6 +449,8 @@ export class EventLog {
       fileHandle,
       lastSeq: scan.lastSeq,
       lastEventId: scan.lastEventId,
+      logger: o.logger,
+      onAppend: o.onAppend,
     });
     return { log, truncatedBytes: scan.truncatedBytes };
   }
@@ -504,6 +514,14 @@ export class EventLog {
 
     this._lastSeq = seq;
     this._lastEventId = eventId;
+    try {
+      this.onAppend?.(event);
+    } catch (error) {
+      this.logger.warn(
+        { error: error instanceof Error ? error.message : String(error), eventType: event.type },
+        'event append observer failed after the event was durable',
+      );
+    }
     return event;
   }
 

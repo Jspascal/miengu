@@ -232,6 +232,8 @@ describe('runCommand', () => {
       const raw = await readFile(paths.eventsFile, 'utf8');
       expect(raw).toContain('RunStarted');
       expect(raw).not.toContain('StageEntered');
+      expect(raw).toContain('WorkItemFailed');
+      expect(raw).toContain('RunFinished');
     }
 
     vi.doUnmock('../../src/executors/stub.js');

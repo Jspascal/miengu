@@ -33,8 +33,9 @@ import { blockedByAccount, planBacklog } from '../../supervisor/backlog.js';
 import type { BacklogBlocker, BacklogCandidate, BacklogEntry } from '../../supervisor/backlog.js';
 import { EXIT } from '../exit.js';
 import { projectAccelerated } from './replay.js';
+import { writeProgressEvent } from '../progress.js';
 
-const MIENGU_VERSION = '0.1.0';
+const MIENGU_VERSION = '0.1.1';
 
 export interface RunCommandOptions {
   readonly prdFile: string;
@@ -244,8 +245,9 @@ async function drainBacklog(o: {
   readonly logger: Logger;
   readonly retainWorkspace: boolean;
   readonly signal: AbortSignal;
+  readonly showProgress: boolean;
 }): Promise<BacklogResultRow[]> {
-  const { loaded, runId, newItemId, newItemResult, clock, ids, logger, retainWorkspace, signal } = o;
+  const { loaded, runId, newItemId, newItemResult, clock, ids, logger, retainWorkspace, signal, showProgress } = o;
   const policy = policyFromConfig(loaded.config);
   const itemIds = await listItemIds(loaded.storeDir);
 
@@ -363,7 +365,15 @@ async function drainBacklog(o: {
 
     let log: EventLog;
     try {
-      ({ log } = await EventLog.open({ storeDir: loaded.storeDir, itemId: entry.itemId, runId, clock, ids, logger }));
+      ({ log } = await EventLog.open({
+        storeDir: loaded.storeDir,
+        itemId: entry.itemId,
+        runId,
+        clock,
+        ids,
+        logger,
+        ...(showProgress ? { onAppend: writeProgressEvent } : {}),
+      }));
     } catch (err) {
       if (err instanceof LockHeldError) {
         rows.push({
@@ -488,6 +498,7 @@ export async function runCommand(options: RunCommandOptions): Promise<number> {
     clock,
     ids,
     logger,
+    ...(options.json === true ? {} : { onAppend: writeProgressEvent }),
   });
 
   const abortController = new AbortController();
@@ -497,6 +508,7 @@ export async function runCommand(options: RunCommandOptions): Promise<number> {
   process.once('SIGINT', onSigint);
 
   let result: RunItemResult;
+  let primaryRunFinished = false;
   try {
     await log.append({
       type: 'WorkItemCreated',
@@ -521,16 +533,45 @@ export async function runCommand(options: RunCommandOptions): Promise<number> {
       causationId: log.lastEventId,
     });
 
-    result = await runOneItem({
-      loaded,
-      itemId,
-      log,
-      clock,
-      ids,
-      logger,
-      signal: abortController.signal,
-      retainWorkspace: options.retainWorkspace ?? false,
-    });
+    try {
+      result = await runOneItem({
+        loaded,
+        itemId,
+        log,
+        clock,
+        ids,
+        logger,
+        signal: abortController.signal,
+        retainWorkspace: options.retainWorkspace ?? false,
+      });
+    } catch (error) {
+      // An exception outside the supervisor's normal StageFailed/park paths used to leave
+      // the item looking active forever. Record a terminal outcome before rethrowing so both
+      // the live feed and a later status/replay explain what actually happened.
+      const events = await log.readAll();
+      const alreadyTerminal = events.some(
+        (event) => event.type === 'WorkItemCompleted' || event.type === 'WorkItemFailed' || event.type === 'WorkItemParked',
+      );
+      if (!alreadyTerminal) {
+        await log.append({
+          type: 'WorkItemFailed',
+          data: {
+            reason: 'internal-error',
+            detail: error instanceof Error ? error.message : String(error),
+          },
+          actor: { kind: 'system', id: null },
+          causationId: log.lastEventId,
+        });
+      }
+      const eventsAppendedBeforeFinish = log.lastSeq;
+      await log.append({
+        type: 'RunFinished',
+        data: { outcome: 'failed', events_appended: eventsAppendedBeforeFinish },
+        actor: { kind: 'system', id: null },
+        causationId: log.lastEventId,
+      });
+      throw error;
+    }
 
     const eventsAppendedBeforeFinish = log.lastSeq;
     await log.append({
@@ -539,8 +580,12 @@ export async function runCommand(options: RunCommandOptions): Promise<number> {
       actor: { kind: 'system', id: null },
       causationId: log.lastEventId,
     });
+    primaryRunFinished = true;
   } finally {
     await log.close();
+    if (!primaryRunFinished) {
+      process.removeListener('SIGINT', onSigint);
+    }
   }
 
   let backlog: BacklogResultRow[] = [];
@@ -555,10 +600,10 @@ export async function runCommand(options: RunCommandOptions): Promise<number> {
       logger,
       retainWorkspace: options.retainWorkspace ?? false,
       signal: abortController.signal,
+      showProgress: options.json !== true,
     });
   }
   process.removeListener('SIGINT', onSigint);
-
   if (options.json === true) {
     process.stdout.write(
       `${JSON.stringify({

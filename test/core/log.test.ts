@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventLog, itemPaths, listItemIds, validateFullLog } from '../../src/core/log.js';
 import type { AppendInput, OpenLogOptions } from '../../src/core/log.js';
+import type { MienguEvent } from '../../src/core/events.js';
 import { WorkItemIdSchema, RunIdSchema } from '../../src/core/ids.js';
 import type { WorkItemId } from '../../src/core/ids.js';
 import { fixedClock } from '../../src/core/clock.js';
@@ -78,6 +79,24 @@ describe('EventLog', () => {
     expect(events[0]?.type).toBe('WorkItemCreated');
     expect(events[1]?.type).toBe('BudgetConsumed');
     expect(events[2]?.type).toBe('BudgetConsumed');
+    await log.close();
+  });
+
+  it('notifies an observer only after an event is durably appended', async () => {
+    const observed: MienguEvent[] = [];
+    const options = {
+      ...makeOptions(storeDir, itemId, 'observer'),
+      onAppend: (event: MienguEvent): void => {
+        observed.push(event);
+      },
+    };
+    const { log } = await EventLog.create(options);
+
+    expect(observed).toEqual([]);
+    const appended = await log.append(WORK_ITEM_CREATED);
+
+    expect(observed).toEqual([appended]);
+    expect(await readFile(itemPaths(storeDir, itemId).eventsFile, 'utf8')).toContain(appended.event_id);
     await log.close();
   });
 
