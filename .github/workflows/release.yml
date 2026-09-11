@@ -1,0 +1,35 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+      - run: npm run release:bundle
+      - run: node scripts/render-release-installer.mjs "$GITHUB_REPOSITORY"
+      - run: |
+          SHA256=$(awk '/miengu-v.*tar.gz$/ { print $1; exit }' release/SHA256SUMS)
+          node scripts/render-homebrew-formula.mjs "$GITHUB_REPOSITORY" "$SHA256"
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            release/miengu-v*.tar.gz release/miengu.tar.gz release/SHA256SUMS \
+            release/miengu-install.sh release/miengu.rb \
+            --generate-notes

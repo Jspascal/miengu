@@ -3,11 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "description": "Evidence-bound, deterministic software-delivery supervisor",
   "engines": {
     "node": ">=20"
   },
   "bin": {
-    "miengu": "./dist/cli/index.js"
+    "miengu": "./bin/miengu"
   },
   "main": "./dist/cli/index.js",
   "scripts": {
@@ -15,7 +16,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "release:bundle": "node scripts/build-release.mjs"
   },
   "dependencies": {
     "zod": "^3",

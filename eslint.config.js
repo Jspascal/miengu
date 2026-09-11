@@ -9,7 +9,7 @@ const ICU_MESSAGE =
 export default tseslint.config(
   // Build output, never source. `npm run build` did not produce `dist/` until Group 7 (the CLI
   // entrypoint gives `tsc` something to emit), so this had no observable effect before now.
-  { ignores: ['dist/**'] },
+  { ignores: ['dist/**', 'release/**'] },
   js.configs.recommended,
   ...tseslint.configs.recommendedTypeChecked,
   {
