@@ -465,6 +465,10 @@ export class CodexCliExecutor implements Executor, RawRunSource {
         });
       });
 
+      // A pre-aborted signal can kill the process group (triggerKill, above) before this
+      // write runs, closing the pipe out from under us; the resulting EPIPE lands on
+      // 'error' asynchronously and must be swallowed rather than crashing as unhandled.
+      child.stdin.on('error', () => {});
       child.stdin.write(i.prompt);
       child.stdin.end();
     });
