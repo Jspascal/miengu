@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createProgressReporter, formatProgressEvent } from '../../src/cli/progress.js';
 import type { MienguEvent } from '../../src/core/events.js';
 
@@ -19,6 +19,7 @@ function event(type: MienguEvent['type'], data: unknown): MienguEvent {
 }
 
 describe('formatProgressEvent', () => {
+  afterEach(() => vi.useRealTimers());
   it('reports stage and executor progress', () => {
     expect(formatProgressEvent(event('StageEntered', { stage: 'analysis', attempt: 2 })))
       .toBe('[wi-example-abc123] -> analysis (attempt 2)');
@@ -71,6 +72,24 @@ describe('formatProgressEvent', () => {
     expect(lines).toEqual([
       'miengu: [wi-example-abc123] 2 blocking checkpoints raised (cp-example-1 ... cp-example-2); run `miengu report` for details',
       'miengu: [wi-example-abc123] ok architecture',
+    ]);
+  });
+
+  it('reports a heartbeat while an executor is silent and stops it on return', () => {
+    vi.useFakeTimers();
+    const lines: string[] = [];
+    const report = createProgressReporter((line) => lines.push(line), 30_000);
+    report(event('ExecutorInvoked', {
+      executor_id: 'cx-terra', stage: 'analysis', role: 'analyst',
+    }));
+    vi.advanceTimersByTime(60_000);
+    report(event('ExecutorReturned', { executor_id: 'cx-terra', status: 'completed' }));
+    vi.advanceTimersByTime(60_000);
+
+    expect(lines).toEqual([
+      'miengu: [wi-example-abc123] running analyst with cx-terra',
+      'miengu: [wi-example-abc123] still running analyst with cx-terra (30s elapsed)',
+      'miengu: [wi-example-abc123] still running analyst with cx-terra (60s elapsed)',
     ]);
   });
 });

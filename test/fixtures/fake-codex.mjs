@@ -115,7 +115,7 @@ function readAndBumpCounter() {
 async function main() {
   const args = process.argv.slice(2);
   const mode = process.env['FAKE_CODEX_MODE'] ?? 'success';
-  if (mode === 'hang') {
+  if (mode === 'hang' || mode === 'auth-hang') {
     // Install before any async setup so the timeout test cannot race the handler.
     process.on('SIGTERM', () => {});
   }
@@ -323,6 +323,16 @@ async function main() {
       // deliberately ignores SIGTERM to exercise miengu's SIGKILL ladder
       emit({ type: 'thread.started', thread_id: THREAD_ID });
       emit({ type: 'turn.started' });
+      await sleep(600_000);
+      process.exit(0);
+      break;
+    }
+    case 'auth-hang': {
+      emit({ type: 'thread.started', thread_id: THREAD_ID });
+      emit({ type: 'turn.started' });
+      process.stderr.write(
+        'ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when AuthRequired(AuthRequiredError { scope: "user:design:read" })\n',
+      );
       await sleep(600_000);
       process.exit(0);
       break;

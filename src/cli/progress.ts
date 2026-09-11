@@ -57,9 +57,27 @@ export type ProgressLineWriter = (line: string) => void;
 /** Buffers consecutive blocking checkpoints so one architecture result cannot flood the terminal. */
 export function createProgressReporter(
   write: ProgressLineWriter = (line) => process.stderr.write(`${line}\n`),
+  heartbeatMs = 30_000,
 ): (event: MienguEvent) => void {
   let blocking: string[] = [];
   let item = '';
+  let heartbeat: NodeJS.Timeout | null = null;
+
+  const stopHeartbeat = (): void => {
+    if (heartbeat !== null) clearInterval(heartbeat);
+    heartbeat = null;
+  };
+
+  const startHeartbeat = (event: Extract<MienguEvent, { type: 'ExecutorInvoked' }>): void => {
+    stopHeartbeat();
+    const started = Date.now();
+    const role = event.data.role ?? event.data.stage;
+    heartbeat = setInterval(() => {
+      const elapsed = Math.max(1, Math.round((Date.now() - started) / 1000));
+      write(`miengu: [${event.item_id}] still running ${role} with ${event.data.executor_id} (${String(elapsed)}s elapsed)`);
+    }, heartbeatMs);
+    heartbeat.unref();
+  };
 
   const flush = (): void => {
     if (blocking.length === 0) return;
@@ -78,8 +96,12 @@ export function createProgressReporter(
       blocking.push(event.data.checkpoint);
       return;
     }
+    if (event.type === 'ExecutorReturned' || event.type === 'RunFinished' || event.type === 'WorkItemParked' || event.type === 'WorkItemFailed') {
+      stopHeartbeat();
+    }
     flush();
     const line = formatProgressEvent(event);
     if (line !== null) write(`miengu: ${line}`);
+    if (event.type === 'ExecutorInvoked') startHeartbeat(event);
   };
 }

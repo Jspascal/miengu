@@ -69,6 +69,11 @@ export const CODEX_TURN_EVENT_TYPES: readonly string[] = ['turn.started'];
  */
 export const CODEX_QUOTA_EVENT_TYPES: readonly string[] = ['error', 'turn.failed'];
 
+/** A non-interactive `codex exec` cannot answer an MCP OAuth challenge and may stay alive forever. */
+export function isFatalCodexAuthOutput(text: string): boolean {
+  return /worker quit with fatal:[\s\S]*AuthRequired\(AuthRequiredError/i.test(text);
+}
+
 /** `thread.started.thread_id` — the id `codex exec resume <id>` takes. */
 function selectThreadId(lines: readonly unknown[]): string | null {
   for (const line of lines) {
@@ -201,7 +206,10 @@ export function buildArgv(o: CodexCliOptions, i: ExecutorInput, hermetic: boolea
     i.workdir,
     '-s',
     o.sandboxIntent, // 1:1 with SandboxIntent — codex speaks this dialect natively
-    ...(hermetic ? ['--ephemeral', '--ignore-user-config'] : []),
+    ...(hermetic ? ['--ephemeral'] : []),
+    // A supervisor run must not inherit unrelated interactive MCP servers from the
+    // operator's config. Provider authentication still comes from CODEX_HOME.
+    '--ignore-user-config',
     ...(o.model !== null ? ['-m', o.model] : []),
     // §16.4 + docs/002-executor-findings.md: codex has NO reasoning-effort flag.
     ...(o.reasoningEffort !== null ? ['-c', `model_reasoning_effort=${o.reasoningEffort}`] : []),
@@ -277,6 +285,7 @@ export class CodexCliExecutor implements Executor, RawRunSource {
       let wallTimeoutTriggered = false;
       let abortTriggered = false;
       let spawnErrorOccurred = false;
+      let authFailureTriggered = false;
       let observedTurns = 0;
       let sawTurnEvent = false;
       let stdoutLineBuffer = '';
@@ -303,7 +312,7 @@ export class CodexCliExecutor implements Executor, RawRunSource {
         }
       };
 
-      const triggerKill = (): void => {
+      const triggerKill = (graceSeconds = this.options.sigtermGraceSeconds): void => {
         if (killedMode !== 'none') {
           return;
         }
@@ -312,7 +321,7 @@ export class CodexCliExecutor implements Executor, RawRunSource {
         graceTimer = setTimeout(() => {
           killedMode = 'sigkill';
           sendGroupSignal('SIGKILL');
-        }, this.options.sigtermGraceSeconds * 1000);
+        }, graceSeconds * 1000);
       };
 
       const wallTimer = setTimeout(
@@ -376,6 +385,10 @@ export class CodexCliExecutor implements Executor, RawRunSource {
         if (stderrTail.length > 4096) {
           stderrTail = stderrTail.slice(-4096);
         }
+        if (!authFailureTriggered && isFatalCodexAuthOutput(stderrTail)) {
+          authFailureTriggered = true;
+          triggerKill(Math.min(1, this.options.sigtermGraceSeconds));
+        }
       });
 
       child.on('error', (error) => {
@@ -424,6 +437,9 @@ export class CodexCliExecutor implements Executor, RawRunSource {
           failureKind = 'timeout';
         } else if (abortTriggered) {
           status = 'crashed';
+        } else if (authFailureTriggered) {
+          status = 'crashed';
+          failureKind = 'auth';
         } else if (detectedQuota !== null) {
           status = 'quota_exhausted';
           failureKind = 'quota';

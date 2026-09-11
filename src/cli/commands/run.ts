@@ -36,7 +36,7 @@ import { projectAccelerated } from './replay.js';
 import { createProgressReporter } from '../progress.js';
 import { assertExecutorCommandsAvailable } from '../../executors/processConfig.js';
 
-const MIENGU_VERSION = '0.1.2';
+const MIENGU_VERSION = '0.1.3';
 
 export interface RunCommandOptions {
   readonly prdFile: string;

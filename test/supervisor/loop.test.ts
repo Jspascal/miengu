@@ -1217,6 +1217,30 @@ class QuotaExecutor implements Executor, RawRunSource {
   }
 }
 
+class AuthExecutor implements Executor, RawRunSource {
+  readonly id = ExecutorInstanceIdSchema.parse('stub-analyst');
+  readonly type = 'stub' as const;
+  readonly account = ACCOUNT;
+  readonly capabilities = { nativeStructuredOutput: false, resumableSessions: false, sandboxModes: ['read-only', 'workspace-write'] as const };
+  lastRun: RawRunRecord | null = null;
+
+  constructor(private readonly clock: ReturnType<typeof fixedClock>) {}
+
+  async run(): Promise<ExecutorResult> {
+    const now = this.clock.now();
+    this.lastRun = {
+      commandLine: [], exitCode: null, signal: 'SIGTERM', killed: 'sigterm',
+      startedAt: now, finishedAt: now, observedTurns: 1, failureKind: 'auth',
+      stderrTail: 'worker quit with fatal: AuthRequired(AuthRequiredError)',
+      sessionId: null, transcriptPath: null, rawResult: null, finalMessage: null, quota: null,
+    };
+    return {
+      status: 'crashed',
+      telemetry: { turns: null, inputTokens: null, outputTokens: null, cacheReadTokens: null, cacheCreationTokens: null, wallSeconds: 1 },
+    };
+  }
+}
+
 class CausalOutcomeCoder implements Executor, RawRunSource {
   readonly id = ExecutorInstanceIdSchema.parse('stub-coder');
   readonly type = 'stub' as const;
@@ -1288,6 +1312,19 @@ function registryWithQuotaExecutor(): ExecutorRegistry {
   };
 }
 
+function registryWithAuthExecutor(): ExecutorRegistry {
+  const registry = makeStubRegistry(happyPathScripts(), 'loop-auth-exec');
+  const auth = new AuthExecutor(fixedClock(START));
+  const overridden: ExecutorHandle = { role: 'analyst', executor: auth, sandboxIntent: 'read-only', resolved: RESOLVED };
+  return {
+    forRole(role: Role): ExecutorHandle {
+      return role === 'analyst' ? overridden : registry.forRole(role);
+    },
+    accountForRole: registry.accountForRole,
+    handles: registry.handles,
+  };
+}
+
 describe('runItem: provider-quota failureKind', () => {
   it('appends BudgetExhausted{provider-quota} then WorkItemParked, with no StageFailed for the stage, and attempts unburned', async () => {
     const itemId = WorkItemIdSchema.parse('wi-example-quota1');
@@ -1323,6 +1360,32 @@ describe('runItem: provider-quota failureKind', () => {
     expect(result.finalState.attempts.analysis).toBe(1);
     expect(result.finalState.quotaAborts.analysis).toBe(1);
     expect(result.finalState.attempts.analysis - result.finalState.quotaAborts.analysis).toBe(0);
+
+    await log.close();
+  });
+});
+
+describe('runItem: executor authentication failure', () => {
+  it('parks immediately without opening a remediation cause or burning another attempt', async () => {
+    const itemId = WorkItemIdSchema.parse('wi-example-auth01');
+    const { deps, log } = await makeDeps({
+      itemId,
+      seed: 'loop-auth',
+      executors: registryWithAuthExecutor(),
+      config: makeConfig(),
+    });
+
+    const result = await runItem(deps);
+    const events = await log.readAll();
+
+    expect(result.outcome).toBe('parked');
+    expect(result.finalState.park?.reason).toBe('executor-unavailable');
+    expect(result.finalState.park?.detail).toContain('stub-analyst requires authentication');
+    expect(events.filter((event) => event.type === 'FailureCauseOpened')).toHaveLength(0);
+    expect(events.filter((event) => event.type === 'FailureAttempted')).toHaveLength(0);
+    expect(events.filter((event) => event.type === 'StageEntered' && event.data.stage === 'analysis')).toHaveLength(1);
+    expect(events.findIndex((event) => event.type === 'WorktreeLockReleased'))
+      .toBeLessThan(events.findIndex((event) => event.type === 'WorkItemParked'));
 
     await log.close();
   });

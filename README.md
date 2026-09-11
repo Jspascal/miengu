@@ -76,6 +76,7 @@ accounts:
     maxUsdPerItem: 20
 
 # Named executor instances. args/env safely replace shell aliases (which Node cannot see).
+# Codex runs ignore unrelated user config/MCP servers; CODEX_HOME authentication remains active.
 executors:
   cc-sonnet:
     type: claude-code

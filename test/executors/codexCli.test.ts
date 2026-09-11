@@ -9,6 +9,7 @@ import {
   CODEX_TURN_EVENT_TYPES,
   CODEX_QUOTA_EVENT_TYPES,
   buildArgv,
+  isFatalCodexAuthOutput,
   mapTelemetry,
 } from '../../src/executors/codexCli.js';
 import type { CodexCliOptions } from '../../src/executors/codexCli.js';
@@ -206,6 +207,17 @@ describe('CodexCliExecutor', () => {
     expect(executor.lastRun?.killed).toBe('sigkill');
   });
 
+  it('terminates a stuck non-interactive MCP auth challenge and classifies it as unavailable', async () => {
+    process.env['FAKE_CODEX_MODE'] = 'auth-hang';
+    const executor = new CodexCliExecutor(makeOptions({ sigtermGraceSeconds: 0.05 }));
+    const result = await executor.run(makeInput({ maxWallSeconds: 30 }));
+
+    expect(result.status).toBe('crashed');
+    expect(executor.lastRun?.failureKind).toBe('auth');
+    expect(executor.lastRun?.killed).toBe('sigkill');
+    expect(executor.lastRun?.stderrTail).toContain('AuthRequiredError');
+  });
+
   it('many-turns: budget_turns when observedTurns exceeds maxTurns', async () => {
     process.env['FAKE_CODEX_MODE'] = 'many-turns';
     const executor = new CodexCliExecutor(makeOptions({ sigtermGraceSeconds: 1 }));
@@ -308,11 +320,11 @@ describe('CodexCliExecutor argv', () => {
     }
   });
 
-  it('adds --ephemeral and --ignore-user-config only under MIENGU_HERMETIC', () => {
+  it('always isolates user config while adding --ephemeral only under MIENGU_HERMETIC', () => {
     expect(buildArgv(makeOptions(), input(), true)).toContain('--ephemeral');
     expect(buildArgv(makeOptions(), input(), true)).toContain('--ignore-user-config');
     expect(buildArgv(makeOptions(), input(), false)).not.toContain('--ephemeral');
-    expect(buildArgv(makeOptions(), input(), false)).not.toContain('--ignore-user-config');
+    expect(buildArgv(makeOptions(), input(), false)).toContain('--ignore-user-config');
   });
 
   it('passes extraConfig overrides verbatim', () => {
@@ -331,6 +343,15 @@ describe('codex event-type constants (spike S5)', () => {
     expect(CODEX_QUOTA_EVENT_TYPES).toContain('turn.failed');
     // S5 finding 3 — the whole point. An item.completed error is recoverable.
     expect(CODEX_QUOTA_EVENT_TYPES).not.toContain('item.completed');
+  });
+});
+
+describe('codex fatal stderr detection', () => {
+  it('matches a fatal MCP AuthRequired error without treating ordinary warnings as fatal', () => {
+    expect(isFatalCodexAuthOutput(
+      'ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when AuthRequired(AuthRequiredError { scope: "x" })',
+    )).toBe(true);
+    expect(isFatalCodexAuthOutput('WARN rmcp: reconnecting after transport closed')).toBe(false);
   });
 });
 

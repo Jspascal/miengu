@@ -918,6 +918,29 @@ async function performRunAttempt(
     return;
   }
 
+  // Authentication prompts cannot be answered by a non-interactive executor. Park at the
+  // stage that observed the provider failure instead of routing it into causal remediation.
+  if (outcome.kind === 'failed' && handle.executor.lastRun?.failureKind === 'auth') {
+    state = await appendAndFold(deps, state, {
+      type: 'StageFailed',
+      data: { stage: decision.stage, attempt: decision.attempt, reason: outcome.reason, detail: outcome.detail },
+      actor: SUPERVISOR_ACTOR,
+    });
+    state = await releaseLock(deps, state, workspaceInfo.workdir, handle.executor.id, decision.stage);
+    state = await appendAndFold(deps, state, {
+      type: 'WorkItemParked',
+      data: {
+        reason: 'executor-unavailable',
+        detail: `executor ${handle.executor.id} requires authentication`,
+        resumable: true,
+        account,
+        resets_at: null,
+      },
+      actor: SUPERVISOR_ACTOR,
+    });
+    return;
+  }
+
   if (capture.committedDuringRun) {
     state = await appendAndFold(deps, state, {
       type: 'StageFailed',
@@ -1379,6 +1402,7 @@ async function performSupervisorAction(
     await performRunAttempt(deps, state, { stage: handler, attempt: state.attempts[handler] + 1 });
     const handlerEvents = await deps.log.readAll();
     state = project(handlerEvents);
+    if (state.status !== 'active') return;
     const attemptOutcome = remediationAttemptOutcome(handlerEvents, handlerStartSeq, handler, deps.signal.aborted);
     if (attemptOutcome === 'counted') {
       state = await appendAndFold(deps, state, {
