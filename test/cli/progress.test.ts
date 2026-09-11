@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatProgressEvent } from '../../src/cli/progress.js';
+import { createProgressReporter, formatProgressEvent } from '../../src/cli/progress.js';
 import type { MienguEvent } from '../../src/core/events.js';
 
 function event(type: MienguEvent['type'], data: unknown): MienguEvent {
@@ -49,5 +49,28 @@ describe('formatProgressEvent', () => {
     expect(formatProgressEvent(event('BudgetConsumed', {
       scope: 'item', account: 'primary', wall_seconds: 1, turns: 1, usd: null,
     }))).toBeNull();
+  });
+
+  it('describes FailureAttempted as remediation accounting, not a future retry', () => {
+    expect(formatProgressEvent(event('FailureAttempted', {
+      level: 'planner', handler_stage: 'planning', attempt: 1, limit: 3,
+    }))).toBe('[wi-example-abc123] planner remediation attempt recorded (1/3)');
+  });
+
+  it('groups a checkpoint flood into one actionable line', () => {
+    const lines: string[] = [];
+    const report = createProgressReporter((line) => lines.push(line));
+    report(event('CheckpointRaised', {
+      checkpoint: 'cp-example-1', blocking: true, summary: 'first enormous decision',
+    }));
+    report(event('CheckpointRaised', {
+      checkpoint: 'cp-example-2', blocking: true, summary: 'second enormous decision',
+    }));
+    report(event('StageCompleted', { stage: 'architecture', attempt: 1, artifact: null }));
+
+    expect(lines).toEqual([
+      'miengu: [wi-example-abc123] 2 blocking checkpoints raised (cp-example-1 ... cp-example-2); run `miengu report` for details',
+      'miengu: [wi-example-abc123] ok architecture',
+    ]);
   });
 });

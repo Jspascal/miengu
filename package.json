@@ -1,6 +1,6 @@
 {
   "name": "miengu",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "description": "Evidence-bound, deterministic software-delivery supervisor",

@@ -510,10 +510,11 @@ export async function runAgentStage(i: RunAgentStageInput): Promise<AgentOutcome
     }
 
     if (executorResult.status !== 'completed') {
+      const stderr = rawRun?.stderrTail.trim() ?? '';
       return {
         kind: 'failed',
         reason: failureReasonForStatus(executorResult.status),
-        detail: `executor reported status "${executorResult.status}"`,
+        detail: `executor reported status "${executorResult.status}"${stderr.length > 0 ? `: ${stderr}` : ''}`,
         derived: [],
         executorResult,
       };

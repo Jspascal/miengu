@@ -33,9 +33,10 @@ import { blockedByAccount, planBacklog } from '../../supervisor/backlog.js';
 import type { BacklogBlocker, BacklogCandidate, BacklogEntry } from '../../supervisor/backlog.js';
 import { EXIT } from '../exit.js';
 import { projectAccelerated } from './replay.js';
-import { writeProgressEvent } from '../progress.js';
+import { createProgressReporter } from '../progress.js';
+import { assertExecutorCommandsAvailable } from '../../executors/processConfig.js';
 
-const MIENGU_VERSION = '0.1.1';
+const MIENGU_VERSION = '0.1.2';
 
 export interface RunCommandOptions {
   readonly prdFile: string;
@@ -372,7 +373,7 @@ async function drainBacklog(o: {
         clock,
         ids,
         logger,
-        ...(showProgress ? { onAppend: writeProgressEvent } : {}),
+        ...(showProgress ? { onAppend: createProgressReporter() } : {}),
       }));
     } catch (err) {
       if (err instanceof LockHeldError) {
@@ -401,6 +402,9 @@ async function drainBacklog(o: {
     }
 
     try {
+      if (showProgress) {
+        process.stderr.write(`miengu: backlog: resuming ${entry.itemId} after ${previousReason}\n`);
+      }
       await log.append({
         type: 'RunStarted',
         data: {
@@ -478,6 +482,7 @@ async function drainBacklog(o: {
  */
 export async function runCommand(options: RunCommandOptions): Promise<number> {
   const loaded = await loadConfig(options.configPath);
+  await assertExecutorCommandsAvailable(loaded);
 
   const prdPath = resolve(options.prdFile);
   const [sha256, fileStat] = await Promise.all([sha256File(prdPath), stat(prdPath)]);
@@ -498,7 +503,7 @@ export async function runCommand(options: RunCommandOptions): Promise<number> {
     clock,
     ids,
     logger,
-    ...(options.json === true ? {} : { onAppend: writeProgressEvent }),
+    ...(options.json === true ? {} : { onAppend: createProgressReporter() }),
   });
 
   const abortController = new AbortController();

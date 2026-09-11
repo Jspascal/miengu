@@ -51,6 +51,8 @@ function makeOptions(overrides: Partial<CodexCliOptions> = {}): CodexCliOptions 
     id,
     account,
     bin: FAKE_CODEX,
+    argvPrefix: [],
+    env: {},
     model: null,
     reasoningEffort: null,
     sandboxIntent: 'workspace-write',
@@ -181,6 +183,17 @@ describe('CodexCliExecutor', () => {
     // If that item had been treated as terminal, the turn would never have been counted.
     expect(executor.lastRun?.observedTurns).toBe(1);
     expect(executor.lastRun?.quota).toBeNull();
+  });
+
+  it('passes configured argv prefixes and environment without a shell', async () => {
+    const executor = new CodexCliExecutor(makeOptions({
+      argvPrefix: ['--configured-prefix'],
+      env: { FAKE_CODEX_MODE: 'success' },
+    }));
+    const result = await executor.run(makeInput());
+
+    expect(result.status).toBe('completed');
+    expect(executor.lastRun?.commandLine.slice(0, 2)).toEqual([FAKE_CODEX, '--configured-prefix']);
   });
 
   it('hang: budget_wall and killed sigkill via the SIGTERM -> grace -> SIGKILL ladder', async () => {

@@ -18,6 +18,7 @@ import {
 import { StubExecutor } from './stub.js';
 import { assertSandboxSupported } from './executor.js';
 import type { Executor, RawRunSource } from './executor.js';
+import { expandExecutorEnv } from './processConfig.js';
 
 /** analyst/architect/planner/reviewer -> 'read-only'; testAuthor/coder -> 'workspace-write'. */
 export const ROLE_SANDBOX_INTENT: Readonly<Record<Role, SandboxIntent>> = {
@@ -85,6 +86,8 @@ function buildAdapter(
         id: instanceId,
         account: instance.account,
         bin: instance.bin ?? 'claude',
+        argvPrefix: instance.args,
+        env: expandExecutorEnv(instance.env),
         model: instance.model,
         effort: instance.effort,
         sandboxIntent,
@@ -111,6 +114,8 @@ function buildAdapter(
         id: instanceId,
         account: instance.account,
         bin: instance.bin ?? 'codex',
+        argvPrefix: instance.args,
+        env: expandExecutorEnv(instance.env),
         model: instance.model,
         reasoningEffort: instance.effort,
         sandboxIntent,

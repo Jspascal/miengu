@@ -50,6 +50,8 @@ function makeOptions(overrides: Partial<ClaudeCodeOptions> = {}): ClaudeCodeOpti
     id,
     account,
     bin: FAKE_CLAUDE,
+    argvPrefix: [],
+    env: {},
     model: null,
     effort: null,
     sandboxIntent: 'workspace-write',
@@ -219,6 +221,25 @@ describe('ClaudeCodeExecutor', () => {
     expect(executor.lastRun?.failureKind).toBe('nonzero-exit');
     expect(executor.lastRun?.exitCode).toBe(2);
     expect(executor.lastRun?.stderrTail).toContain('fatal:');
+  });
+
+  it('passes configured argv prefixes and environment without a shell', async () => {
+    const executor = new ClaudeCodeExecutor(makeOptions({
+      argvPrefix: ['--configured-prefix'],
+      env: { FAKE_CLAUDE_MODE: 'success' },
+    }));
+    const result = await executor.run(makeInput());
+
+    expect(result.status).toBe('completed');
+    expect(executor.lastRun?.commandLine.slice(0, 2)).toEqual([FAKE_CLAUDE, '--configured-prefix']);
+  });
+
+  it('captures the actionable spawn error when the executable is missing', async () => {
+    const executor = new ClaudeCodeExecutor(makeOptions({ bin: '/missing/miengu-claude' }));
+    const result = await executor.run(makeInput());
+
+    expect(result.status).toBe('crashed');
+    expect(executor.lastRun?.stderrTail).toMatch(/spawn \/missing\/miengu-claude ENOENT/);
   });
 
   it('hang: budget_wall and killed sigkill via the SIGTERM -> grace -> SIGKILL ladder', async () => {

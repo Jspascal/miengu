@@ -37,6 +37,20 @@ describe('MienguConfigSchema', () => {
     expect(result.success).toBe(true);
   });
 
+  it('accepts explicit executable arguments and environment', () => {
+    const config = validConfig();
+    (config['executors'] as Record<string, unknown>)['cc-sonnet'] = {
+      type: 'claude-code',
+      account: 'claude-personal',
+      bin: 'claude',
+      args: ['--settings', '/tmp/settings.json'],
+      env: { CLAUDE_CONFIG_DIR: '${HOME}/.claude-work' },
+    };
+    const parsed = MienguConfigSchema.parse(config);
+    expect(parsed.executors['cc-sonnet']?.args).toEqual(['--settings', '/tmp/settings.json']);
+    expect(parsed.executors['cc-sonnet']?.env).toEqual({ CLAUDE_CONFIG_DIR: '${HOME}/.claude-work' });
+  });
+
   it('requires target.repo', () => {
     const result = MienguConfigSchema.safeParse({ ...validConfig(), target: {} });
     expect(result.success).toBe(false);
@@ -66,6 +80,8 @@ describe('MienguConfigSchema', () => {
           effort: 'medium',
           account: 'claude-personal',
           bin: null,
+          args: [],
+          env: {},
           permissionMode: null,
           addDirs: [],
           maxBudgetUsd: null,
@@ -77,6 +93,8 @@ describe('MienguConfigSchema', () => {
           effort: 'high',
           account: 'claude-personal',
           bin: null,
+          args: [],
+          env: {},
           permissionMode: null,
           addDirs: [],
           maxBudgetUsd: null,
@@ -88,6 +106,8 @@ describe('MienguConfigSchema', () => {
           effort: 'high',
           account: 'codex-personal',
           bin: null,
+          args: [],
+          env: {},
           permissionMode: null,
           addDirs: [],
           maxBudgetUsd: null,
@@ -99,6 +119,8 @@ describe('MienguConfigSchema', () => {
           effort: 'low',
           account: 'codex-personal',
           bin: null,
+          args: [],
+          env: {},
           permissionMode: null,
           addDirs: [],
           maxBudgetUsd: null,

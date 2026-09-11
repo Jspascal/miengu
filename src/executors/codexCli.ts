@@ -25,6 +25,8 @@ export interface CodexCliOptions {
   id: ExecutorInstanceId;
   account: AccountId;
   bin: string;
+  argvPrefix: readonly string[];
+  env: Readonly<Record<string, string>>;
   model: string | null;
   /** Shipped as `-c model_reasoning_effort=<v>`. There is NO reasoning-effort flag — see §16.4. */
   reasoningEffort: string | null;
@@ -189,6 +191,7 @@ function detectQuota(
 export function buildArgv(o: CodexCliOptions, i: ExecutorInput, hermetic: boolean): string[] {
   return [
     o.bin,
+    ...o.argvPrefix,
     'exec',
     '--json',
     '--skip-git-repo-check',
@@ -286,6 +289,7 @@ export class CodexCliExecutor implements Executor, RawRunSource {
         cwd: i.workdir,
         detached: true,
         stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env, ...this.options.env },
       });
 
       const sendGroupSignal = (sig: NodeJS.Signals): void => {
@@ -374,8 +378,9 @@ export class CodexCliExecutor implements Executor, RawRunSource {
         }
       });
 
-      child.on('error', () => {
+      child.on('error', (error) => {
         spawnErrorOccurred = true;
+        stderrTail = `${stderrTail}${stderrTail.length > 0 ? '\n' : ''}${error.message}`.slice(-4096);
       });
 
       child.on('close', (code, signal) => {

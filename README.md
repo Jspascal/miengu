@@ -75,14 +75,27 @@ accounts:
     maxTurnsPerItem: null      # null = unlimited; set a ceiling to cap spend per item
     maxUsdPerItem: 20
 
-# Named executor instances: provider, model, and effort live here.
+# Named executor instances. args/env safely replace shell aliases (which Node cannot see).
 executors:
-  cc-sonnet: { type: claude-code, model: sonnet, effort: medium, account: claude-personal }
-  cx-high:   { type: codex,       model: gpt-5.2-codex, effort: high, account: codex-personal }
+  cc-sonnet:
+    type: claude-code
+    bin: claude
+    env: { CLAUDE_CONFIG_DIR: "${HOME}/.claude-work" }
+    model: sonnet
+    effort: medium
+    account: claude-personal
+  cc-opus:
+    type: claude-code
+    bin: claude
+    env: { CLAUDE_CONFIG_DIR: "${HOME}/.claude-work" }
+    model: opus
+    effort: high
+    account: claude-personal
+  cx-sol: { type: codex, model: gpt-5.6-sol, effort: high, account: codex-personal }
 
 # Roles reference an executor instance. Turns and context budget live here.
 roles:
-  architect: { executor: cx-high,   maxTurns: 12, contextBudgetTokens: 90000 }
+  architect: { executor: cx-sol,    maxTurns: 12, contextBudgetTokens: 90000 }
   coder:     { executor: cc-sonnet, maxTurns: 60, contextBudgetTokens: 60000 }
   reviewer:  { executor: cc-opus,   maxTurns: 10, contextBudgetTokens: 50000 }
 

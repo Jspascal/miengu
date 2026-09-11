@@ -44,6 +44,13 @@ export const ExecutorInstanceSchema = z
     effort: z.string().nullable().default(null),
     account: AccountIdSchema,
     bin: z.string().nullable().default(null),
+    /** Arguments inserted immediately after the executable, before Miengu's provider flags. */
+    args: z.array(z.string().refine((value) => !value.includes('\0'), 'argument must not contain NUL')).default([]),
+    /** Per-executor environment. Values support explicit ${NAME} interpolation. */
+    env: z.record(
+      z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/),
+      z.string().refine((value) => !value.includes('\0'), 'environment value must not contain NUL'),
+    ).default({}),
     permissionMode: z
       .enum(['acceptEdits', 'auto', 'bypassPermissions', 'manual', 'dontAsk', 'plan'])
       .nullable()

@@ -28,13 +28,11 @@ export function formatProgressEvent(event: MienguEvent): string | null {
     case 'StageFailed':
       return `${prefix} x ${event.data.stage} failed (${event.data.reason}): ${compact(event.data.detail)}`;
     case 'CheckpointRaised':
-      return event.data.blocking
-        ? `${prefix} waiting for decision ${event.data.checkpoint}: ${compact(event.data.summary)}`
-        : null;
+      return null;
     case 'BudgetExhausted':
       return `${prefix} ! budget exhausted (${event.data.limit_kind}): ${compact(event.data.detail)}`;
     case 'FailureAttempted':
-      return `${prefix} retrying ${event.data.handler_stage} (${String(event.data.attempt)}/${String(event.data.limit)})`;
+      return `${prefix} ${event.data.level} remediation attempt recorded (${String(event.data.attempt)}/${String(event.data.limit)})`;
     case 'EscalationAdvanced':
       return `${prefix} escalating ${event.data.from_level} -> ${event.data.to_level}: ${compact(event.data.reason)}`;
     case 'OracleResultRecorded':
@@ -54,9 +52,34 @@ export function formatProgressEvent(event: MienguEvent): string | null {
   }
 }
 
-export function writeProgressEvent(event: MienguEvent): void {
-  const line = formatProgressEvent(event);
-  if (line !== null) {
-    process.stderr.write(`miengu: ${line}\n`);
-  }
+export type ProgressLineWriter = (line: string) => void;
+
+/** Buffers consecutive blocking checkpoints so one architecture result cannot flood the terminal. */
+export function createProgressReporter(
+  write: ProgressLineWriter = (line) => process.stderr.write(`${line}\n`),
+): (event: MienguEvent) => void {
+  let blocking: string[] = [];
+  let item = '';
+
+  const flush = (): void => {
+    if (blocking.length === 0) return;
+    const range = blocking.length === 1
+      ? blocking[0]
+      : `${blocking[0]} ... ${blocking[blocking.length - 1]}`;
+    write(
+      `miengu: [${item}] ${String(blocking.length)} blocking checkpoint${blocking.length === 1 ? '' : 's'} raised (${range}); run \`miengu report\` for details`,
+    );
+    blocking = [];
+  };
+
+  return (event): void => {
+    if (event.type === 'CheckpointRaised' && event.data.blocking) {
+      item = event.item_id;
+      blocking.push(event.data.checkpoint);
+      return;
+    }
+    flush();
+    const line = formatProgressEvent(event);
+    if (line !== null) write(`miengu: ${line}`);
+  };
 }

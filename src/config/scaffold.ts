@@ -36,26 +36,28 @@ accounts:
     maxWallSecondsPerItem:  null
     maxUsdPerItem:          null
 
-# 2. Named executor instances. Model + effort live here: they are provider terms.
+# 2. Named executor instances. args/env replace shell aliases without invoking a shell.
 executors:
-  cc-sonnet:  { type: claude-code, model: sonnet,        effort: medium, account: claude-personal }
-  cc-opus:    { type: claude-code, model: opus,          effort: high,   account: claude-personal }
-  cx-high:    { type: codex,       model: gpt-5.2-codex, effort: high,   account: codex-personal }
-  cx-low:     { type: codex,       model: gpt-5.2-codex, effort: low,    account: codex-personal }
+  cc-sonnet: { type: claude-code, bin: claude, env: { CLAUDE_CONFIG_DIR: "\${HOME}/.claude-work" }, model: sonnet,        effort: medium, account: claude-personal }
+  cc-opus:   { type: claude-code, bin: claude, env: { CLAUDE_CONFIG_DIR: "\${HOME}/.claude-work" }, model: opus,          effort: high,   account: claude-personal }
+  cx-luna:   { type: codex,                                                                       model: gpt-5.6-luna,  effort: low,    account: codex-personal }
+  cx-terra:  { type: codex,                                                                       model: gpt-5.6-terra, effort: medium, account: codex-personal }
+  cx-sol:    { type: codex,                                                                       model: gpt-5.6-sol,   effort: high,   account: codex-personal }
 
 # 3. Declared cross-vendor ranking. Explicit, because no honest inferred rank exists.
 tiers:
   cc-sonnet: 2
   cc-opus:   3
-  cx-low:    1
-  cx-high:   3
+  cx-luna:   1
+  cx-terra:  2
+  cx-sol:    3
 
 # 4. Roles reference an instance by name. Turns + context live here: role terms.
 roles:
-  analyst:    { executor: cx-high,   maxTurns: 8,  contextBudgetTokens: 40000 }
-  architect:  { executor: cx-high,   maxTurns: 12, contextBudgetTokens: 90000 }
-  planner:    { executor: cx-low,    maxTurns: 6,  contextBudgetTokens: 50000 }
-  testAuthor: { executor: cx-high,   maxTurns: 15, contextBudgetTokens: 40000 }
+  analyst:    { executor: cx-terra,  maxTurns: 8,  contextBudgetTokens: 40000 }
+  architect:  { executor: cx-sol,    maxTurns: 12, contextBudgetTokens: 90000 }
+  planner:    { executor: cx-luna,   maxTurns: 6,  contextBudgetTokens: 50000 }
+  testAuthor: { executor: cx-terra,  maxTurns: 15, contextBudgetTokens: 40000 }
   coder:      { executor: cc-sonnet, maxTurns: 60, contextBudgetTokens: 60000 }
   reviewer:   { executor: cc-opus,   maxTurns: 10, contextBudgetTokens: 50000 }
 
