@@ -510,11 +510,11 @@ export async function runAgentStage(i: RunAgentStageInput): Promise<AgentOutcome
     }
 
     if (executorResult.status !== 'completed') {
-      const stderr = rawRun?.stderrTail.trim() ?? '';
+      const stderr = [providerError(rawRun?.rawResult), rawRun?.stderrTail.trim()].filter(Boolean).join('\n');
       return {
         kind: 'failed',
         reason: failureReasonForStatus(executorResult.status),
-        detail: `executor reported status "${executorResult.status}"${stderr.length > 0 ? `: ${stderr}` : ''}`,
+        detail: `executor reported status "${executorResult.status}" (exit ${String(rawRun?.exitCode ?? 'unknown')}, signal ${rawRun?.signal ?? 'none'})${stderr.length > 0 ? `: ${stderr}` : ''}${rawRun?.transcriptPath ? `\nTranscript: ${rawRun.transcriptPath}` : ''}`,
         derived: [],
         executorResult,
       };
@@ -651,3 +651,4 @@ async function appendValidationFailed(
     actor: { kind: 'supervisor', id: null },
   });
 }
+import { providerError } from '../executors/output.js';

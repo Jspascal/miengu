@@ -75,12 +75,13 @@ function emitLeadingNoise() {
   });
 }
 
-function emitAssistant(text) {
+let assistantSerial = 0;
+function emitAssistant(text, id = `msg_fake_${++assistantSerial}`) {
   emit({
     type: 'assistant',
     message: {
       model: 'claude-sonnet-5',
-      id: 'msg_fake',
+      id,
       type: 'message',
       role: 'assistant',
       content: [{ type: 'text', text }],
@@ -215,6 +216,14 @@ async function main() {
   const mode = process.env['FAKE_CLAUDE_MODE'] ?? 'success';
 
   switch (mode) {
+    case 'split-message': {
+      emitLeadingNoise();
+      emitAssistant('First block', 'msg_same');
+      emitAssistant('Second block', 'msg_same');
+      emitResult({ num_turns: 1 });
+      process.exit(0);
+      break;
+    }
     case 'success': {
       emitLeadingNoise();
       emitAssistant('ok');

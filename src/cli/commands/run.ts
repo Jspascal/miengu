@@ -33,7 +33,8 @@ import { blockedByAccount, planBacklog } from '../../supervisor/backlog.js';
 import type { BacklogBlocker, BacklogCandidate, BacklogEntry } from '../../supervisor/backlog.js';
 import { EXIT } from '../exit.js';
 import { projectAccelerated } from './replay.js';
-import { createProgressReporter } from '../progress.js';
+import { createRunDisplay } from '../display.js';
+import type { RunDisplay } from '../display.js';
 import { assertExecutorCommandsAvailable } from '../../executors/processConfig.js';
 
 const MIENGU_VERSION = '0.1.3';
@@ -44,6 +45,7 @@ export interface RunCommandOptions {
   readonly retainWorkspace?: boolean | undefined;
   readonly noBacklog?: boolean | undefined;
   readonly json?: boolean | undefined;
+  readonly tui?: boolean | undefined;
 }
 
 interface BacklogResultRow {
@@ -96,6 +98,7 @@ function exitCodeForOutcome(outcome: RunItemResult['outcome']): number {
  * the new item and every drained backlog item so the two never diverge in behaviour.
  */
 async function runOneItem(o: {
+  readonly display: RunDisplay;
   readonly loaded: LoadedConfig;
   readonly itemId: WorkItemId;
   readonly log: EventLog;
@@ -124,6 +127,7 @@ async function runOneItem(o: {
   ]);
 
   const executors = buildExecutorRegistry({
+    onOutput: o.display.onOutput,
     config: loaded.config,
     paths: { transcriptsDir: paths.transcriptsDir, messagesDir },
     clock,
@@ -204,7 +208,7 @@ async function runOneItem(o: {
       type: 'WorkItemParked',
       data: {
         reason: 'operator-abort',
-        detail: 'received SIGINT',
+        detail: 'received operator stop signal (SIGINT or SIGTERM)',
         resumable: true,
         account: null,
         resets_at: null,
@@ -237,6 +241,7 @@ function sortBacklogEntries(entries: readonly BacklogEntry[]): BacklogEntry[] {
  * strictly serially — never two logs open at once. The whole invocation shares one `RunId`.
  */
 async function drainBacklog(o: {
+  readonly display: RunDisplay;
   readonly loaded: LoadedConfig;
   readonly runId: RunId;
   readonly newItemId: WorkItemId;
@@ -322,6 +327,7 @@ async function drainBacklog(o: {
 
   const rows: BacklogResultRow[] = [];
   for (const entry of allEntries) {
+    if (signal.aborted) break;
     const state = states.get(entry.itemId) ?? null;
 
     if (!entry.ready) {
@@ -373,7 +379,7 @@ async function drainBacklog(o: {
         clock,
         ids,
         logger,
-        ...(showProgress ? { onAppend: createProgressReporter() } : {}),
+        onAppend: o.display.onEvent,
       }));
     } catch (err) {
       if (err instanceof LockHeldError) {
@@ -403,7 +409,7 @@ async function drainBacklog(o: {
 
     try {
       if (showProgress) {
-        process.stderr.write(`miengu: backlog: resuming ${entry.itemId} after ${previousReason}\n`);
+        o.display.onOutput({ executor: 'backlog', kind: 'activity', text: `resuming ${entry.itemId} after ${previousReason}` });
       }
       await log.append({
         type: 'RunStarted',
@@ -428,6 +434,7 @@ async function drainBacklog(o: {
       });
 
       const result = await runOneItem({
+        display: o.display,
         loaded,
         itemId: entry.itemId,
         log,
@@ -463,6 +470,20 @@ async function drainBacklog(o: {
         stage: result.finalState.stage,
         status: result.finalState.status,
       });
+    } catch (error) {
+      await log.append({
+        type: 'WorkItemFailed',
+        data: { reason: 'internal-error', detail: error instanceof Error ? error.message : String(error) },
+        actor: { kind: 'system', id: null },
+        causationId: log.lastEventId,
+      });
+      await log.append({
+        type: 'RunFinished',
+        data: { outcome: 'failed', events_appended: log.lastSeq },
+        actor: { kind: 'system', id: null },
+        causationId: log.lastEventId,
+      });
+      throw error;
     } finally {
       await log.close();
     }
@@ -481,6 +502,15 @@ async function drainBacklog(o: {
  * item's** exit code — a backlog item's outcome never changes it (§10).
  */
 export async function runCommand(options: RunCommandOptions): Promise<number> {
+  const display = createRunDisplay(options.tui !== false && process.stderr.isTTY === true && process.env['TERM'] !== 'dumb', options.json === true);
+  try {
+    return await runCommandWithDisplay(options, display);
+  } finally {
+    display.close();
+  }
+}
+
+async function runCommandWithDisplay(options: RunCommandOptions, display: RunDisplay): Promise<number> {
   const loaded = await loadConfig(options.configPath);
   await assertExecutorCommandsAvailable(loaded);
 
@@ -503,7 +533,7 @@ export async function runCommand(options: RunCommandOptions): Promise<number> {
     clock,
     ids,
     logger,
-    ...(options.json === true ? {} : { onAppend: createProgressReporter() }),
+    onAppend: display.onEvent,
   });
 
   const abortController = new AbortController();
@@ -511,6 +541,7 @@ export async function runCommand(options: RunCommandOptions): Promise<number> {
     abortController.abort();
   };
   process.once('SIGINT', onSigint);
+  process.once('SIGTERM', onSigint);
 
   let result: RunItemResult;
   let primaryRunFinished = false;
@@ -540,6 +571,7 @@ export async function runCommand(options: RunCommandOptions): Promise<number> {
 
     try {
       result = await runOneItem({
+        display,
         loaded,
         itemId,
         log,
@@ -590,25 +622,32 @@ export async function runCommand(options: RunCommandOptions): Promise<number> {
     await log.close();
     if (!primaryRunFinished) {
       process.removeListener('SIGINT', onSigint);
+      process.removeListener('SIGTERM', onSigint);
     }
   }
 
   let backlog: BacklogResultRow[] = [];
-  if (options.noBacklog !== true) {
-    backlog = await drainBacklog({
-      loaded,
-      runId,
-      newItemId: itemId,
-      newItemResult: result,
-      clock,
-      ids,
-      logger,
-      retainWorkspace: options.retainWorkspace ?? false,
-      signal: abortController.signal,
-      showProgress: options.json !== true,
-    });
+  try {
+    if (options.noBacklog !== true && !abortController.signal.aborted) {
+      backlog = await drainBacklog({
+        display,
+        loaded,
+        runId,
+        newItemId: itemId,
+        newItemResult: result,
+        clock,
+        ids,
+        logger,
+        retainWorkspace: options.retainWorkspace ?? false,
+        signal: abortController.signal,
+        showProgress: options.json !== true,
+      });
+    }
+  } finally {
+    process.removeListener('SIGINT', onSigint);
+    process.removeListener('SIGTERM', onSigint);
   }
-  process.removeListener('SIGINT', onSigint);
+  display.close();
   if (options.json === true) {
     process.stdout.write(
       `${JSON.stringify({

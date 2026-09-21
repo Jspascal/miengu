@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, rm, readFile } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -83,6 +83,37 @@ function makeInput(
 }
 
 describe('ClaudeCodeExecutor', () => {
+  it('counts multiple blocks of the same assistant message as one turn', async () => {
+    const executor = new ClaudeCodeExecutor(makeOptions({ env: { FAKE_CLAUDE_MODE: 'split-message' } }));
+    expect((await executor.run(makeInput({ maxTurns: 1 }))).status).toBe('completed');
+    expect(executor.lastRun?.observedTurns).toBe(1);
+  });
+  it('rejects a transcript write failure instead of leaving the run pending', async () => {
+    const file = join(workdir, 'not-a-directory');
+    await writeFile(file, 'occupied');
+    const executor = new ClaudeCodeExecutor(makeOptions({ transcriptDir: file }));
+    await expect(executor.run(makeInput())).rejects.toThrow('could not save transcript');
+    expect(executor.lastRun).toBeNull();
+  });
+
+  it('streams replies before returning and isolates broken display listeners', async () => {
+    const replies: string[] = [];
+    const executor = new ClaudeCodeExecutor(makeOptions({ onOutput: (output) => {
+      expect(executor.lastRun).toBeNull();
+      if (output.kind === 'reply') replies.push(output.text);
+      throw new Error('display disconnected');
+    } }));
+    const result = await executor.run(makeInput());
+    expect(result.status).toBe('completed');
+    expect(replies.length).toBeGreaterThan(0);
+  });
+
+  it('surfaces a missing executable with its OS error', async () => {
+    const executor = new ClaudeCodeExecutor(makeOptions({ bin: join(workdir, 'missing') }));
+    expect((await executor.run(makeInput())).status).toBe('crashed');
+    expect(executor.lastRun?.stderrTail).toContain('ENOENT');
+  });
+
   it('exposes the amended Executor identity and capabilities', () => {
     const executor = new ClaudeCodeExecutor(makeOptions());
     expect(executor.id).toBe(id);

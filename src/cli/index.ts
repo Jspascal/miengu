@@ -42,11 +42,12 @@ program
   .option('--config <path>', 'path to miengu.config.yaml')
   .option('--retain-workspace', 'do not remove the worktree on exit')
   .option('--no-backlog', 'run only the new item; skip the backlog scan entirely')
+  .option('--no-tui', 'use a plain live feed instead of the terminal dashboard')
   .option('--json', 'print machine-readable output')
   .action(
     async (
       prdFile: string,
-      opts: { config?: string; retainWorkspace?: boolean; backlog?: boolean; json?: boolean },
+      opts: { config?: string; retainWorkspace?: boolean; backlog?: boolean; json?: boolean; tui?: boolean },
     ) => {
       process.exitCode = await runCommand({
         prdFile,
@@ -54,6 +55,7 @@ program
         retainWorkspace: opts.retainWorkspace,
         noBacklog: opts.backlog === false,
         json: opts.json,
+        tui: opts.tui,
       });
     },
   );

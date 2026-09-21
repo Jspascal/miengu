@@ -2,6 +2,8 @@ import { spawn } from 'node:child_process';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { z } from 'zod';
+import { decodeOutput, emitOutput } from './output.js';
+import type { OutputListener } from './output.js';
 import type { Clock, IsoTimestamp } from '../core/clock.js';
 import type { SandboxIntent } from '../core/events.js';
 import type { IdMinter } from '../core/idgen.js';
@@ -24,6 +26,7 @@ export const DEFAULT_SIGTERM_GRACE_SECONDS = 10;
 export type PermissionMode = 'acceptEdits' | 'auto' | 'bypassPermissions' | 'manual' | 'dontAsk' | 'plan';
 
 export interface ClaudeCodeOptions {
+  onOutput?: OutputListener | undefined;
   id: ExecutorInstanceId;
   account: AccountId;
   bin: string;
@@ -335,6 +338,7 @@ export class ClaudeCodeExecutor implements Executor, RawRunSource {
   }
 
   async run(i: ExecutorInput): Promise<ExecutorResult> {
+    this.lastRun = null;
     const sessionId = this.options.ids.sessionUuid();
     const argv = buildArgv(this.options, sessionId);
     const startedAt = this.options.clock.now();
@@ -345,7 +349,7 @@ export class ClaudeCodeExecutor implements Executor, RawRunSource {
       status: ExecutorStatus;
       telemetry: ExecutorTelemetry;
       lastRun: RawRunRecord;
-    }>((resolve) => {
+    }>((resolve, reject) => {
       let settled = false;
       let killedMode: RawRunRecord['killed'] = 'none';
       let turnCapTriggered = false;
@@ -356,6 +360,7 @@ export class ClaudeCodeExecutor implements Executor, RawRunSource {
       let stdoutLineBuffer = '';
       let fullStdout = '';
       const parsedLines: unknown[] = [];
+      const messageIds = new Set<string>();
       let stderrTail = '';
       let graceTimer: NodeJS.Timeout | null = null;
 
@@ -415,7 +420,11 @@ export class ClaudeCodeExecutor implements Executor, RawRunSource {
         try {
           const parsed: unknown = JSON.parse(trimmed);
           parsedLines.push(parsed);
+          for (const output of decodeOutput(parsed)) emitOutput(this.options.onOutput, { executor: this.id, ...output });
           if (isRecordWithType(parsed) && parsed.type === 'assistant') {
+            const messageId = (parsed as { message?: { id?: string } }).message?.id;
+            if (messageId !== undefined && messageIds.has(messageId)) return;
+            if (messageId !== undefined) messageIds.add(messageId);
             observedTurns += 1;
             if (observedTurns > i.budget.maxTurns) {
               turnCapTriggered = true;
@@ -423,12 +432,13 @@ export class ClaudeCodeExecutor implements Executor, RawRunSource {
             }
           }
         } catch {
+          emitOutput(this.options.onOutput, { executor: this.id, kind: 'activity', text: trimmed });
           // not a JSON line; still captured verbatim in the transcript below
         }
       };
 
-      child.stdout.on('data', (chunk: Buffer) => {
-        const text = chunk.toString('utf8');
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (text: string) => {
         fullStdout += text;
         stdoutLineBuffer += text;
         let newlineIndex = stdoutLineBuffer.indexOf('\n');
@@ -439,14 +449,17 @@ export class ClaudeCodeExecutor implements Executor, RawRunSource {
         }
       });
 
-      child.stderr.on('data', (chunk: Buffer) => {
-        stderrTail += chunk.toString('utf8');
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', (text: string) => {
+        emitOutput(this.options.onOutput, { executor: this.id, kind: 'error', text });
+        stderrTail += text;
         if (stderrTail.length > 4096) {
           stderrTail = stderrTail.slice(-4096);
         }
       });
 
       child.on('error', (error) => {
+        emitOutput(this.options.onOutput, { executor: this.id, kind: 'error', text: error.message });
         spawnErrorOccurred = true;
         stderrTail = `${stderrTail}${stderrTail.length > 0 ? '\n' : ''}${error.message}`.slice(-4096);
       });
@@ -555,6 +568,7 @@ export class ClaudeCodeExecutor implements Executor, RawRunSource {
               },
             });
           },
+          (error: unknown) => reject(new Error(`claude: could not save transcript: ${String(error)}`)),
         );
       });
 

@@ -1,6 +1,8 @@
 import { spawn } from 'node:child_process';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { decodeOutput, emitOutput } from './output.js';
+import type { OutputListener } from './output.js';
 import type { Clock } from '../core/clock.js';
 import type { SandboxIntent } from '../core/events.js';
 import type { IdMinter } from '../core/idgen.js';
@@ -22,6 +24,7 @@ import type {
 export const DEFAULT_SIGTERM_GRACE_SECONDS = 10;
 
 export interface CodexCliOptions {
+  onOutput?: OutputListener | undefined;
   id: ExecutorInstanceId;
   account: AccountId;
   bin: string;
@@ -267,6 +270,7 @@ export class CodexCliExecutor implements Executor, RawRunSource {
   }
 
   async run(i: ExecutorInput): Promise<ExecutorResult> {
+    this.lastRun = null;
     const sessionId = this.options.ids.sessionUuid();
     const hermetic = process.env['MIENGU_HERMETIC'] === '1';
     const argv = buildArgv(this.options, i, hermetic);
@@ -278,7 +282,7 @@ export class CodexCliExecutor implements Executor, RawRunSource {
       status: ExecutorStatus;
       telemetry: ExecutorTelemetry;
       lastRun: RawRunRecord;
-    }>((resolve) => {
+    }>((resolve, reject) => {
       let settled = false;
       let killedMode: RawRunRecord['killed'] = 'none';
       let turnCapTriggered = false;
@@ -350,6 +354,7 @@ export class CodexCliExecutor implements Executor, RawRunSource {
         try {
           const parsed: unknown = JSON.parse(trimmed);
           parsedLines.push(parsed);
+          for (const output of decodeOutput(parsed)) emitOutput(this.options.onOutput, { executor: this.id, ...output });
           if (parsed !== null && typeof parsed === 'object') {
             const type = String((parsed as { type?: unknown }).type);
             if (CODEX_TURN_EVENT_TYPES.includes(type)) {
@@ -362,12 +367,13 @@ export class CodexCliExecutor implements Executor, RawRunSource {
             }
           }
         } catch {
+          emitOutput(this.options.onOutput, { executor: this.id, kind: 'activity', text: trimmed });
           // not a JSON line; still captured verbatim in the transcript below
         }
       };
 
-      child.stdout.on('data', (chunk: Buffer) => {
-        const text = chunk.toString('utf8');
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (text: string) => {
         fullStdout += text;
         stdoutLineBuffer += text;
         let newlineIndex = stdoutLineBuffer.indexOf('\n');
@@ -380,8 +386,10 @@ export class CodexCliExecutor implements Executor, RawRunSource {
 
       // S5: codex writes failures to STDOUT, not stderr — stderr was empty even on a failing
       // run. Captured anyway so a spawn-level failure is not lost.
-      child.stderr.on('data', (chunk: Buffer) => {
-        stderrTail += chunk.toString('utf8');
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', (text: string) => {
+        emitOutput(this.options.onOutput, { executor: this.id, kind: 'error', text });
+        stderrTail += text;
         if (stderrTail.length > 4096) {
           stderrTail = stderrTail.slice(-4096);
         }
@@ -392,6 +400,7 @@ export class CodexCliExecutor implements Executor, RawRunSource {
       });
 
       child.on('error', (error) => {
+        emitOutput(this.options.onOutput, { executor: this.id, kind: 'error', text: error.message });
         spawnErrorOccurred = true;
         stderrTail = `${stderrTail}${stderrTail.length > 0 ? '\n' : ''}${error.message}`.slice(-4096);
       });
@@ -478,12 +487,12 @@ export class CodexCliExecutor implements Executor, RawRunSource {
               stderrTail,
               sessionId: threadId ?? sessionId,
               transcriptPath,
-              rawResult: turnCompleted ?? terminalFailure,
+              rawResult: terminalFailure ?? turnCompleted,
               finalMessage,
               quota: detectedQuota,
             },
           });
-        });
+        }, (error: unknown) => reject(new Error(`codex: could not save transcript: ${String(error)}`)));
       });
 
       // A pre-aborted signal can kill the process group (triggerKill, above) before this

@@ -368,6 +368,27 @@ class FakeNativeExecutor implements Executor, RawRunSource {
 }
 
 describe('runAgentStage — native path (nativeStructuredOutput: true)', () => {
+  it('preserves provider errors from stdout when stderr is empty', async () => {
+    const executor = new FakeNativeExecutor([{ status: 'crashed' }]);
+    const originalRun = executor.run.bind(executor);
+    executor.run = async (input) => {
+      const result = await originalRun(input);
+      executor.lastRun = {
+        ...executor.lastRun!,
+        exitCode: 1,
+        rawResult: { type: 'turn.failed', error: { message: 'Invalid model selected' } },
+        transcriptPath: '/tmp/provider-transcript.ndjson',
+      };
+      return result;
+    };
+    const outcome = await runAgentStage(baseInput({ executor }));
+    expect(outcome.kind).toBe('failed');
+    if (outcome.kind === 'failed') {
+      expect(outcome.detail).toContain('Invalid model selected');
+      expect(outcome.detail).toContain('exit 1');
+      expect(outcome.detail).toContain('/tmp/provider-transcript.ndjson');
+    }
+  });
   it('writes the schema file and passes outputSchemaPath, and still validates with zod on receipt', async () => {
     const executor = new FakeNativeExecutor([{ status: 'completed', finalMessage: JSON.stringify(VALID) }]);
     const outcome = await runAgentStage(

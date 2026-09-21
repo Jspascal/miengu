@@ -19,6 +19,7 @@ import { StubExecutor } from './stub.js';
 import { assertSandboxSupported } from './executor.js';
 import type { Executor, RawRunSource } from './executor.js';
 import { expandExecutorEnv } from './processConfig.js';
+import type { OutputListener } from './output.js';
 
 /** analyst/architect/planner/reviewer -> 'read-only'; testAuthor/coder -> 'workspace-write'. */
 export const ROLE_SANDBOX_INTENT: Readonly<Record<Role, SandboxIntent>> = {
@@ -66,6 +67,7 @@ function buildAdapter(
   instance: ExecutorInstanceConfig,
   sandboxIntent: SandboxIntent,
   o: {
+    onOutput?: OutputListener | undefined;
     paths: { transcriptsDir: string; messagesDir: string };
     clock: Clock;
     ids: IdMinter;
@@ -83,6 +85,7 @@ function buildAdapter(
       });
     case 'claude-code':
       return new ClaudeCodeExecutor({
+        onOutput: o.onOutput,
         id: instanceId,
         account: instance.account,
         bin: instance.bin ?? 'claude',
@@ -111,6 +114,7 @@ function buildAdapter(
       });
     case 'codex':
       return new CodexCliExecutor({
+        onOutput: o.onOutput,
         id: instanceId,
         account: instance.account,
         bin: instance.bin ?? 'codex',
@@ -140,6 +144,7 @@ function buildAdapter(
  * should not have.
  */
 export function buildExecutorRegistry(o: {
+  onOutput?: OutputListener | undefined;
   config: MienguConfig;
   paths: { transcriptsDir: string; messagesDir: string };
   clock: Clock;
@@ -160,6 +165,7 @@ export function buildExecutorRegistry(o: {
     }
     const sandboxIntent = ROLE_SANDBOX_INTENT[role];
     const executor = buildAdapter(instanceId, instance, sandboxIntent, {
+      onOutput: o.onOutput,
       paths: o.paths,
       clock: o.clock,
       ids: o.ids,

@@ -59,6 +59,24 @@ Each PRD becomes one work item, identified by a slug of its filename (`feature.p
 `--no-backlog` to process only the new item. A run that hits a gate parks the item and exits
 non-zero rather than guessing.
 
+### Live terminal view
+
+`miengu run feature.prd.md` opens a dashboard automatically when stderr is an interactive
+terminal. It shows the current stage and agent, elapsed time, time since the last output,
+tool activity, replies, and any reasoning text or summaries the provider exposes in its
+public CLI stream. Hidden internal reasoning is not available. Output appears as each
+provider emits its messages; this is not a token-by-token view.
+
+Use Up/Down or Page Up/Page Down to scroll, End to follow live output, and Ctrl-C to stop
+the run. The dashboard retains the most recent 5,000 lines; raw provider stdout is saved
+to the transcript path shown when an agent returns. Failure messages include provider
+errors, exit status, and the transcript location. Transcript-save failures are reported
+as errors instead of leaving the run pending.
+
+Use `--no-tui` for a plain live feed with normal terminal scrollback. Redirected output
+automatically uses that format; `--json` suppresses the live view and retains the existing
+machine-readable result. The terminal is restored on completion or error.
+
 ## Config, by example
 
 `miengu init` writes the full annotated file — [`miengu.config.example.yaml`](./miengu.config.example.yaml)

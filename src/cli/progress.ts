@@ -58,7 +58,7 @@ export type ProgressLineWriter = (line: string) => void;
 export function createProgressReporter(
   write: ProgressLineWriter = (line) => process.stderr.write(`${line}\n`),
   heartbeatMs = 30_000,
-): (event: MienguEvent) => void {
+): ((event: MienguEvent) => void) & { close(): void } {
   let blocking: string[] = [];
   let item = '';
   let heartbeat: NodeJS.Timeout | null = null;
@@ -90,7 +90,7 @@ export function createProgressReporter(
     blocking = [];
   };
 
-  return (event): void => {
+  const report = (event: MienguEvent): void => {
     if (event.type === 'CheckpointRaised' && event.data.blocking) {
       item = event.item_id;
       blocking.push(event.data.checkpoint);
@@ -104,4 +104,5 @@ export function createProgressReporter(
     if (line !== null) write(`miengu: ${line}`);
     if (event.type === 'ExecutorInvoked') startHeartbeat(event);
   };
+  return Object.assign(report, { close: () => { stopHeartbeat(); flush(); } });
 }
