@@ -368,6 +368,16 @@ class FakeNativeExecutor implements Executor, RawRunSource {
 }
 
 describe('runAgentStage — native path (nativeStructuredOutput: true)', () => {
+  it('includes durable human decisions as authoritative context in the next prompt', async () => {
+    const executor = new FakeNativeExecutor([{ status: 'completed', finalMessage: JSON.stringify(VALID) }]);
+    let prompt = '';
+    const originalRun = executor.run.bind(executor);
+    executor.run = async (input) => { prompt = input.prompt; return originalRun(input); };
+    const input = baseInput({ executor });
+    await runAgentStage({ ...input, pack: { ...input.pack, raw: { ...input.pack.raw, humanDecisions: 'Question: May frozen accounts receive deposits?\nHuman answer: Yes, deposits only.' } } });
+    expect(prompt).toContain('Human answers (authoritative; supersede earlier proposals)');
+    expect(prompt).toContain('Yes, deposits only.');
+  });
   it('preserves provider errors from stdout when stderr is empty', async () => {
     const executor = new FakeNativeExecutor([{ status: 'crashed' }]);
     const originalRun = executor.run.bind(executor);

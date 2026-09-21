@@ -2,7 +2,7 @@
 import { Command } from 'commander';
 import { WorkItemIdSchema } from '../core/ids.js';
 import { initCommand } from './commands/init.js';
-import { runCommand } from './commands/run.js';
+import { runCommand, resumeCommand } from './commands/run.js';
 import { statusCommand } from './commands/status.js';
 import { replayCommand } from './commands/replay.js';
 import { reportCommand } from './commands/report.js';
@@ -41,24 +41,37 @@ program
   .argument('<prd-file>', 'path to the PRD file')
   .option('--config <path>', 'path to miengu.config.yaml')
   .option('--retain-workspace', 'do not remove the worktree on exit')
-  .option('--no-backlog', 'run only the new item; skip the backlog scan entirely')
+  .option('--new', 'explicitly create a new item even when this PRD has an unfinished item')
+  .option('--backlog', 'also resume other ready work items', false)
+  .option('--no-backlog', 'run only the selected item; skip the backlog scan entirely')
   .option('--no-tui', 'use a plain live feed instead of the terminal dashboard')
   .option('--json', 'print machine-readable output')
   .action(
     async (
       prdFile: string,
-      opts: { config?: string; retainWorkspace?: boolean; backlog?: boolean; json?: boolean; tui?: boolean },
+      opts: { config?: string; retainWorkspace?: boolean; backlog?: boolean; json?: boolean; tui?: boolean; new?: boolean },
     ) => {
       process.exitCode = await runCommand({
         prdFile,
         configPath: opts.config,
         retainWorkspace: opts.retainWorkspace,
-        noBacklog: opts.backlog === false,
+        noBacklog: opts.backlog !== true,
+        newItem: opts.new,
         json: opts.json,
         tui: opts.tui,
       });
     },
   );
+
+program.command('resume')
+  .argument('<item>', 'existing work item id; opens its unanswered questions and continues it')
+  .option('--config <path>', 'path to miengu.config.yaml')
+  .option('--no-tui', 'use plain output')
+  .option('--json', 'print machine-readable output')
+  .option('--retain-workspace', 'keep the worktree on exit')
+  .action(async (item: string, opts: { config?: string; tui?: boolean; json?: boolean; retainWorkspace?: boolean }) => {
+    process.exitCode = await resumeCommand({ resumeItem: WorkItemIdSchema.parse(item), configPath: opts.config, tui: opts.tui, json: opts.json, retainWorkspace: opts.retainWorkspace, noBacklog: true });
+  });
 
 program
   .command('status')

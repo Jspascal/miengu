@@ -303,6 +303,7 @@ describe('analystModule.validate', () => {
   });
 
   it('allows a genuine intent question', () => {
+    expect(analystModule.validate(setWith('Which operations must a frozen account refuse? Its behaviour is not defined.'), ctx)).toEqual([]);
     const failures = analystModule.validate(setWith('Should the product charge admins a monthly fee?'), ctx);
     expect(failures.some((f) => f.includes('mechanically answerable'))).toBe(false);
   });

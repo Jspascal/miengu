@@ -4,9 +4,16 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { runCommand } from '../../src/cli/commands/run.js';
+import { runCommand, resumeCommand } from '../../src/cli/commands/run.js';
 import { EXIT } from '../../src/cli/exit.js';
-import { listItemIds, itemPaths } from '../../src/core/log.js';
+import { EventLog, listItemIds, itemPaths } from '../../src/core/log.js';
+import { loadConfig } from '../../src/config/load.js';
+import { createIdMinter, fixedRng } from '../../src/core/idgen.js';
+import { systemClock } from '../../src/core/clock.js';
+import { SlugSchema, CheckpointIdSchema } from '../../src/core/ids.js';
+import { sha256File } from '../../src/core/hash.js';
+import { silentLogger } from '../../src/logging.js';
+import * as displayModule from '../../src/cli/display.js';
 import { ConfigError } from '../../src/errors.js';
 
 const execFileAsync = promisify(execFile);
@@ -83,6 +90,42 @@ afterEach(async () => {
 });
 
 describe('runCommand', () => {
+  it('reuses an unfinished PRD item and resumes it explicitly without duplicating it', async () => {
+    const prdFile = join(workDir, 'prd.md');
+    await writeFile(prdFile, 'Build a thing.\n');
+    const loaded = await loadConfig(configPath);
+    const ids = createIdMinter(fixedRng('resume'));
+    const itemId = ids.workItemId(SlugSchema.parse('prd'));
+    const { log } = await EventLog.create({ storeDir: loaded.storeDir, itemId, runId: ids.runId(), clock: systemClock, ids, logger: silentLogger });
+    try {
+      await log.append({ type: 'WorkItemCreated', data: { title: 'prd', slug: SlugSchema.parse('prd'), source: { kind: 'prd-file', path: prdFile, sha256: await sha256File(prdFile), bytes: 15 }, config_hash: loaded.configHash }, actor: { kind: 'human', id: null }, causationId: null });
+      await log.append({ type: 'CheckpointRaised', data: { checkpoint: CheckpointIdSchema.parse('cp-prd-1'), kind: 'irreversible', stage: 'analysis', summary: 'Choose a policy', blocking: true, sla_seconds: null, default_decision: null }, actor: { kind: 'supervisor', id: null }, causationId: log.lastEventId });
+      await log.append({ type: 'WorkItemParked', data: { reason: 'awaiting-human', detail: 'Choose a policy', resumable: true, account: null, resets_at: null }, actor: { kind: 'supervisor', id: null }, causationId: log.lastEventId });
+    } finally { await log.close(); }
+    expect(await runCommand({ prdFile, configPath, tui: false, json: true })).toBe(EXIT.PARKED);
+    expect(await resumeCommand({ resumeItem: itemId, configPath, tui: false, json: true })).toBe(EXIT.PARKED);
+    expect(await listItemIds(loaded.storeDir)).toEqual([itemId]);
+    const raw = await readFile(itemPaths(loaded.storeDir, itemId).eventsFile, 'utf8');
+    expect(raw.match(/"type":"WorkItemCreated"/g)).toHaveLength(1);
+    expect(raw).not.toContain('ExecutorInvoked');
+    await writeFile(prdFile, 'Changed scope');
+    await expect(runCommand({ prdFile, configPath, tui: false })).rejects.toThrow('PRD changed');
+    expect(await listItemIds(loaded.storeDir)).toEqual([itemId]);
+    await writeFile(prdFile, 'Build a thing.\n');
+    const display = displayModule.createRunDisplay(false, true);
+    const displaySpy = vi.spyOn(displayModule, 'createRunDisplay').mockReturnValue({
+      ...display, interactive: true,
+      requestAnswer: async (questions) => ({ id: questions[0]!.id, answer: questions[0]!.proposed }),
+    });
+    try {
+      expect(await resumeCommand({ resumeItem: itemId, configPath, json: true })).toBe(EXIT.OK);
+      expect(await listItemIds(loaded.storeDir)).toEqual([itemId]);
+      const completed = await readFile(itemPaths(loaded.storeDir, itemId).eventsFile, 'utf8');
+      expect(completed).toContain('CheckpointDecided');
+      expect(completed).toContain('WorkItemResumed');
+      expect(completed).toContain('WorkItemCompleted');
+    } finally { displaySpy.mockRestore(); }
+  });
   it('creates exactly one work item and runs it to completion, exit 0', async () => {
     const prdFile = join(workDir, 'prd.md');
     await writeFile(prdFile, 'Build a thing.\n', 'utf8');

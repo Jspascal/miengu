@@ -52,7 +52,7 @@ import { checkpointAcceptedTask, checkpointFrozenTests, captureFinalPatch, rebui
 import { bucketLimit, classifyFailure, deterministicTaskOrder, escalationRank, invalidationClosure, nextEscalationLevel } from './escalation.js';
 import type { SupervisorAction } from './nextStage.js';
 import type { ReviewVerdict } from '../contracts/index.js';
-import { openAssumptions } from './assumptions.js';
+import { assumptionFacts, openAssumptions } from './assumptions.js';
 import { classifyBlastRadius, blastRadiusInput } from './blastRadius.js';
 import {
   assumptionGateDraft,
@@ -70,6 +70,8 @@ export const MAX_LOOP_ITERATIONS = 1000;
 const SUPERVISOR_ACTOR: Actor = { kind: 'supervisor', id: null };
 
 export interface RunItemDeps {
+  /** Called between stages under the item's existing write lock, never during an executor. */
+  readonly reviewHuman?: (events: readonly MienguEvent[]) => Promise<boolean>;
   readonly log: EventLog;
   readonly snapshots: SnapshotStore<WorkItemState>;
   readonly config: MienguConfig;
@@ -353,6 +355,10 @@ async function buildRawPackMaterials(o: {
 
   return {
     prd,
+    humanDecisions: assumptionFacts(o.events).filter((f) => f.resolved).map((fact) => {
+      const assumption = o.state.assumptions.find((a) => a.id === fact.id);
+      return `Question: ${assumption?.question ?? fact.id}\nHuman answer: ${assumption?.chosen ?? ''}`;
+    }).join('\n\n'),
     wikiIndex: wikiIndexBodies(claimSet),
     existingReqIds: o.requirementSet?.requirements.map((r) => r.req_id) ?? [],
     priorOutOfScope: o.requirementSet?.out_of_scope ?? [],
@@ -745,6 +751,7 @@ async function performRunAttempt(
   };
 
   const gate: GateContext = {
+    answeredQuestions: assumptionFacts(events).filter((f) => f.resolved).flatMap((f) => state.assumptions.filter((a) => a.id === f.id).map((a) => a.question)),
     nextCheckpointSerial: nextCheckpointSerial(state.checkpoints),
     nextAssumptionSerial: nextAssumptionSerial(state.assumptions),
     openAssumptions: openAssumptions(events),
@@ -1471,6 +1478,9 @@ export async function runItem(deps: RunItemDeps): Promise<RunItemResult> {
     if (deps.signal.aborted) {
       return finalize(deps, state, 'aborted');
     }
+
+    if (deps.reviewHuman && await deps.reviewHuman(events)) continue;
+    if (deps.signal.aborted) continue;
 
     if (iterations > MAX_LOOP_ITERATIONS) {
       const failed = await appendAndFold(deps, state, {

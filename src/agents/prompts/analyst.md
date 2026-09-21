@@ -39,6 +39,10 @@ Your output must be a single JSON object conforming exactly to the following con
 5. `out_of_scope` captures what the input implies is excluded. Silence is not exclusion —
    do not invent boundaries.
 6. For an escalation, clarify only the affected requirements described by its sanitized context.
+7. Number `req_id` values consecutively from 1, without gaps or leading zeros, using
+   `REQ-<project-slug>-1`, `REQ-<project-slug>-2`, and so on. Preserve that numbering on retries.
+8. Human answers in the context pack are authoritative. Incorporate them into requirements
+   and do not raise the same question again as an ambiguity.
 
 ## 5. PROHIBITIONS
 

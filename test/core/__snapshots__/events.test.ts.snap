@@ -24,6 +24,7 @@ exports[`MienguEventSchema closure > (e) EVENT_TYPES is snapshotted so adding a 
   "BudgetExhausted",
   "CheckpointRaised",
   "CheckpointDecided",
+  "HumanAnswerRecorded",
   "AutoApproved",
   "AssumptionRecorded",
   "TestsFrozen",

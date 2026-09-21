@@ -39,7 +39,7 @@ describe('run display', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it('pauses initially idle stdin after leaving interactive mode', () => {
+  it('submits a typed answer, cancels a pending question, and restores idle stdin', async () => {
     vi.spyOn(process.stderr, 'write').mockReturnValue(true);
     const tty = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY');
     const raw = Object.getOwnPropertyDescriptor(process.stdin, 'setRawMode');
@@ -53,6 +53,16 @@ describe('run display', () => {
     try {
       const display = createRunDisplay(true);
       display.onOutput({ executor: 'test', kind: 'reply', text: 'Done' });
+      const questions = [{ id: 'assumption-example-1', kind: 'assumption' as const, question: 'Which limit?', proposed: 'No limit', alternatives: ['100'], affects: [], checkpoints: [], editable: true }];
+      const controller = new AbortController();
+      const answer = display.requestAnswer(questions, controller.signal);
+      process.stdin.emit('keypress', 'e', { name: 'e' });
+      process.stdin.emit('keypress', '500', { name: undefined });
+      process.stdin.emit('keypress', '\r', { name: 'return' });
+      await expect(answer).resolves.toEqual({ id: 'assumption-example-1', answer: '500' });
+      const waiting = display.requestAnswer(questions, controller.signal);
+      controller.abort();
+      await expect(waiting).resolves.toBeNull();
       display.close();
       expect(setRawMode).toHaveBeenLastCalledWith(false);
       expect(pause).toHaveBeenCalled();

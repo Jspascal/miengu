@@ -84,7 +84,7 @@ import type {
 // Bumped from 4 to 5 because qualified drift now retains the item that minted the target claim.
 // Snapshots written under the old fold must be discarded and rebuilt from events; event logs are
 // untouched and remain independently versioned by EVENT_SCHEMA_VERSION.
-export const PROJECTION_VERSION = 5;
+export const PROJECTION_VERSION = 6;
 
 export const STAGE_ORDER: readonly Stage[] = STAGES;
 

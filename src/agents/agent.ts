@@ -18,7 +18,7 @@ import { AgentError } from '../errors.js';
 import { contractFor } from '../contracts/index.js';
 import { toJsonSchema, jsonSchemaSha256 } from '../contracts/toJsonSchema.js';
 import type { TaskGraph } from '../contracts/index.js';
-import { assemblePack, renderPack } from '../wiki/contextpack.js';
+import { assemblePack, packSection, renderPack } from '../wiki/contextpack.js';
 import type { ContextPackSection } from '../wiki/contextpack.js';
 import type { TieredBody } from '../wiki/packmaterials.js';
 import type { ProvenanceTier } from '../core/provenance.js';
@@ -53,6 +53,7 @@ export type AppendFn = (
  * it already has; a `null`/empty value simply yields no section of that kind.
  */
 export interface RawPackMaterials {
+  readonly humanDecisions?: string;
   readonly prd: string | null;
   readonly wikiIndex: readonly TieredBody[];
   readonly existingReqIds: readonly ReqId[];
@@ -127,6 +128,7 @@ export function renderEscalationContext(
  * routing state machine, and the narrow shape is what keeps that true.
  */
 export interface GateContext {
+  readonly answeredQuestions?: readonly string[];
   readonly nextCheckpointSerial: number;
   readonly nextAssumptionSerial: number;
   readonly openAssumptions: readonly AssumptionFact[];
@@ -356,7 +358,10 @@ export async function runAgentStage(i: RunAgentStageInput): Promise<AgentOutcome
   const jsonSchemaText = JSON.stringify(jsonSchema, null, 2);
   const schemaSha256 = jsonSchemaSha256(jsonSchema);
 
-  const candidates = i.module.buildCandidates(i.pack);
+  const candidates = [...i.module.buildCandidates(i.pack)];
+  if (i.pack.raw.humanDecisions) {
+    candidates.push(packSection('human-decisions', 'Human answers (authoritative; supersede earlier proposals)', i.pack.raw.humanDecisions, 'T0'));
+  }
   const pack = assemblePack({
     itemId: i.itemId,
     stage: i.stage,

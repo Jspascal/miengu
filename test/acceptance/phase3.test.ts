@@ -127,7 +127,7 @@ describe('Phase 3 acceptance: deterministic task supervision', () => {
       await writeFile(paths.eventsFile, v2, 'utf8');
       const before = await readFile(paths.eventsFile, 'utf8');
       const v2State = project(v2.trim().split('\n').map((line) => StoredEventSchema.parse(JSON.parse(line))));
-      expect(v2State.projectionVersion).toBe(5);
+      expect(v2State.projectionVersion).toBe(6);
       await expect(EventLog.open({ storeDir: store, itemId, runId: ids.runId(), clock: fixedClock(START), ids, logger: silentLogger })).rejects.toThrow('v2 event logs are read-only');
       expect(await readFile(paths.eventsFile, 'utf8')).toBe(before);
       expect(created.seq).toBe(1);

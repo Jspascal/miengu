@@ -181,7 +181,7 @@ describe('runCommand: backlog drain', () => {
     });
     let result: number;
     try {
-      result = await runCommand({ prdFile, configPath });
+      result = await runCommand({ prdFile, configPath, noBacklog: false });
     } finally {
       write.mockRestore();
     }
@@ -212,7 +212,7 @@ describe('runCommand: backlog drain', () => {
 
     const prdFile = join(workDir, 'new-item.md');
     await writeFile(prdFile, 'Build a thing.\n', 'utf8');
-    const result = await runCommand({ prdFile, configPath });
+    const result = await runCommand({ prdFile, configPath, noBacklog: false });
     expect(result).toBe(EXIT.OK);
 
     const itemIds = await listItemIds(storeDir);
@@ -286,7 +286,7 @@ describe('runCommand: backlog drain', () => {
       return true;
     });
     try {
-      await runCommand({ prdFile, configPath, json: true });
+      await runCommand({ prdFile, configPath, noBacklog: false, json: true });
     } finally {
       write.mockRestore();
     }
@@ -333,7 +333,7 @@ describe('runCommand: backlog drain', () => {
       return true;
     });
     try {
-      await runCommand({ prdFile, configPath, json: true });
+      await runCommand({ prdFile, configPath, noBacklog: false, json: true });
     } finally {
       write.mockRestore();
     }
@@ -371,7 +371,7 @@ describe('runCommand: backlog drain', () => {
     try {
       const prdFile = join(workDir, 'new-item.md');
       await writeFile(prdFile, 'Build a thing.\n', 'utf8');
-      const result = await runCommand({ prdFile, configPath, json: true });
+      const result = await runCommand({ prdFile, configPath, noBacklog: false, json: true });
       expect(result).toBe(EXIT.OK);
     } finally {
       await holderLog.close();
@@ -423,7 +423,7 @@ describe('runCommand: backlog drain', () => {
       return true;
     });
     try {
-      await runCommand({ prdFile, configPath, json: true });
+      await runCommand({ prdFile, configPath, noBacklog: false, json: true });
     } finally {
       write.mockRestore();
     }
@@ -482,7 +482,7 @@ describe('runCommand: backlog drain', () => {
 
     const prdFile = join(workDir, 'new-item.md');
     await writeFile(prdFile, 'Build a thing.\n', 'utf8');
-    await runCommand({ prdFile, configPath });
+    await runCommand({ prdFile, configPath, noBacklog: false });
 
     const itemIds = await listItemIds(storeDir);
     for (const itemId of itemIds) {

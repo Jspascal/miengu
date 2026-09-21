@@ -422,7 +422,7 @@ describe('§8 section order', () => {
     // Every qualifying item gets a `shipped` entry (even with zero accepted tasks), so this
     // section is always present once there is at least one item; the other three (nothing was
     // ever agent-originated, no oracle sweep ran, nothing drifted) are correctly absent.
-    const shippedIdx = text.indexOf('## Shipped');
+    const shippedIdx = text.indexOf('## Work items and delivery status');
     expect(blockedIdx).toBeGreaterThanOrEqual(0);
     expect(assumptionsIdx).toBeGreaterThan(blockedIdx);
     expect(shippedIdx).toBeGreaterThan(assumptionsIdx);

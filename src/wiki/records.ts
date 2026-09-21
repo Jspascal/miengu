@@ -342,6 +342,8 @@ function coreClaimsFor(event: MienguEvent): CoreClaim[] {
     }
     case 'AssumptionRecorded':
       return assumptionClaims(event);
+    case 'HumanAnswerRecorded':
+      return [{ kind: 'assumption', subject: event.data.assumption_id, statement: event.data.answer, baseTier: 'T0', agentOriginated: false, trace: EMPTY_TRACE }];
     case 'DiffCaptured':
       return fileClaims(event);
     case 'OracleResultRecorded':
@@ -414,9 +416,19 @@ function deriveClaimsWithDrift(
   let updatedAt: IsoTimestamp = createdAt;
   const emitted: EmittedClaim[] = [];
   const invalidatedEventIds = new Set<EventId>();
+  const assumptionAnswers = new Map<string, { chosen: string; eventId: EventId }>();
+  const planningEvents: EventId[] = [];
   let emissionIndex = 0;
 
   for (const event of ordered) {
+    if (event.type === 'StageCompleted' && ['analysis', 'architecture', 'planning', 'test-authoring'].includes(event.data.stage)) planningEvents.push(event.event_id);
+    if (event.type === 'AssumptionRecorded') assumptionAnswers.set(event.data.id, { chosen: event.data.chosen, eventId: event.event_id });
+    if (event.type === 'HumanAnswerRecorded') {
+      const prior = assumptionAnswers.get(event.data.assumption_id);
+      if (prior && prior.chosen !== event.data.answer) for (const id of planningEvents) invalidatedEventIds.add(id);
+      if (prior) invalidatedEventIds.add(prior.eventId);
+      assumptionAnswers.set(event.data.assumption_id, { chosen: event.data.answer, eventId: event.event_id });
+    }
     if (event.ts > updatedAt) {
       updatedAt = event.ts;
     }

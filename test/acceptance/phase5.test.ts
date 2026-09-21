@@ -343,7 +343,7 @@ describe('Phase 5 acceptance: criterion 1 — quota park across two items, one a
       const { exitCode: exit2, output } = await captureJsonOutput<{
         item: string;
         backlog: { item: string; ready: boolean; blocker: string | null }[];
-      }>(() => runCommand({ prdFile: prd2, configPath: env.configPath, json: true }));
+      }>(() => runCommand({ prdFile: prd2, configPath: env.configPath, json: true, noBacklog: false }));
       expect(exit2).toBe(EXIT.PARKED);
       itemSecondQuota = await newItemId(env.storeDir, before2);
       expect(output.item).toBe(itemSecondQuota);
@@ -368,7 +368,7 @@ describe('Phase 5 acceptance: criterion 1 — quota park across two items, one a
         item: string;
         outcome: string;
         backlog: { item: string; ready: boolean; blocker: string | null; outcome: string | null }[];
-      }>(() => runCommand({ prdFile: prd3, configPath: env.configPath, json: true }));
+      }>(() => runCommand({ prdFile: prd3, configPath: env.configPath, json: true, noBacklog: false }));
       expect(exit3).toBe(EXIT.OK);
       expect(output3.outcome).toBe('completed');
       itemAfterClear = await newItemId(env.storeDir, before3);
@@ -405,7 +405,7 @@ describe('Phase 5 acceptance: criterion 1 — quota park across two items, one a
     for (const itemId of [itemFirstQuota, itemSecondQuota, itemAfterClear]) {
       const { state } = await projectAccelerated(env.storeDir, itemId);
       expect(state.status).toBe('completed');
-      const replayExit = await replayCommand({ itemId, configPath: env.configPath, json: true });
+      const replayExit = await replayCommand({ itemId, configPath: env.configPath, json: true, noBacklog: false });
       expect(replayExit).toBe(EXIT.OK);
     }
   });
@@ -506,7 +506,7 @@ describe('Phase 5 acceptance: criterion 2 — blocked checkpoints, decide, resum
     const before = await listItemIds(env.storeDir);
     const prd = await writePrd(env.workDir, 'checkpoints-probe');
     const { output } = await captureJsonOutput<{ backlog: { item: string; ready: boolean; blocker: string | null }[] }>(() =>
-      runCommand({ prdFile: prd, configPath: env.configPath, json: true }),
+      runCommand({ prdFile: prd, configPath: env.configPath, json: true, noBacklog: false }),
     );
     const row = output.backlog.find((r) => r.item === itemId);
     expect(row?.ready).toBe(false);
@@ -526,7 +526,7 @@ describe('Phase 5 acceptance: criterion 2 — blocked checkpoints, decide, resum
     const { exitCode, output } = await captureJsonOutput<{
       item: string;
       backlog: { item: string; ready: boolean; outcome: string | null }[];
-    }>(() => runCommand({ prdFile: prd, configPath: env.configPath, json: true }));
+    }>(() => runCommand({ prdFile: prd, configPath: env.configPath, json: true, noBacklog: false }));
     expect(exitCode).toBe(EXIT.OK);
     await newItemId(env.storeDir, before);
 
@@ -543,7 +543,7 @@ describe('Phase 5 acceptance: criterion 2 — blocked checkpoints, decide, resum
     expect(state.status).toBe('completed');
     expect(state.park).toBeNull();
 
-    const replayExit = await replayCommand({ itemId, configPath: env.configPath, json: true });
+    const replayExit = await replayCommand({ itemId, configPath: env.configPath, json: true, noBacklog: false });
     expect(replayExit).toBe(EXIT.OK);
   });
 
@@ -621,7 +621,7 @@ describe('Phase 5 acceptance: criterion 2 — blocked checkpoints, decide, resum
         const prd = await writePrd(rerunEnv.workDir, 'rerun-checkpoints-resume');
         const { output } = await captureJsonOutput<{
           backlog: { item: string; ready: boolean; outcome: string | null }[];
-        }>(() => runCommand({ prdFile: prd, configPath: rerunEnv.configPath, json: true }));
+        }>(() => runCommand({ prdFile: prd, configPath: rerunEnv.configPath, json: true, noBacklog: false }));
         await newItemId(rerunEnv.storeDir, before);
         const row = output.backlog.find((r) => r.item === rerunItemId);
         expect(row?.ready).toBe(true);
@@ -751,7 +751,7 @@ describe('Phase 5 acceptance: blast radius, dedupe, and SLA auto-approval', () =
       // outcome (§10: never the drain's) — assert on the drained item's own backlog row.
       const { output } = await captureJsonOutput<{
         backlog: { item: string; ready: boolean; outcome: string | null }[];
-      }>(() => runCommand({ prdFile: prd, configPath: env.configPath, json: true }));
+      }>(() => runCommand({ prdFile: prd, configPath: env.configPath, json: true, noBacklog: false }));
       await newItemId(env.storeDir, before);
       const row = output.backlog.find((r) => r.item === itemId);
       expect(row?.ready).toBe(true);
@@ -773,7 +773,7 @@ describe('Phase 5 acceptance: blast radius, dedupe, and SLA auto-approval', () =
     expect(state.status).toBe('completed');
     expect(state.checkpoints[diffSizeCheckpoint]?.status).toBe('auto-approved');
 
-    const replayExit = await replayCommand({ itemId, configPath: env.configPath, json: true });
+    const replayExit = await replayCommand({ itemId, configPath: env.configPath, json: true, noBacklog: false });
     expect(replayExit).toBe(EXIT.OK);
   });
 });
@@ -1015,7 +1015,7 @@ describe('Phase 5 acceptance: criterion 4 — an actionable report', () => {
 describe('Phase 5 acceptance: nothing shipped moves', () => {
   it('EVENT_SCHEMA_VERSION and PROJECTION_VERSION are unchanged, and EVENT_TYPES matches its committed snapshot', async () => {
     expect(EVENT_SCHEMA_VERSION).toBe(4);
-    expect(PROJECTION_VERSION).toBe(5);
+    expect(PROJECTION_VERSION).toBe(6);
 
     const snapPath = fileURLToPath(new URL('../core/__snapshots__/events.test.ts.snap', import.meta.url));
     const snapText = await readFile(snapPath, 'utf8');

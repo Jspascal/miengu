@@ -6,6 +6,7 @@ import { ContextPackError } from '../errors.js';
 import { sha256Canonical } from '../core/hash.js';
 
 export const PACK_SOURCE_KINDS = [
+  'human-decisions',
   'prd',
   'wiki-index',
   'existing-req-ids',
@@ -49,7 +50,7 @@ function rolePolicy(
   required: readonly PackSourceKind[],
   omits: readonly PackSourceKind[],
 ): RolePackPolicy {
-  return { includes, required, omits };
+  return { includes: [...includes, 'human-decisions'], required: [...required, 'human-decisions'], omits };
 }
 
 /**

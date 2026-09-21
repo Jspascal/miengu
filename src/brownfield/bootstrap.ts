@@ -107,6 +107,8 @@ function relevantComponents(input: EnsureBrownfieldInput): readonly import('../c
 export function isIntentQuestion(question: string): boolean {
   const normalized = question.trim().toLowerCase();
   if (normalized.length === 0) return false;
+  // Desired product behaviour is author intent even when it mentions behaviour or commands.
+  if (/\b(?:should|must|intended|permitted|allowed|expected|business)\b/.test(normalized)) return true;
   return !/(?:\bpath\b|\bfile\b|\bdirectory\b|\bframework\b|\bcommand\b|\bdependency\b|\btest(?:s|ing)?\b|\bcurrent\b|\bexist(?:s|ence)?\b|\bbehavio(?:u)?r\b|\bpackage\.json\b|\bsrc\/)/.test(normalized);
 }
 

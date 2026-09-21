@@ -646,7 +646,7 @@ describe('Phase 4 acceptance: claims, provenance, context isolation, human view,
   // ---------------------------------------------------------------------------------------
   it('EVENT_SCHEMA_VERSION and PROJECTION_VERSION are unchanged, and miengu replay reports MATCH', async () => {
     expect(EVENT_SCHEMA_VERSION).toBe(4);
-    expect(PROJECTION_VERSION).toBe(5);
+    expect(PROJECTION_VERSION).toBe(6);
 
     const replayResult = await replayCommand({ itemId: ctx.itemId, configPath: ctx.configPath, json: true });
     expect(replayResult).toBe(EXIT.OK);

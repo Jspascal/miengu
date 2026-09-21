@@ -112,7 +112,8 @@ export function postStep(i: PostStepInput): Promise<PostStepResult> {
   let open: readonly AssumptionFact[] = i.gate.openAssumptions;
   let checkpointSerial = i.gate.nextCheckpointSerial;
 
-  artifact.ambiguities.forEach((ambiguity, index) => {
+  const answered = new Set(i.gate.answeredQuestions?.map((q) => q.trim().toLowerCase()) ?? []);
+  artifact.ambiguities.filter((a) => !answered.has(a.question.trim().toLowerCase())).forEach((ambiguity, index) => {
     const chosen = ambiguity.recommended ?? ambiguity.options[0] ?? '';
     const id = formatAssumptionId(i.slug, i.gate.nextAssumptionSerial + index);
     const depth = assumptionDepth(ambiguity.affects, open);

@@ -44,7 +44,7 @@ describe('emptyQuotaAborts', () => {
 
 function buildFullState(): WorkItemState {
   return {
-    projectionVersion: 5,
+    projectionVersion: 6,
     itemId: 'wi-example-abc123' as WorkItemState['itemId'],
     slug: 'example' as WorkItemState['slug'],
     seq: 1,

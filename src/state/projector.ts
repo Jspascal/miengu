@@ -427,6 +427,25 @@ export function applyEvent(
         checkpoints: { ...base.checkpoints, [event.data.checkpoint]: updated },
       };
     }
+    case 'HumanAnswerRecorded': {
+      const assumption = base.assumptions.find((a) => a.id === event.data.assumption_id);
+      if (assumption === undefined || event.actor.kind !== 'human') throw new ProjectionError('human answer requires a known assumption and a human actor');
+      const changed = assumption.chosen !== event.data.answer;
+      if (changed && (base.frozenTests !== null || base.activeCauseId !== null || base.status === 'completed')) {
+        throw new ProjectionError('changing an assumption after tests are frozen or during remediation requires a new work item');
+      }
+      const assumptions = base.assumptions.map((a) => a.id === assumption.id ? { ...a, chosen: event.data.answer } : a);
+      if (!changed) return { ...base, assumptions };
+      // A changed product decision invalidates planning before implementation starts.
+      // Keep the budget ledger and old events; new artifacts get their own event identities.
+      const invalidated = [base.artifacts.requirementSet, base.artifacts.architecturePlan, base.artifacts.taskGraph, base.artifacts.testSuiteSpec].flatMap((a) => a === null ? [] : [a.eventId]);
+      return {
+        ...base, assumptions, stage: 'analysis', attempts: emptyAttempts(), quotaAborts: emptyQuotaAborts(),
+        artifacts: { requirementSet: null, architecturePlan: null, taskGraph: null, testSuiteSpec: null },
+        taskGraphTaskIds: null, taskGraphDependencies: null, tasks: null,
+        invalidatedEventIds: [...base.invalidatedEventIds, ...invalidated],
+      };
+    }
     case 'AssumptionRecorded': {
       return {
         ...base,

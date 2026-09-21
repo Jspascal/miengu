@@ -22,7 +22,7 @@ import type { LoadedConfig } from '../../config/load.js';
 import { createSnapshotStore } from '../../core/snapshot.js';
 import { PROJECTION_VERSION, WorkItemStateSchema } from '../../state/workitem.js';
 import type { WorkItemState } from '../../state/workitem.js';
-import { applyEvent } from '../../state/projector.js';
+import { applyEvent, project } from '../../state/projector.js';
 import { stateHash } from '../../state/stateHash.js';
 import { buildExecutorRegistry } from '../../executors/registry.js';
 import { createWorkspaceProvider } from '../../executors/isolation.js';
@@ -36,8 +36,9 @@ import { projectAccelerated } from './replay.js';
 import { createRunDisplay } from '../display.js';
 import type { RunDisplay } from '../display.js';
 import { assertExecutorCommandsAvailable } from '../../executors/processConfig.js';
+import { pendingQuestions, recordHumanResponse } from '../questions.js';
 
-const MIENGU_VERSION = '0.1.4';
+const MIENGU_VERSION = '0.2.0';
 
 export interface RunCommandOptions {
   readonly prdFile: string;
@@ -46,6 +47,29 @@ export interface RunCommandOptions {
   readonly noBacklog?: boolean | undefined;
   readonly json?: boolean | undefined;
   readonly tui?: boolean | undefined;
+  readonly newItem?: boolean | undefined;
+  readonly resumeItem?: WorkItemId | undefined;
+}
+
+export async function resumeCommand(options: Omit<RunCommandOptions, 'prdFile' | 'newItem'> & { resumeItem: WorkItemId }): Promise<number> {
+  return runCommand({ ...options, prdFile: '' });
+}
+
+async function resumeReady(log: EventLog, clock: Clock): Promise<boolean> {
+  const state = project(await log.readAll());
+  if (state.status !== 'parked') return false;
+  const checkpoints = Object.values(state.checkpoints);
+  const entry = planBacklog([{
+    itemId: state.itemId, status: state.status, parkReason: state.park?.reason ?? null,
+    parkSince: state.park?.since ?? null, resumable: state.park?.resumable ?? false,
+    parkAccount: state.park?.account ?? null, nextStageAccount: null,
+    quotaWindowCleared: state.park?.resetsAt == null || epochSeconds(state.park.resetsAt) <= epochSeconds(clock.now()),
+    openBlockingCheckpoints: checkpoints.filter((c) => c.blocking && c.status === 'open').length,
+    rejectedBlockingCheckpoints: checkpoints.filter((c) => c.blocking && c.status === 'rejected').length,
+  }])[0];
+  if (!entry?.ready || !state.park) return false;
+  await log.append({ type: 'WorkItemResumed', data: { previous_reason: state.park.reason, detail: 'Resuming this work item after its blocker cleared', account: state.park.account }, actor: { kind: 'human', id: null }, causationId: log.lastEventId });
+  return true;
 }
 
 interface BacklogResultRow {
@@ -146,6 +170,19 @@ async function runOneItem(o: {
   const policy = policyFromConfig(loaded.config);
 
   const deps: RunItemDeps = {
+    ...(o.display.interactive ? { reviewHuman: async (events: readonly MienguEvent[]): Promise<boolean> => {
+      const questions = pendingQuestions(events);
+      if (questions.length === 0) return resumeReady(log, clock);
+      const response = await o.display.requestAnswer(questions, signal);
+      if (response === null) return false;
+      try {
+        await recordHumanResponse(log, response);
+        await resumeReady(log, clock);
+      } catch (error) {
+        o.display.onOutput({ executor: 'miengu', kind: 'error', text: error instanceof Error ? error.message : String(error) });
+      }
+      return true;
+    } } : {}),
     log,
     snapshots,
     config: loaded.config,
@@ -201,6 +238,7 @@ async function runOneItem(o: {
     },
   };
 
+  await resumeReady(log, clock);
   let result = await runItem(deps);
 
   if (signal.aborted) {
@@ -493,12 +531,13 @@ async function drainBacklog(o: {
 }
 
 /**
- * Mints a work item and runs it, via `runItem`, to completion or park. Constructs the
+ * Resumes a matching unfinished item (or explicitly creates one) and runs it to completion
+ * or park. Constructs the
  * executor registry (eagerly, per role) after `RunStarted` and before `runItem` — a
  * `ConfigError` from a misconfigured sandbox therefore propagates before any `StageEntered`
- * is ever appended. Then, unless `--no-backlog`, drains every resumable parked item whose
- * park condition has cleared (binding decision 13); the new item's log is closed strictly
- * before the drain starts, so at most one log is ever open at once. Returns the **new
+ * is ever appended. With `--backlog`, drains every resumable parked item whose
+ * park condition has cleared; the selected item's log is closed strictly
+ * before the drain starts, so at most one log is ever open at once. Returns the **selected
  * item's** exit code — a backlog item's outcome never changes it (§10).
  */
 export async function runCommand(options: RunCommandOptions): Promise<number> {
@@ -514,8 +553,23 @@ async function runCommandWithDisplay(options: RunCommandOptions, display: RunDis
   const loaded = await loadConfig(options.configPath);
   await assertExecutorCommandsAvailable(loaded);
 
-  const prdPath = resolve(options.prdFile);
+  let existing: WorkItemState | null = options.resumeItem ? (await projectAccelerated(loaded.storeDir, options.resumeItem)).state : null;
+  const prdPath = existing?.source.path ?? resolve(options.prdFile);
   const [sha256, fileStat] = await Promise.all([sha256File(prdPath), stat(prdPath)]);
+  if (!existing && options.newItem !== true) {
+    const candidates: WorkItemState[] = [];
+    for (const id of await listItemIds(loaded.storeDir)) {
+      try {
+        const { state } = await projectAccelerated(loaded.storeDir, id);
+        if (resolve(state.source.path) === prdPath && state.status !== 'completed') candidates.push(state);
+      } catch { /* unrelated corrupt items do not hide the selected request */ }
+    }
+    candidates.sort((a, b) => b.createdAt < a.createdAt ? -1 : b.createdAt > a.createdAt ? 1 : a.itemId < b.itemId ? -1 : 1);
+    existing = candidates[0] ?? null;
+  }
+  if (existing && existing.source.sha256 !== sha256) throw new StoreError('The PRD changed since this item was created. Use run --new to start a separate item.');
+  if (existing?.status === 'failed') throw new StoreError(`Item ${existing.itemId} failed. Inspect its report, or use run --new for an explicit new attempt.`);
+  if (existing?.status === 'completed') throw new StoreError(`Item ${existing.itemId} is already completed.`);
   const title = basename(prdPath, extname(prdPath));
   const slug = slugify(title);
 
@@ -523,10 +577,10 @@ async function runCommandWithDisplay(options: RunCommandOptions, display: RunDis
   const ids = createIdMinter(systemRng);
   const logger = createLogger({ level: loaded.config.log.level });
 
-  const itemId = await mintItemId(loaded.storeDir, slug, ids);
+  const itemId = existing?.itemId ?? await mintItemId(loaded.storeDir, slug, ids);
   const runId = ids.runId();
 
-  const { log } = await EventLog.create({
+  const logOptions = {
     storeDir: loaded.storeDir,
     itemId,
     runId,
@@ -534,7 +588,8 @@ async function runCommandWithDisplay(options: RunCommandOptions, display: RunDis
     ids,
     logger,
     onAppend: display.onEvent,
-  });
+  };
+  const { log } = existing ? await EventLog.open(logOptions) : await EventLog.create(logOptions);
 
   const abortController = new AbortController();
   const onSigint = (): void => {
@@ -546,17 +601,21 @@ async function runCommandWithDisplay(options: RunCommandOptions, display: RunDis
   let result: RunItemResult;
   let primaryRunFinished = false;
   try {
-    await log.append({
-      type: 'WorkItemCreated',
-      data: {
-        title,
-        slug,
-        source: { kind: 'prd-file', path: prdPath, sha256, bytes: fileStat.size },
-        config_hash: loaded.configHash,
-      },
-      actor: { kind: 'human', id: null },
-      causationId: null,
-    });
+    display.conversation('You / request', await readFile(prdPath, 'utf8'));
+    if (existing) display.history(await log.readAll());
+    if (!existing) {
+      await log.append({
+        type: 'WorkItemCreated',
+        data: {
+          title,
+          slug,
+          source: { kind: 'prd-file', path: prdPath, sha256, bytes: fileStat.size },
+          config_hash: loaded.configHash,
+        },
+        actor: { kind: 'human', id: null },
+        causationId: null,
+      });
+    }
     await log.append({
       type: 'RunStarted',
       data: {
@@ -568,6 +627,11 @@ async function runCommandWithDisplay(options: RunCommandOptions, display: RunDis
       actor: { kind: 'system', id: null },
       causationId: log.lastEventId,
     });
+
+    if (existing?.status === 'active') {
+      // Acquiring the item lock proves no live writer owns this interrupted run.
+      await log.append({ type: 'WorkItemParked', data: { reason: 'operator-abort', detail: 'Recovering an interrupted run', resumable: true, account: null, resets_at: null }, actor: { kind: 'system', id: null }, causationId: log.lastEventId });
+    }
 
     try {
       result = await runOneItem({
@@ -586,9 +650,7 @@ async function runCommandWithDisplay(options: RunCommandOptions, display: RunDis
       // the item looking active forever. Record a terminal outcome before rethrowing so both
       // the live feed and a later status/replay explain what actually happened.
       const events = await log.readAll();
-      const alreadyTerminal = events.some(
-        (event) => event.type === 'WorkItemCompleted' || event.type === 'WorkItemFailed' || event.type === 'WorkItemParked',
-      );
+      const alreadyTerminal = project(events).status !== 'active';
       if (!alreadyTerminal) {
         await log.append({
           type: 'WorkItemFailed',
@@ -628,7 +690,7 @@ async function runCommandWithDisplay(options: RunCommandOptions, display: RunDis
 
   let backlog: BacklogResultRow[] = [];
   try {
-    if (options.noBacklog !== true && !abortController.signal.aborted) {
+    if (options.noBacklog === false && !abortController.signal.aborted) {
       backlog = await drainBacklog({
         display,
         loaded,

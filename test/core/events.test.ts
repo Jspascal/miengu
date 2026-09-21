@@ -26,6 +26,7 @@ const BASE_ENVELOPE = {
 const ORACLE_EVIDENCE = { sha256: 'a'.repeat(64), path: '/tmp/oracle.out', bytes: 0 };
 
 const VALID_DATA: Record<EventType, Record<string, unknown>> = {
+  HumanAnswerRecorded: { assumption_id: 'assumption-example-1', answer: 'Use the proposed behaviour' },
   WorkItemCreated: {
     title: 'Example item',
     slug: 'example',
@@ -319,6 +320,7 @@ describe('tier assignment', () => {
       if (
         type === 'WorkItemCreated' ||
         type === 'CheckpointDecided' ||
+        type === 'HumanAnswerRecorded' ||
         type === 'AssumptionRecorded' ||
         type === 'ItemArtifactRecorded' ||
         type === 'BrownfieldPredicateProposed'

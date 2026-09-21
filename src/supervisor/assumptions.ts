@@ -12,6 +12,17 @@ export interface AssumptionFact {
   readonly gateCheckpointId: CheckpointId | null;
 }
 
+/** Explicit IDs in both historical escalation summaries and assumption-gate summaries. */
+export function checkpointAssumptions(
+  event: Extract<MienguEvent, { type: 'CheckpointRaised' }>,
+  open: readonly AssumptionFact[],
+): readonly AssumptionId[] {
+  const named = new Set(event.data.summary.match(/assumption-[a-z0-9-]+-\d+/g) ?? []);
+  if (event.data.kind === 'escalation' && named.size === 0) return [];
+  if (event.data.kind !== 'assumption-gate' && event.data.kind !== 'escalation') return [];
+  return open.filter((fact) => !fact.resolved && (named.size === 0 || named.has(fact.id))).map((fact) => fact.id);
+}
+
 /** One left-to-right fold over `events` in seq order. Pure, total, allocation-bounded.
  *
  *  1. `AssumptionRecorded` -> append a fact with `resolved: false`, `gateCheckpointId: null`.
@@ -39,8 +50,14 @@ export function assumptionFacts(events: readonly MienguEvent[]): readonly Assump
       byId.set(event.data.id, index);
       continue;
     }
-    if (event.type === 'CheckpointRaised' && event.data.kind === 'assumption-gate') {
-      const unresolvedIds = facts.filter((f) => !f.resolved).map((f) => f.id);
+    if (event.type === 'HumanAnswerRecorded') {
+      const index = byId.get(event.data.assumption_id);
+      const fact = index === undefined ? undefined : facts[index];
+      if (index !== undefined && fact !== undefined) facts[index] = { ...fact, resolved: true };
+      continue;
+    }
+    if (event.type === 'CheckpointRaised') {
+      const unresolvedIds = checkpointAssumptions(event, facts);
       gated.set(event.data.checkpoint, unresolvedIds);
       for (const id of unresolvedIds) {
         const index = byId.get(id);

@@ -99,6 +99,7 @@ export const EVENT_TYPES = [
   // F — human / checkpoint
   'CheckpointRaised',
   'CheckpointDecided',
+  'HumanAnswerRecorded',
   'AutoApproved',
   // G — named by contract elsewhere in the brief
   'AssumptionRecorded',
@@ -529,6 +530,11 @@ export const AutoApprovedData = z
   })
   .strict();
 
+export const HumanAnswerRecordedData = z.object({
+  assumption_id: AssumptionIdSchema,
+  answer: z.string().trim().min(1).max(20000),
+}).strict();
+
 export const AssumptionRecordedData = z
   .object({
     id: AssumptionIdSchema,
@@ -924,6 +930,7 @@ const MEMBERS = {
   WorkspaceCheckpointed: EnvelopeSchema.extend({ type: z.literal('WorkspaceCheckpointed'), data: WorkspaceCheckpointedData }),
   WorkspaceRestored: EnvelopeSchema.extend({ type: z.literal('WorkspaceRestored'), data: WorkspaceRestoredData }),
   FinalPatchCaptured: EnvelopeSchema.extend({ type: z.literal('FinalPatchCaptured'), data: FinalPatchCapturedData }),
+  HumanAnswerRecorded: EnvelopeSchema.extend({ type: z.literal('HumanAnswerRecorded'), data: HumanAnswerRecordedData }),
 } satisfies Record<EventType, z.ZodObject<{ type: z.ZodLiteral<EventType> } & z.ZodRawShape>>;
 
 export const MienguEventSchema = z.discriminatedUnion(
@@ -1041,6 +1048,7 @@ export const DEFAULT_TIER = {
   BudgetExhausted: 'T1',
   CheckpointRaised: 'T1',
   CheckpointDecided: 'T0',
+  HumanAnswerRecorded: 'T0',
   AutoApproved: 'T1',
   AssumptionRecorded: 'T2',
   TestsFrozen: 'T1',

@@ -55,20 +55,30 @@ miengu run feature.prd.md
 ```
 
 Each PRD becomes one work item, identified by a slug of its filename (`feature.prd.md` →
-`feature`). `run` also drains any other parked item whose blocking condition has cleared — pass
-`--no-backlog` to process only the new item. A run that hits a gate parks the item and exits
-non-zero rather than guessing.
+`feature`). Re-running an unchanged PRD resumes its newest unfinished item. Use `--new` to
+explicitly create a separate item, or `miengu resume <item-id>` to select an existing one.
+Other items are processed only when you pass `--backlog`. A blocked non-interactive run
+parks and exits non-zero; an interactive run presents its questions in the terminal.
 
 ### Live terminal view
 
 `miengu run feature.prd.md` opens a dashboard automatically when stderr is an interactive
-terminal. It shows the current stage and agent, elapsed time, time since the last output,
-tool activity, replies, and any reasoning text or summaries the provider exposes in its
-public CLI stream. Hidden internal reasoning is not available. Output appears as each
-provider emits its messages; this is not a token-by-token view.
+terminal. Separate panels show the pipeline, your conversation with agents, pending questions,
+and tool activity. The conversation includes your PRD, AI replies, and your saved answers.
+Activity includes the reasoning text or summaries a provider exposes in its public CLI stream;
+hidden internal reasoning is not available. Replies appear as the provider emits messages.
 
-Use Up/Down or Page Up/Page Down to scroll, End to follow live output, and Ctrl-C to stop
-the run. The dashboard retains the most recent 5,000 lines; raw provider stdout is saved
+Use Tab to switch panels; Up/Down or Page Up/Page Down to navigate; End to follow live output;
+and Ctrl-C to stop. At a question, choose an option with 1–9, or press `e` to write a custom
+answer, then Enter to submit. Enter without editing explicitly accepts the proposed answer.
+Escape clears an edit; Escape again parks the item. Answers are saved as human-authored
+events and become required context for every subsequent agent. Changing a proposal before
+tests are frozen invalidates the earlier plans and reruns analysis on the same item. Once tests
+are frozen or remediation is active, the panel permits confirmation only; changed scope needs
+a new item. Answering every question linked to an assumption checkpoint resolves that checkpoint.
+Other checkpoints require an explicit accept/reject decision. No answer is selected automatically.
+
+The dashboard retains the most recent 5,000 lines per conversation/activity pane; raw provider stdout is saved
 to the transcript path shown when an agent returns. Failure messages include provider
 errors, exit status, and the transcript location. Transcript-save failures are reported
 as errors instead of leaving the run pending.
@@ -151,7 +161,8 @@ Retry-After header once exceeded. Reuse the existing Redis client in src/cache.t
 | Command | Does |
 |---|---|
 | `miengu init [dir]` | Writes an annotated `miengu.config.yaml` into `dir` (default cwd). `--target <path>` sets the repo it points at; `--force` overwrites. |
-| `miengu run <prd-file>` | Runs the PRD as a new work item, then drains the backlog. `--retain-workspace` keeps the worktree instead of removing it on exit; `--no-backlog`; `--json`. |
+| `miengu run <prd-file>` | Starts or resumes the PRD. `--new` creates a separate item; `--backlog` opts into other ready items; `--retain-workspace` keeps the worktree; `--no-tui`; `--json`. |
+| `miengu resume <item>` | Opens an existing item's questions and resumes it when its blockers clear. Restores recorded conversation history. |
 | `miengu status` | Every item's stage, status, and any open checkpoints with their owner, SLA, and default. |
 | `miengu report [--since <date>]` | The batch review report across items, optionally filtered to those updated since a date. |
 | `miengu replay <item>` | Re-derives and prints an item's current state by replaying its event log — the same projection `status` uses, for one item. |
@@ -179,7 +190,7 @@ machine-readable output. `miengu status --json` on a parked item looks like:
 
 ```sh
 miengu decide cp-add-rate-limiting-1 accept --reason "reviewed the key-lookup change by hand"
-miengu run feature.prd.md   # resumes it on the next drain
+miengu resume <item-id>     # resume the same item, or answer its questions in the TUI
 ```
 
 ## How state actually works
