@@ -37,7 +37,7 @@ import { createRunDisplay } from '../display.js';
 import type { RunDisplay } from '../display.js';
 import { assertExecutorCommandsAvailable } from '../../executors/processConfig.js';
 
-const MIENGU_VERSION = '0.1.3';
+const MIENGU_VERSION = '0.1.4';
 
 export interface RunCommandOptions {
   readonly prdFile: string;
